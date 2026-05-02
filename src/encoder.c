@@ -624,7 +624,20 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
                                recon_y_frame, stride_recon_y,
                                modes4_b, ac_lev_b, recon_b);
 
-    /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode). */
+    /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode).
+     *
+     * KNOWN BUG (2026-05-02): the I_4x4 path is byte-exact with ffmpeg in
+     * isolation (every MB I_4x4) and the I_16x16 path is byte-exact in
+     * isolation. But when SOME MBs pick I_4x4 and others pick I_16x16, the
+     * decoder's recon diverges from ours starting at the first I_4x4 ↔
+     * I_16x16 boundary (verified across all 24 Kodak images at QP 18-38).
+     * Spec analysis of the cross-MB state (luma_nc TotalCoeff semantics,
+     * luma_mode4 sentinel for I_16x16 neighbors, mode-prediction round-
+     * trip) all looks consistent — the bug is somewhere subtler that I
+     * couldn't pin down. Until it's found, force I_16x16 to keep the
+     * dataset byte-exact. The full I_4x4 emit path is preserved in code;
+     * just flip this guard to re-enable. */
+    bits_b = INT32_MAX;
     if (bits_a <= bits_b) {
         st->mb_type_is_i4x4 = 0;
         st->mode16 = mode_a;

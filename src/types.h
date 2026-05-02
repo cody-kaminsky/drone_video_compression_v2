@@ -20,9 +20,10 @@ typedef uint32_t u32;
 #define MB_H   16
 #define BLK    4
 
-/* Maximum frame in our v1 plan: 4K UHD. Used for static-sized buffers in
- * the FPGA-friendly variant. v1 uses dynamic alloc. */
+/* Maximum frame: sized to cover the architecture's 4K UHD target plus the
+ * tall drone aerial samples in the validation set (e.g. agadir 3400x2671,
+ * alicudi 3840x2586). The static arena in encoder.c allocates by these. */
 #define MAX_W  3840
-#define MAX_H  2160
+#define MAX_H  2688
 
 #endif /* DCC_TYPES_H */
