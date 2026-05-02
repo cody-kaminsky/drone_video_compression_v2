@@ -1,7 +1,5 @@
 /* cavlc.c — CAVLC bit-length estimation + actual bit emission. */
 #include "cavlc_tables.h"
-#include <stdio.h>
-#include <stdlib.h>
 /* Original header below: */
 /* cavlc.c — CAVLC bit-length estimation.
  *
@@ -84,7 +82,6 @@ static int coeff_token_bits_approx(int total_coef, int trailing_ones, int nC)
  * suffix_length adapts as we encode levels in reverse scan order. */
 static int level_bits(int abs_level, int suffix_length, int *next_suffix)
 {
-    int level_code;
     /* "Level - 1" sign-magnitude shift used in spec — for bit length we
      * only need the magnitude. */
     if (suffix_length == 0) {
@@ -312,13 +309,6 @@ static int emit_level(bitstream_t *bs, int level_code, int suffix_length)
 static void emit_total_zeros(bitstream_t *bs, int total_zeros,
                              int total_coef, block_type_t bt)
 {
-    if (getenv("CAVLC_DEBUG")) {
-        vlc_t v = (bt == BLK_CHROMA_DC)
-                  ? total_zeros_chroma_dc[total_coef - 1][total_zeros]
-                  : total_zeros_4x4[total_coef - 1][total_zeros];
-        fprintf(stderr, "emit_total_zeros: tz=%d TC=%d bt=%d -> code=0x%X len=%d\n",
-                total_zeros, total_coef, bt, v.code, v.len);
-    }
     if (bt == BLK_CHROMA_DC) {
         emit_vlc(bs, total_zeros_chroma_dc[total_coef - 1][total_zeros]);
     } else {

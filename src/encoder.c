@@ -14,10 +14,32 @@
 #include "bitstream.h"
 #include "nal.h"
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* ===== static arena =====
+ * Bounded per-frame buffers, sized for the architecture max (MAX_W x MAX_H).
+ * Replacing malloc/free in the encode path is the M2 transition step toward
+ * FPGA-friendly C: fixed memory footprint, no allocator dependency, and
+ * predictable static analysis for the HLS port.
+ */
+
+#define ARENA_LUMA_W4     (MAX_W / 4)
+#define ARENA_LUMA_H4     (MAX_H / 4)
+#define ARENA_CHROMA_W4   (MAX_W / 8)
+#define ARENA_CHROMA_H4   (MAX_H / 8)
+
+/* RBSP slice payload buffer.
+ * 8 MB comfortably holds 4K at sane QPs and any 1080p QP. The bitstream-
+ * emitting path returns -6 on overflow if very low QPs blow the budget. */
+#define ARENA_RBSP_BYTES  (8 * 1024 * 1024)
+
+static u8  arena_recon_y    [MAX_W * MAX_H];
+static u8  arena_recon_uv   [MAX_W * (MAX_H / 2)];
+static int arena_luma_nc    [ARENA_LUMA_W4   * ARENA_LUMA_H4];
+static int arena_chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+static int arena_chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+static u8  arena_rbsp       [ARENA_RBSP_BYTES];
 
 /* ===== local helpers ===== */
 
@@ -470,13 +492,7 @@ static void try_i4x4_luma(const u8 src_mb[256],
         u8 best_pred[16];
         u8 pred[16];
 
-        /* Debug: I4_DC_ONLY=1 forces DC mode only — useful for isolating
-         * bugs in directional modes vs neighbor gathering. */
-        int dc_only = getenv("I4_DC_ONLY") != NULL;
-        int m_lo = 0, m_hi = 9;
-        if (dc_only) { m_lo = I4_DC; m_hi = I4_DC + 1; }
-
-        for (int m = m_lo; m < m_hi; m++) {
+        for (int m = 0; m < 9; m++) {
             /* Mode availability checks (spec 8.3.1.2). */
             if ((m == I4_VERTICAL          || m == I4_DIAG_DOWN_LEFT  ||
                  m == I4_VERTICAL_LEFT) && !at)  continue;
@@ -579,13 +595,8 @@ static int encode_mb(const u8 *src_y,  int stride_y,
     try_i4x4_luma(src_mb_y, recon_y, recon_stride_y, mb_r, mb_c, mbs_w,
                   qp_y, recon_mb_b, &info_b);
 
-    /* Pick winner by total estimated bits.
-     * Debug: force I_16x16 by setting I4_DEBUG_FORCE_16. */
-    int force_16 = getenv("I4_FORCE_16") != NULL;
-    int force_4  = getenv("I4_FORCE_4")  != NULL;
+    /* Pick winner by total estimated bits. */
     int pick_b = (info_b.total_bits < info_a.total_bits);
-    if (force_16) pick_b = 0;
-    if (force_4)  pick_b = 1;
     luma_path_t *winner = pick_b ? &info_b : &info_a;
     u8 *recon_mb_y     = pick_b ? recon_mb_b : recon_mb_a;
 
@@ -743,6 +754,7 @@ int encode_frame(int width, int height, int qp,
     if (width  % 16 != 0) return -1;
     if (height % 16 != 0) return -1;
     if (qp < 0 || qp > 51) return -2;
+    if (width > MAX_W || height > MAX_H) return -3;
 
     int mbs_w = width  / 16;
     int mbs_h = height / 16;
@@ -752,33 +764,26 @@ int encode_frame(int width, int height, int qp,
     int chroma_w4 = mbs_w * 2;
     int chroma_h4 = mbs_h * 2;
 
-    u8 *recon_y_int  = (u8*)malloc((size_t)width * height);
-    u8 *recon_uv_int = (u8*)malloc((size_t)width * (height / 2));
-    if (!recon_y_int || !recon_uv_int) {
-        free(recon_y_int); free(recon_uv_int);
-        return -3;
-    }
+    u8 *recon_y_int  = arena_recon_y;
+    u8 *recon_uv_int = arena_recon_uv;
     memset(recon_y_int,  128, (size_t)width * height);
     memset(recon_uv_int, 128, (size_t)width * (height / 2));
 
     nc_state_t ncs;
-    ncs.luma_nc     = (int*)calloc((size_t)luma_w4 * luma_h4,     sizeof(int));
-    ncs.chroma_u_nc = (int*)calloc((size_t)chroma_w4 * chroma_h4, sizeof(int));
-    ncs.chroma_v_nc = (int*)calloc((size_t)chroma_w4 * chroma_h4, sizeof(int));
-    ncs.luma_w4   = luma_w4;
-    ncs.luma_h4   = luma_h4;
-    ncs.chroma_w4 = chroma_w4;
-    ncs.chroma_h4 = chroma_h4;
-    if (!ncs.luma_nc || !ncs.chroma_u_nc || !ncs.chroma_v_nc) {
-        free(ncs.luma_nc); free(ncs.chroma_u_nc); free(ncs.chroma_v_nc);
-        free(recon_y_int); free(recon_uv_int);
-        return -3;
-    }
+    ncs.luma_nc     = arena_luma_nc;
+    ncs.chroma_u_nc = arena_chroma_u_nc;
+    ncs.chroma_v_nc = arena_chroma_v_nc;
+    ncs.luma_w4     = luma_w4;
+    ncs.luma_h4     = luma_h4;
+    ncs.chroma_w4   = chroma_w4;
+    ncs.chroma_h4   = chroma_h4;
+    memset(ncs.luma_nc,     0, (size_t)luma_w4   * luma_h4   * sizeof(int));
+    memset(ncs.chroma_u_nc, 0, (size_t)chroma_w4 * chroma_h4 * sizeof(int));
+    memset(ncs.chroma_v_nc, 0, (size_t)chroma_w4 * chroma_h4 * sizeof(int));
 
     int qp_c = chroma_qp(qp, 0);
 
     int total_residual_bits = 0;
-    int i4_count = 0, i16_count = 0;
 
     for (int r = 0; r < mbs_h; r++) {
         for (int c = 0; c < mbs_w; c++) {
@@ -789,7 +794,6 @@ int encode_frame(int width, int height, int qp,
                 qp, qp_c, &ncs);
         }
     }
-    (void)i4_count; (void)i16_count;
 
     int header_bits = 30 + (150 / 30) + 64;
     int total_bits  = total_residual_bits + header_bits;
@@ -820,8 +824,6 @@ int encode_frame(int width, int height, int qp,
         stats->bytes_out = (total_bits + 7) / 8;
     }
 
-    free(ncs.luma_nc); free(ncs.chroma_u_nc); free(ncs.chroma_v_nc);
-    free(recon_y_int); free(recon_uv_int);
     return 0;
 }
 
@@ -857,9 +859,7 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
 
     int mode16 = I16_DC, best_cost = INT32_MAX;
     u8 pred_y[256], best_pred[256];
-    int force_dc = getenv("DCC_FORCE_DC") != NULL;
     for (int m = 0; m < 4; m++) {
-        if (force_dc && m != I16_DC) continue;
         if (m == I16_VERTICAL   && !at)  continue;
         if (m == I16_HORIZONTAL && !al)  continue;
         if (m == I16_PLANE      && !(at && al && atl)) continue;
@@ -990,10 +990,6 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
     }
     int cbp_chroma = chroma_ac_nz ? 2 : (chroma_dc_nz ? 1 : 0);
 
-    /* Debug: force cbp_chroma=0 / cbp_luma=0 to isolate where bug lives. */
-    if (getenv("DCC_NO_CHROMA")) cbp_chroma = 0;
-    if (getenv("DCC_NO_LUMA"))   cbp_luma = 0;
-
     int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
 
     /* === Emit MB syntax ===
@@ -1019,21 +1015,6 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
 
         i16 zz[16];
         for (int k = 0; k < 16; k++) zz[k] = dc_levels[zz_scan_4x4[k]];
-        if (getenv("DCC_DEBUG_FIRST_MB") && mb_r == 0 && mb_c == 0) {
-            fprintf(stderr, "DC levels (zigzag): ");
-            for (int k = 0; k < 16; k++) fprintf(stderr, "%d ", zz[k]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "mode16=%d cbp_luma=%d cbp_chroma=%d mb_type=%d\n",
-                    mode16, cbp_luma, cbp_chroma,
-                    1 + mode16 + 4*cbp_chroma + 12*cbp_luma);
-        }
-        if (getenv("DCC_DUMP_BITS")) {
-            int blk_start = bs->byte_pos * 8 + bs->n_in_cur;
-            int nz = 0; for (int k = 0; k < 16; k++) if (zz[k] != 0) nz++;
-            fprintf(stderr, "ENC MB(%d,%d) DC: nC=%d TC=%d zz=", mb_r, mb_c, nC_dc, nz);
-            for (int k = 0; k < 16; k++) fprintf(stderr, "%d ", zz[k]);
-            fprintf(stderr, "start=%d\n", blk_start);
-        }
         cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC_dc);
     }
 
@@ -1059,19 +1040,7 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
         int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
 
         if (cbp_luma) {
-            if (getenv("DCC_DUMP_AC")) {
-                fprintf(stderr, "MB(%d,%d) blk8scan=%d br=%d bc=%d nC=%d zz[1..15]=",
-                        mb_r, mb_c, s, br, bc, nC);
-                for (int k = 1; k < 16; k++) fprintf(stderr, "%d ", zz[k]);
-                fprintf(stderr, "\n");
-            }
-            int blk_start = bs->byte_pos * 8 + bs->n_in_cur;
             cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
-            int blk_end = bs->byte_pos * 8 + bs->n_in_cur;
-            if (getenv("DCC_DUMP_BITS")) {
-                fprintf(stderr, "ENC MB(%d,%d) blk%d: bits=%d-%d (size %d)\n",
-                        mb_r, mb_c, s, blk_start, blk_end, blk_end - blk_start);
-            }
         }
         ncs->luma_nc[gy * luma_w4 + gx] = count_nonzero(&zz[1], 15);
     }
@@ -1123,6 +1092,7 @@ int encode_frame_h264(int width, int height, int qp,
     if (height % 16 != 0) return -1;
     if (qp < 0 || qp > 51) return -2;
     if (!bs_out)           return -3;
+    if (width > MAX_W || height > MAX_H) return -3;
 
     int mbs_w = width  / 16;
     int mbs_h = height / 16;
@@ -1143,14 +1113,8 @@ int encode_frame_h264(int width, int height, int qp,
     dst_pos += n;
 
     /* === Slice RBSP === */
-    /* Per-MB worst case: 24 blocks × 16 coefs × ~32 bits + headers.
-     * At QP=0 (lossless) levels can be large and CAVLC bits balloon to
-     * ~2 KB per MB. Be generous to avoid overflow. */
-    int rbsp_cap = mb_count * 2048 + 256;
-    u8 *rbsp = (u8*)malloc((size_t)rbsp_cap);
-    if (!rbsp) return -5;
     bitstream_t bs;
-    bs_init(&bs, rbsp, rbsp_cap);
+    bs_init(&bs, arena_rbsp, ARENA_RBSP_BYTES);
 
     /* Slice header */
     bs_put_ue(&bs, 0);                       /* first_mb_in_slice */
@@ -1168,24 +1132,23 @@ int encode_frame_h264(int width, int height, int qp,
     bs_put_ue(&bs, 1);                       /* disable_deblocking_filter_idc */
     /* When idc != 1, alpha/beta offsets are NOT signaled. */
 
-    /* Recon buffers */
-    u8 *recon_y_int  = (u8*)malloc((size_t)width * height);
-    u8 *recon_uv_int = (u8*)malloc((size_t)width * (height / 2));
-    if (!recon_y_int || !recon_uv_int) {
-        free(rbsp); free(recon_y_int); free(recon_uv_int);
-        return -5;
-    }
+    /* Recon buffers from the static arena. */
+    u8 *recon_y_int  = arena_recon_y;
+    u8 *recon_uv_int = arena_recon_uv;
     memset(recon_y_int,  128, (size_t)width * height);
     memset(recon_uv_int, 128, (size_t)width * (height / 2));
 
     nc_state_t ncs;
-    ncs.luma_nc     = (int*)calloc((size_t)luma_w4 * luma_h4,     sizeof(int));
-    ncs.chroma_u_nc = (int*)calloc((size_t)chroma_w4 * chroma_h4, sizeof(int));
-    ncs.chroma_v_nc = (int*)calloc((size_t)chroma_w4 * chroma_h4, sizeof(int));
-    ncs.luma_w4   = luma_w4;
-    ncs.luma_h4   = luma_h4;
-    ncs.chroma_w4 = chroma_w4;
-    ncs.chroma_h4 = chroma_h4;
+    ncs.luma_nc     = arena_luma_nc;
+    ncs.chroma_u_nc = arena_chroma_u_nc;
+    ncs.chroma_v_nc = arena_chroma_v_nc;
+    ncs.luma_w4     = luma_w4;
+    ncs.luma_h4     = luma_h4;
+    ncs.chroma_w4   = chroma_w4;
+    ncs.chroma_h4   = chroma_h4;
+    memset(ncs.luma_nc,     0, (size_t)luma_w4   * luma_h4   * sizeof(int));
+    memset(ncs.chroma_u_nc, 0, (size_t)chroma_w4 * chroma_h4 * sizeof(int));
+    memset(ncs.chroma_v_nc, 0, (size_t)chroma_w4 * chroma_h4 * sizeof(int));
 
     int qp_c = chroma_qp(qp, 0);
 
@@ -1201,19 +1164,11 @@ int encode_frame_h264(int width, int height, int qp,
 
     bs_rbsp_trailing(&bs);
     int rbsp_len = bs_byte_count(&bs);
-    if (bs.overflow) {
-        free(rbsp); free(recon_y_int); free(recon_uv_int);
-        free(ncs.luma_nc); free(ncs.chroma_u_nc); free(ncs.chroma_v_nc);
-        return -6;
-    }
+    if (bs.overflow) return -6;
 
     /* Wrap in IDR NAL */
-    n = nal_emit_idr(bs_out + dst_pos, bs_max_size - dst_pos, rbsp, rbsp_len);
-    if (n < 0) {
-        free(rbsp); free(recon_y_int); free(recon_uv_int);
-        free(ncs.luma_nc); free(ncs.chroma_u_nc); free(ncs.chroma_v_nc);
-        return -6;
-    }
+    n = nal_emit_idr(bs_out + dst_pos, bs_max_size - dst_pos, arena_rbsp, rbsp_len);
+    if (n < 0) return -6;
     dst_pos += n;
 
     /* PSNR vs source */
@@ -1241,8 +1196,5 @@ int encode_frame_h264(int width, int height, int qp,
         stats->mb_count  = mb_count;
     }
 
-    free(rbsp);
-    free(recon_y_int); free(recon_uv_int);
-    free(ncs.luma_nc); free(ncs.chroma_u_nc); free(ncs.chroma_v_nc);
     return 0;
 }

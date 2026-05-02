@@ -99,6 +99,47 @@ static int avg_n(const u8 *p, int n)
     return (s + (n / 2)) / n;
 }
 
+/* IC_DC computation — extracted so IC_PLANE's unavailable-neighbor fallback
+ * can call it directly (avoiding self-recursion in predict_chroma_8x8). */
+static void chroma_8x8_dc(const u8 top[8], const u8 left[8],
+                          int avail_top, int avail_left, u8 pred[64])
+{
+    /* Spec 8.3.4.2 — chroma DC has 4 4x4 quadrants with different
+     * averaging rules depending on neighbor availability. */
+    int dc[4]; /* index by quadrant: 0=TL, 1=TR, 2=BL, 3=BR */
+
+    if (avail_top && avail_left) {
+        int s = 0;
+        for (int k = 0; k < 4; k++) s += top[k] + left[k];
+        dc[0] = (s + 4) >> 3;
+    } else if (avail_top)        dc[0] = avg_n(top,  4);
+      else if (avail_left)       dc[0] = avg_n(left, 4);
+      else                       dc[0] = 128;
+
+    if (avail_top)               dc[1] = avg_n(top + 4, 4);
+    else if (avail_left)         dc[1] = avg_n(left,    4);
+    else                         dc[1] = 128;
+
+    if (avail_left)              dc[2] = avg_n(left + 4, 4);
+    else if (avail_top)          dc[2] = avg_n(top,      4);
+    else                         dc[2] = 128;
+
+    if (avail_top && avail_left) {
+        int s = 0;
+        for (int k = 4; k < 8; k++) s += top[k] + left[k];
+        dc[3] = (s + 4) >> 3;
+    } else if (avail_top)        dc[3] = avg_n(top + 4,  4);
+      else if (avail_left)       dc[3] = avg_n(left + 4, 4);
+      else                       dc[3] = 128;
+
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            int q = (i / 4) * 2 + (j / 4);
+            pred[i * 8 + j] = (u8)dc[q];
+        }
+    }
+}
+
 void predict_chroma_8x8(int mode,
                         const u8 top[8], const u8 left[8], u8 tl,
                         int avail_top, int avail_left, int avail_tl,
@@ -127,52 +168,13 @@ void predict_chroma_8x8(int mode,
             memcpy(&pred[i * 8], top, 8);
         return;
 
-    case IC_DC: {
-        /* Spec 8.3.4.2 — chroma DC has 4 4x4 quadrants with different
-         * averaging rules depending on neighbor availability. */
-        int dc[4]; /* index by quadrant: 0=TL, 1=TR, 2=BL, 3=BR */
-
-        /* Top-left 4x4 */
-        if (avail_top && avail_left) {
-            int s = 0;
-            for (int k = 0; k < 4; k++) s += top[k] + left[k];
-            dc[0] = (s + 4) >> 3;
-        } else if (avail_top)        dc[0] = (avg_n(top,  4));
-          else if (avail_left)       dc[0] = (avg_n(left, 4));
-          else                       dc[0] = 128;
-
-        /* Top-right 4x4 */
-        if (avail_top)               dc[1] = avg_n(top + 4, 4);
-        else if (avail_left)         dc[1] = avg_n(left,    4);
-        else                         dc[1] = 128;
-
-        /* Bottom-left 4x4 */
-        if (avail_left)              dc[2] = avg_n(left + 4, 4);
-        else if (avail_top)          dc[2] = avg_n(top,      4);
-        else                         dc[2] = 128;
-
-        /* Bottom-right 4x4 */
-        if (avail_top && avail_left) {
-            int s = 0;
-            for (int k = 4; k < 8; k++) s += top[k] + left[k];
-            dc[3] = (s + 4) >> 3;
-        } else if (avail_top)        dc[3] = avg_n(top + 4,  4);
-          else if (avail_left)       dc[3] = avg_n(left + 4, 4);
-          else                       dc[3] = 128;
-
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 8; j++) {
-                int q = (i / 4) * 2 + (j / 4);
-                pred[i * 8 + j] = (u8)dc[q];
-            }
-        }
+    case IC_DC:
+        chroma_8x8_dc(top, left, avail_top, avail_left, pred);
         return;
-    }
 
     case IC_PLANE: {
         if (!(avail_top && avail_left && avail_tl)) {
-            predict_chroma_8x8(IC_DC, top, left, tl,
-                               avail_top, avail_left, avail_tl, pred);
+            chroma_8x8_dc(top, left, avail_top, avail_left, pred);
             return;
         }
         int top_ext[9], left_ext[9];

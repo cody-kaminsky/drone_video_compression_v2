@@ -1,8 +1,6 @@
 /* bitstream.c — bit-level writer for H.264 Annex B output. */
 
 #include "bitstream.h"
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 void bs_init(bitstream_t *bs, u8 *buf, int cap)
@@ -40,19 +38,6 @@ void bs_put_bits(bitstream_t *bs, u32 val, int nbits)
      * shift it down into the appropriate position above n_in_cur. */
     u32 mask = (nbits == 32) ? 0xFFFFFFFFu : ((1u << nbits) - 1u);
     val &= mask;
-
-    /* Debug: log every emission. Set BS_DEBUG=1 to enable. */
-    {
-        static int debug = -1;
-        if (debug < 0) {
-            const char *e = getenv("BS_DEBUG");
-            debug = e && *e ? 1 : 0;
-        }
-        if (debug) {
-            fprintf(stderr, "bs_put_bits val=0x%X nbits=%d at bit_pos=%d\n",
-                    val, nbits, bs->byte_pos * 8 + bs->n_in_cur);
-        }
-    }
 
     /* Place val starting at bit (31 - n_in_cur), going downward. */
     int free_bits = 32 - bs->n_in_cur;
