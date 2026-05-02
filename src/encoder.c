@@ -13,6 +13,7 @@
 #include "cavlc.h"
 #include "bitstream.h"
 #include "nal.h"
+#include "mb_state.h"
 
 #include <string.h>
 #include <math.h>
@@ -835,7 +836,338 @@ int encode_frame(int width, int height, int qp,
  * emitted bitstream (yet). The internal forward+inverse paths still apply
  * the same math as the estimate-only path, so PSNR matches the decoder's
  * reconstruction.
+ *
+ * Pipeline structure (architecture.txt §8/§9). Each stage is a pure function
+ * over mb_state_t — these are the boundaries that become module / FIFO
+ * interfaces in the HLS port.
  */
+
+/* I_4x4 sub-block scan order within an MB (used by stage 7 to walk AC
+ * blocks for CAVLC emission and by stage 7 nC indexing). Spec 8.5.6. */
+static const int blk_scan_br[16] = {0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3};
+static const int blk_scan_bc[16] = {0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3};
+
+/* === stage 0: mb_fetch ===
+ * Read source MB samples from frame and gather neighbor samples for
+ * prediction. Architecture.txt §8 "MB Fetch" stage. */
+static void mb_fetch(const u8 *src_y,  int stride_y,
+                     const u8 *src_uv, int stride_uv,
+                     const u8 *recon_y, int recon_stride_y,
+                     const u8 *recon_uv, int recon_stride_uv,
+                     int width, int height, mb_state_t *st)
+{
+    copy_in_mb_luma(src_y, stride_y, st->mb_r, st->mb_c, st->src_y);
+    copy_in_mb_chroma_split(src_uv, stride_uv, st->mb_r, st->mb_c,
+                            st->src_u, st->src_v);
+
+    gather_neighbors_luma(recon_y, recon_stride_y, st->mb_r, st->mb_c,
+                          width, height,
+                          st->luma_top, st->luma_left, &st->luma_tl,
+                          &st->luma_avail_top, &st->luma_avail_left,
+                          &st->luma_avail_tl);
+
+    gather_neighbors_chroma(recon_uv, recon_stride_uv, st->mb_r, st->mb_c,
+                            st->cu_top, st->cu_left, &st->cu_tl,
+                            st->cv_top, st->cv_left, &st->cv_tl,
+                            &st->chroma_avail_top,
+                            &st->chroma_avail_left,
+                            &st->chroma_avail_tl);
+}
+
+/* === stage 1: mb_mode_decide ===
+ * Pick I_16x16 luma mode (4 candidates) by SATD, and chroma 8x8 mode
+ * (4 candidates) by combined U+V SAD. Writes chosen modes and the matching
+ * predicted samples into mb_state. Architecture.txt §8 "Mode Decision". */
+static void mb_mode_decide(mb_state_t *st)
+{
+    /* Luma I_16x16. */
+    int mode = I16_DC, best = INT32_MAX;
+    u8 cand[256];
+    for (int m = 0; m < 4; m++) {
+        if (m == I16_VERTICAL   && !st->luma_avail_top)  continue;
+        if (m == I16_HORIZONTAL && !st->luma_avail_left) continue;
+        if (m == I16_PLANE      && !(st->luma_avail_top && st->luma_avail_left
+                                     && st->luma_avail_tl)) continue;
+        predict_16x16(m, st->luma_top, st->luma_left, st->luma_tl,
+                      st->luma_avail_top, st->luma_avail_left,
+                      st->luma_avail_tl, cand);
+        int cost = satd_16x16(st->src_y, cand);
+        if (cost < best) {
+            best = cost;
+            mode = m;
+            memcpy(st->pred_y, cand, 256);
+        }
+    }
+    st->mode16 = mode;
+
+    /* Chroma 8x8. SAD jointly across U and V. */
+    int cmode = IC_DC, cbest = INT32_MAX;
+    u8 cand_u[64], cand_v[64];
+    for (int m = 0; m < 4; m++) {
+        if (m == IC_VERTICAL   && !st->chroma_avail_top)  continue;
+        if (m == IC_HORIZONTAL && !st->chroma_avail_left) continue;
+        if (m == IC_PLANE      && !(st->chroma_avail_top && st->chroma_avail_left
+                                    && st->chroma_avail_tl)) continue;
+        predict_chroma_8x8(m, st->cu_top, st->cu_left, st->cu_tl,
+                           st->chroma_avail_top, st->chroma_avail_left,
+                           st->chroma_avail_tl, cand_u);
+        predict_chroma_8x8(m, st->cv_top, st->cv_left, st->cv_tl,
+                           st->chroma_avail_top, st->chroma_avail_left,
+                           st->chroma_avail_tl, cand_v);
+        int s = sad_n(st->src_u, cand_u, 64) + sad_n(st->src_v, cand_v, 64);
+        if (s < cbest) {
+            cbest = s;
+            cmode = m;
+            memcpy(st->pred_u, cand_u, 64);
+            memcpy(st->pred_v, cand_v, 64);
+        }
+    }
+    st->mode_chroma = cmode;
+}
+
+/* === stage 2: mb_residual ===
+ * res = src - pred for all 16 luma 4x4 blocks and 4+4 chroma 4x4 blocks.
+ * Architecture.txt §8 "Pred + Residual". */
+static void mb_residual(mb_state_t *st)
+{
+    for (int br = 0; br < 4; br++)
+        for (int bc = 0; bc < 4; bc++)
+            residual_4x4(st->src_y, st->pred_y, br, bc, st->res_y[br*4 + bc]);
+
+    for (int br = 0; br < 2; br++)
+        for (int bc = 0; bc < 2; bc++) {
+            residual_4x4_8x8(st->src_u, st->pred_u, br, bc, st->res_u[br*2 + bc]);
+            residual_4x4_8x8(st->src_v, st->pred_v, br, bc, st->res_v[br*2 + bc]);
+        }
+}
+
+/* === stage 3: mb_transform ===
+ * 4x4 integer DCT per block; extract DC coefficient into a separate array;
+ * Hadamard-transform the DC array (4x4 for luma, 2x2 for chroma).
+ * Architecture.txt §8 "4x4 T + DC Hadamard". */
+static void mb_transform(mb_state_t *st)
+{
+    /* Luma: per-block DCT, extract DC, zero DC slot in dct_ac. */
+    for (int idx = 0; idx < 16; idx++) {
+        i16 dct[16];
+        dct4x4(st->res_y[idx], dct);
+        st->dc_extract_y[idx] = dct[0];
+        memcpy(st->dct_ac_y[idx], dct, sizeof dct);
+        st->dct_ac_y[idx][0] = 0;
+    }
+    hadamard4x4(st->dc_extract_y, st->dc_had_y);
+
+    /* Chroma U */
+    for (int idx = 0; idx < 4; idx++) {
+        i16 dct[16];
+        dct4x4(st->res_u[idx], dct);
+        st->dc_extract_u[idx] = dct[0];
+        memcpy(st->dct_ac_u[idx], dct, sizeof dct);
+        st->dct_ac_u[idx][0] = 0;
+    }
+    hadamard2x2(st->dc_extract_u, st->dc_had_u);
+
+    /* Chroma V */
+    for (int idx = 0; idx < 4; idx++) {
+        i16 dct[16];
+        dct4x4(st->res_v[idx], dct);
+        st->dc_extract_v[idx] = dct[0];
+        memcpy(st->dct_ac_v[idx], dct, sizeof dct);
+        st->dct_ac_v[idx][0] = 0;
+    }
+    hadamard2x2(st->dc_extract_v, st->dc_had_v);
+}
+
+/* === stage 4: mb_quantize ===
+ * Quantize all AC blocks and the per-component DC blocks.
+ * AC blocks stored in raster order (matches MF table position indexing).
+ * Architecture.txt §8 "Quantize". */
+static void mb_quantize(mb_state_t *st)
+{
+    for (int idx = 0; idx < 16; idx++)
+        quant_4x4(st->dct_ac_y[idx], st->ac_levels_y[idx], st->qp_y, 1);
+    quant_dc_4x4(st->dc_had_y, st->dc_levels_y, st->qp_y, 1);
+
+    for (int idx = 0; idx < 4; idx++) {
+        quant_4x4(st->dct_ac_u[idx], st->ac_levels_u[idx], st->qp_c, 1);
+        quant_4x4(st->dct_ac_v[idx], st->ac_levels_v[idx], st->qp_c, 1);
+    }
+    quant_dc_2x2(st->dc_had_u, st->dc_levels_u, st->qp_c, 1);
+    quant_dc_2x2(st->dc_had_v, st->dc_levels_v, st->qp_c, 1);
+}
+
+/* === stages 5+6: mb_reconstruct ===
+ * Inverse-quantize, inverse-Hadamard the DC, splice DC back into AC,
+ * inverse-DCT, add prediction, clip to u8. Architecture.txt §8 "iQ + iT"
+ * and "Reconstruct" — fused here because the i32 residual handoff is
+ * trivial in software (in HW these are two cascaded modules with a
+ * register handoff). */
+static void mb_reconstruct(mb_state_t *st)
+{
+    /* Luma */
+    i32 dc_dq[16], dc_recon[16];
+    iquant_dc_4x4(st->dc_levels_y, dc_dq, st->qp_y);
+    ihadamard4x4(dc_dq, dc_recon);
+    for (int br = 0; br < 4; br++)
+        for (int bc = 0; bc < 4; bc++) {
+            int idx = br*4 + bc;
+            i32 ac_dq[16];
+            iquant_4x4(st->ac_levels_y[idx], ac_dq, st->qp_y);
+            ac_dq[0] = dc_recon[idx];
+            i32 res[16];
+            idct4x4(ac_dq, res);
+            recon_4x4(st->recon_y, st->pred_y, br, bc, res);
+        }
+
+    /* Chroma U */
+    i32 dc_dq_u[4], dc_recon_u[4];
+    iquant_dc_2x2(st->dc_levels_u, dc_dq_u, st->qp_c);
+    ihadamard2x2(dc_dq_u, dc_recon_u);
+    for (int br = 0; br < 2; br++)
+        for (int bc = 0; bc < 2; bc++) {
+            int idx = br*2 + bc;
+            i32 ac_dq[16];
+            iquant_4x4(st->ac_levels_u[idx], ac_dq, st->qp_c);
+            ac_dq[0] = dc_recon_u[idx];
+            i32 res[16];
+            idct4x4(ac_dq, res);
+            recon_4x4_8x8(st->recon_u, st->pred_u, br, bc, res);
+        }
+
+    /* Chroma V */
+    i32 dc_dq_v[4], dc_recon_v[4];
+    iquant_dc_2x2(st->dc_levels_v, dc_dq_v, st->qp_c);
+    ihadamard2x2(dc_dq_v, dc_recon_v);
+    for (int br = 0; br < 2; br++)
+        for (int bc = 0; bc < 2; bc++) {
+            int idx = br*2 + bc;
+            i32 ac_dq[16];
+            iquant_4x4(st->ac_levels_v[idx], ac_dq, st->qp_c);
+            ac_dq[0] = dc_recon_v[idx];
+            i32 res[16];
+            idct4x4(ac_dq, res);
+            recon_4x4_8x8(st->recon_v, st->pred_v, br, bc, res);
+        }
+}
+
+/* Compute coded-block-pattern flags from quantized levels.
+ * cbp_luma   = 1 iff any AC luma coefficient is nonzero (positions 1..15).
+ * cbp_chroma = 0 if all chroma is zero,
+ *              1 if any chroma DC is nonzero but all chroma AC is zero,
+ *              2 if any chroma AC is nonzero. */
+static void mb_compute_cbp(mb_state_t *st)
+{
+    int cbp_luma = 0;
+    for (int idx = 0; idx < 16 && !cbp_luma; idx++)
+        for (int k = 1; k < 16; k++)
+            if (st->ac_levels_y[idx][k] != 0) { cbp_luma = 1; break; }
+
+    int chroma_dc_nz = 0, chroma_ac_nz = 0;
+    for (int k = 0; k < 4; k++) {
+        if (st->dc_levels_u[k] != 0) chroma_dc_nz = 1;
+        if (st->dc_levels_v[k] != 0) chroma_dc_nz = 1;
+    }
+    for (int idx = 0; idx < 4 && !chroma_ac_nz; idx++)
+        for (int k = 1; k < 16; k++) {
+            if (st->ac_levels_u[idx][k] != 0) { chroma_ac_nz = 1; break; }
+            if (st->ac_levels_v[idx][k] != 0) { chroma_ac_nz = 1; break; }
+        }
+
+    st->cbp_luma   = cbp_luma;
+    st->cbp_chroma = chroma_ac_nz ? 2 : (chroma_dc_nz ? 1 : 0);
+}
+
+/* === stage 7: mb_cavlc_emit ===
+ * Emit the macroblock layer to the slice bitstream. Order matches H.264
+ * spec 7.3.5.1: mb_type, intra_chroma_pred_mode, mb_qp_delta, then
+ * residual blocks (luma DC, luma AC×16, chroma DC ×2, chroma AC ×8).
+ * Updates the neighbor totalcoeff buffers (ncs) so subsequent MBs see
+ * the right nC for their predictor.
+ * Architecture.txt §8 "CAVLC + bit pack". */
+static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
+{
+    int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
+
+    /* mb_type for I_16x16: spec Table 7-11
+     * mb_type = 1 + PredMode + 4*CBPChroma + 12*CBPLuma. */
+    int mb_type = 1 + st->mode16 + 4 * st->cbp_chroma + 12 * st->cbp_luma;
+    bs_put_ue(bs, mb_type);
+    bs_put_ue(bs, st->mode_chroma);     /* intra_chroma_pred_mode */
+    bs_put_se(bs, 0);                   /* mb_qp_delta = 0 */
+
+    int luma_w4   = ncs->luma_w4;
+    int chroma_w4 = ncs->chroma_w4;
+
+    /* Luma DC block (always emitted for I_16x16). nC from block-0 neighbors. */
+    {
+        int gx0 = st->mb_c * 4;
+        int gy0 = st->mb_r * 4;
+        int top_nc  = (gy0 > 0) ? ncs->luma_nc[(gy0 - 1) * luma_w4 + gx0] : 0;
+        int left_nc = (gx0 > 0) ? ncs->luma_nc[gy0 * luma_w4 + (gx0 - 1)] : 0;
+        int nC = cavlc_compute_nC(top_nc, left_nc, gy0 > 0, gx0 > 0);
+
+        i16 zz[16];
+        for (int k = 0; k < 16; k++) zz[k] = st->dc_levels_y[zz_scan_4x4[k]];
+        cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
+    }
+
+    /* Luma AC blocks in I_4x4 sub-block scan order.
+     * Spec 8.5.6 — nC for each block reads from already-encoded top/left
+     * neighbors. We update ncs->luma_nc immediately after each block so the
+     * next block sees the latest counts. */
+    for (int s = 0; s < 16; s++) {
+        int br = blk_scan_br[s];
+        int bc = blk_scan_bc[s];
+        int idx = br*4 + bc;
+
+        i16 zz[16];
+        for (int k = 0; k < 16; k++)
+            zz[k] = st->ac_levels_y[idx][zz_scan_4x4[k]];
+
+        int gx = st->mb_c * 4 + bc;
+        int gy = st->mb_r * 4 + br;
+        int top_nc  = (gy > 0) ? ncs->luma_nc[(gy - 1) * luma_w4 + gx] : 0;
+        int left_nc = (gx > 0) ? ncs->luma_nc[gy * luma_w4 + (gx - 1)] : 0;
+        int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
+
+        if (st->cbp_luma)
+            cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
+        ncs->luma_nc[gy * luma_w4 + gx] = count_nonzero(&zz[1], 15);
+    }
+
+    /* Chroma DC: emitted in U,V order whenever cbp_chroma >= 1. */
+    if (st->cbp_chroma >= 1) {
+        cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+        cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+    }
+
+    /* Chroma AC: 4 U blocks then 4 V blocks. nC update mirrors the luma
+     * AC update — emit-or-skip based on cbp_chroma == 2, but ALWAYS update
+     * neighbor counts (a downstream block's predictor depends on them). */
+    for (int comp = 0; comp < 2; comp++) {
+        int *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
+        i16 (*ac_levels)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
+        for (int br = 0; br < 2; br++)
+            for (int bc = 0; bc < 2; bc++) {
+                int idx = br*2 + bc;
+                i16 zz[16];
+                for (int k = 0; k < 16; k++)
+                    zz[k] = ac_levels[idx][zz_scan_4x4[k]];
+
+                int gx = st->mb_c * 2 + bc;
+                int gy = st->mb_r * 2 + br;
+                int top_nc  = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
+                int left_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
+                int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
+
+                if (st->cbp_chroma == 2)
+                    cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                cnc[gy * chroma_w4 + gx] = count_nonzero(&zz[1], 15);
+            }
+    }
+
+    return bs->byte_pos * 8 + bs->n_in_cur - start_bits;
+}
 
 static int encode_mb_emit(const u8 *src_y,  int stride_y,
                           const u8 *src_uv, int stride_uv,
@@ -845,239 +1177,29 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                           int qp_y, int qp_c, nc_state_t *ncs,
                           bitstream_t *bs)
 {
-    /* === Source MB === */
-    u8 src_mb_y[256];
-    u8 src_mb_u[64], src_mb_v[64];
-    copy_in_mb_luma(src_y, stride_y, mb_r, mb_c, src_mb_y);
-    copy_in_mb_chroma_split(src_uv, stride_uv, mb_r, mb_c, src_mb_u, src_mb_v);
+    mb_state_t st = {0};
+    st.mb_r = mb_r;
+    st.mb_c = mb_c;
+    st.qp_y = qp_y;
+    st.qp_c = qp_c;
 
-    /* === I_16x16 mode decision === */
-    u8 top[16], left[16], tl;
-    int at, al, atl;
-    gather_neighbors_luma(recon_y, recon_stride_y, mb_r, mb_c, width, height,
-                          top, left, &tl, &at, &al, &atl);
+    mb_fetch(src_y, stride_y, src_uv, stride_uv,
+             recon_y, recon_stride_y, recon_uv, recon_stride_uv,
+             width, height, &st);
+    mb_mode_decide(&st);
+    mb_residual(&st);
+    mb_transform(&st);
+    mb_quantize(&st);
+    mb_reconstruct(&st);
 
-    int mode16 = I16_DC, best_cost = INT32_MAX;
-    u8 pred_y[256], best_pred[256];
-    for (int m = 0; m < 4; m++) {
-        if (m == I16_VERTICAL   && !at)  continue;
-        if (m == I16_HORIZONTAL && !al)  continue;
-        if (m == I16_PLANE      && !(at && al && atl)) continue;
-        predict_16x16(m, top, left, tl, at, al, atl, pred_y);
-        int cost = satd_16x16(src_mb_y, pred_y);
-        if (cost < best_cost) { best_cost = cost; mode16 = m;
-                                memcpy(best_pred, pred_y, 256); }
-    }
-
-    /* === Forward + inverse luma === */
-    i16 luma_dc[16];
-    i16 ac_levels_raster[16][16];
-    i16 dc_levels[16];
-
-    for (int br = 0; br < 4; br++) {
-        for (int bc = 0; bc < 4; bc++) {
-            i16 res[16], dct[16];
-            residual_4x4(src_mb_y, best_pred, br, bc, res);
-            dct4x4(res, dct);
-            int idx = br*4 + bc;
-            luma_dc[idx] = dct[0];
-            i16 dct_zd[16];
-            memcpy(dct_zd, dct, sizeof(dct));
-            dct_zd[0] = 0;
-            quant_4x4(dct_zd, ac_levels_raster[idx], qp_y, 1);
-        }
-    }
-    i32 dc_had[16];
-    hadamard4x4(luma_dc, dc_had);
-    quant_dc_4x4(dc_had, dc_levels, qp_y, 1);
-
-    /* Inverse path → recon_mb_y */
-    i32 dc_dq[16], dc_recon[16];
-    iquant_dc_4x4(dc_levels, dc_dq, qp_y);
-    ihadamard4x4(dc_dq, dc_recon);
-
-    u8 recon_mb_y[256];
-    for (int br = 0; br < 4; br++) {
-        for (int bc = 0; bc < 4; bc++) {
-            int idx = br*4 + bc;
-            i32 ac_dq[16];
-            iquant_4x4(ac_levels_raster[idx], ac_dq, qp_y);
-            ac_dq[0] = dc_recon[idx];
-            i32 res[16];
-            idct4x4(ac_dq, res);
-            recon_4x4(recon_mb_y, best_pred, br, bc, res);
-        }
-    }
-    copy_out_mb_luma(recon_y, recon_stride_y, mb_r, mb_c, recon_mb_y);
-
-    /* === Chroma === */
-    u8 ctop_u[8], cleft_u[8], ctl_u, ctop_v[8], cleft_v[8], ctl_v;
-    int cat, cal, catl;
-    gather_neighbors_chroma(recon_uv, recon_stride_uv, mb_r, mb_c,
-                            ctop_u, cleft_u, &ctl_u, ctop_v, cleft_v, &ctl_v,
-                            &cat, &cal, &catl);
-
-    int mode_c = IC_DC, best_sad_c = INT32_MAX;
-    u8 pred_u[64], pred_v[64], best_pred_u[64], best_pred_v[64];
-    for (int m = 0; m < 4; m++) {
-        if (m == IC_VERTICAL   && !cat) continue;
-        if (m == IC_HORIZONTAL && !cal) continue;
-        if (m == IC_PLANE      && !(cat && cal && catl)) continue;
-        predict_chroma_8x8(m, ctop_u, cleft_u, ctl_u, cat, cal, catl, pred_u);
-        predict_chroma_8x8(m, ctop_v, cleft_v, ctl_v, cat, cal, catl, pred_v);
-        int s = sad_n(src_mb_u, pred_u, 64) + sad_n(src_mb_v, pred_v, 64);
-        if (s < best_sad_c) { best_sad_c = s; mode_c = m;
-                              memcpy(best_pred_u, pred_u, 64);
-                              memcpy(best_pred_v, pred_v, 64); }
-    }
-
-    i16 c_dc[2][4];
-    i16 c_ac_levels[2][4][16];
-    i16 c_dc_levels[2][4];
-    const u8 *src_c[2]  = { src_mb_u,    src_mb_v };
-    const u8 *pred_c[2] = { best_pred_u, best_pred_v };
-    u8 recon_mb_c[2][64];
-
-    for (int comp = 0; comp < 2; comp++) {
-        for (int br = 0; br < 2; br++) {
-            for (int bc = 0; bc < 2; bc++) {
-                i16 res[16], dct[16];
-                residual_4x4_8x8(src_c[comp], pred_c[comp], br, bc, res);
-                dct4x4(res, dct);
-                c_dc[comp][br*2 + bc] = dct[0];
-                i16 dct_zd[16];
-                memcpy(dct_zd, dct, sizeof(dct));
-                dct_zd[0] = 0;
-                quant_4x4(dct_zd, c_ac_levels[comp][br*2 + bc], qp_c, 1);
-            }
-        }
-        i16 dc_had_c[4];
-        hadamard2x2(c_dc[comp], dc_had_c);
-        quant_dc_2x2(dc_had_c, c_dc_levels[comp], qp_c, 1);
-
-        i32 dc_dq_c[4], dc_recon_c[4];
-        iquant_dc_2x2(c_dc_levels[comp], dc_dq_c, qp_c);
-        ihadamard2x2(dc_dq_c, dc_recon_c);
-
-        for (int br = 0; br < 2; br++) {
-            for (int bc = 0; bc < 2; bc++) {
-                int idx = br*2 + bc;
-                i32 ac_dq[16];
-                iquant_4x4(c_ac_levels[comp][idx], ac_dq, qp_c);
-                ac_dq[0] = dc_recon_c[idx];
-                i32 res[16];
-                idct4x4(ac_dq, res);
-                recon_4x4_8x8(recon_mb_c[comp], pred_c[comp], br, bc, res);
-            }
-        }
-    }
+    /* Write reconstructed samples into the frame-level recon planes so
+     * subsequent MBs see them as prediction neighbors. */
+    copy_out_mb_luma(recon_y, recon_stride_y, mb_r, mb_c, st.recon_y);
     copy_out_mb_chroma_combine(recon_uv, recon_stride_uv, mb_r, mb_c,
-                               recon_mb_c[0], recon_mb_c[1]);
+                               st.recon_u, st.recon_v);
 
-    /* === Compute CBPs === */
-    int cbp_luma = 0;
-    for (int idx = 0; idx < 16 && !cbp_luma; idx++) {
-        for (int k = 1; k < 16; k++) {
-            if (ac_levels_raster[idx][k] != 0) { cbp_luma = 1; break; }
-        }
-    }
-    int chroma_dc_nz = 0, chroma_ac_nz = 0;
-    for (int comp = 0; comp < 2; comp++) {
-        for (int k = 0; k < 4; k++) if (c_dc_levels[comp][k] != 0) chroma_dc_nz = 1;
-        for (int idx = 0; idx < 4; idx++)
-            for (int k = 1; k < 16; k++)
-                if (c_ac_levels[comp][idx][k] != 0) chroma_ac_nz = 1;
-    }
-    int cbp_chroma = chroma_ac_nz ? 2 : (chroma_dc_nz ? 1 : 0);
-
-    int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
-
-    /* === Emit MB syntax ===
-     * Spec Table 7-11: mb_type = 1 + PredMode + 4*CBPChroma + 12*CBPLuma
-     * (note: NOT 4*CBPLuma + 8*CBPChroma — got this wrong initially). */
-    int mb_type = 1 + mode16 + 4 * cbp_chroma + 12 * cbp_luma;
-    bs_put_ue(bs, mb_type);
-    bs_put_ue(bs, mode_c);                 /* intra_chroma_pred_mode */
-    bs_put_se(bs, 0);                      /* mb_qp_delta = 0 */
-
-    /* === Emit luma DC block (always for I_16x16) ===
-     * Spec 9.2.1.1: DC block uses luma4x4BlkIdx=0's neighbors for nC.
-     * Block 0 lives at global 4x4 position (mb_r*4, mb_c*4); its left
-     * neighbor is the rightmost 4x4 of the MB to the left, top is the
-     * bottom 4x4 of the MB above. */
-    int luma_w4_dc = ncs->luma_w4;
-    {
-        int gx0 = mb_c * 4;
-        int gy0 = mb_r * 4;
-        int top_nc_dc  = (gy0 > 0) ? ncs->luma_nc[(gy0 - 1) * luma_w4_dc + gx0] : 0;
-        int left_nc_dc = (gx0 > 0) ? ncs->luma_nc[gy0 * luma_w4_dc + (gx0 - 1)] : 0;
-        int nC_dc = cavlc_compute_nC(top_nc_dc, left_nc_dc, gy0 > 0, gx0 > 0);
-
-        i16 zz[16];
-        for (int k = 0; k < 16; k++) zz[k] = dc_levels[zz_scan_4x4[k]];
-        cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC_dc);
-    }
-
-    /* === Emit luma AC blocks if cbp_luma ===
-     * Spec 8.5.6: blocks within an MB are scanned in the I_4x4 zigzag scan
-     * order (NOT raster). Each block's nC is derived from physical neighbors
-     * (top, left), which by scan order have already been encoded. */
-    int luma_w4 = ncs->luma_w4;
-    static const int blk_scan_br[16] = {0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3};
-    static const int blk_scan_bc[16] = {0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3};
-    for (int s = 0; s < 16; s++) {
-        int br = blk_scan_br[s];
-        int bc = blk_scan_bc[s];
-        int idx = br*4 + bc;
-        i16 zz[16];
-        for (int k = 0; k < 16; k++)
-            zz[k] = ac_levels_raster[idx][zz_scan_4x4[k]];
-
-        int gx = mb_c * 4 + bc;
-        int gy = mb_r * 4 + br;
-        int top_nc  = (gy > 0) ? ncs->luma_nc[(gy - 1) * luma_w4 + gx] : 0;
-        int left_nc = (gx > 0) ? ncs->luma_nc[gy * luma_w4 + (gx - 1)] : 0;
-        int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
-
-        if (cbp_luma) {
-            cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
-        }
-        ncs->luma_nc[gy * luma_w4 + gx] = count_nonzero(&zz[1], 15);
-    }
-
-    /* === Emit chroma DC blocks if cbp_chroma >= 1 === */
-    if (cbp_chroma >= 1) {
-        for (int comp = 0; comp < 2; comp++) {
-            cavlc_encode_block(bs, c_dc_levels[comp], 4, BLK_CHROMA_DC, -1);
-        }
-    }
-
-    /* === Emit chroma AC blocks if cbp_chroma == 2 === */
-    int chroma_w4 = ncs->chroma_w4;
-    for (int comp = 0; comp < 2; comp++) {
-        int *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
-        for (int br = 0; br < 2; br++) {
-            for (int bc = 0; bc < 2; bc++) {
-                int idx = br*2 + bc;
-                i16 zz[16];
-                for (int k = 0; k < 16; k++)
-                    zz[k] = c_ac_levels[comp][idx][zz_scan_4x4[k]];
-
-                int gx = mb_c * 2 + bc;
-                int gy = mb_r * 2 + br;
-                int top_nc  = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
-                int left_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
-                int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
-
-                if (cbp_chroma == 2) {
-                    cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
-                }
-                cnc[gy * chroma_w4 + gx] = count_nonzero(&zz[1], 15);
-            }
-        }
-    }
-
-    return bs->byte_pos * 8 + bs->n_in_cur - start_bits;
+    mb_compute_cbp(&st);
+    return mb_cavlc_emit(&st, ncs, bs);
 }
 
 int encode_frame_h264(int width, int height, int qp,
