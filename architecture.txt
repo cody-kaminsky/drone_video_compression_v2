@@ -1,0 +1,703 @@
+================================================================================
+DRONE VIDEO COMPRESSION CODEC — ARCHITECTURE DOCUMENT
+================================================================================
+Target FPGA  : Xilinx Zynq-7030 (xc7z030) — likely oversized for 1080p; see §17
+Resolution   : 1920 x 1080 (Full HD) — locked as v1 target on 2026-04-29
+                 4K UHD remains a future goal but requires P-frames
+Frame rate   : 30 fps
+Bitrate cap  : 30 Mbps
+Quality      : PSNR_Y >= 28 dB
+Coding style : H.264-inspired, I-frame only (v1); P-frames deferred
+Workflow     : Architecture -> C reference -> FPGA-friendly C -> HLS -> VHDL
+Last updated : 2026-04-29
+
+----- v1 RESOLUTION DECISION (2026-04-29) -----
+The C reference encoder (I_16x16 + I_4x4, SATD mode decision, approximate
+CAVLC bit estimation) was characterized on:
+  - Kodak24 (24 photos, 768x512)
+  - 5 aerial drone photos (3840 wide)
+
+Measured BPP-vs-PSNR curve produced these conclusions:
+
+  4K30 @ 30 Mbps target (BPP <= 0.121):
+    - Drone aerial at QP=51 (max): avg BPP=0.222, avg PSNR_Y=25.05 dB
+    - Misses bitrate cap by ~2x; misses 28 dB target on hard content
+    - Conclusion: I-only insufficient at 4K30. P-frames required.
+
+  1080p30 @ 30 Mbps target (BPP <= 0.482):
+    - Drone aerial at QP=44: avg BPP=0.347, avg PSNR_Y=27.40 dB
+    - Drone aerial at QP=40: avg BPP=0.505, avg PSNR_Y=29.29 dB
+    - Hits 28 dB target with ~30% bitrate margin around QP=41-42
+    - Conclusion: I-only sufficient at 1080p. PROCEED WITH 1080p AS v1.
+
+----- WHY DRONE IS HARDER FOR I-ONLY -----
+Common belief is "drone footage compresses well" — that is true for INTER
+coding (P-frames) because of slow camera motion and high temporal
+correlation. For INTRA-only coding, aerial content is HARDER than typical
+photo content (e.g., Kodak): foliage, rock, and urban detail give high
+per-pixel entropy with no large flat regions to amortize bits across.
+Once P-frames are added, this reverses.
+
+
+================================================================================
+1. GOALS & CONSTRAINTS
+================================================================================
+
+PIXEL THROUGHPUT (1080p30, v1 target)
+  1920 * 1080 * 30 = 62.2 M samples/s (luma)
+  YUV420 raw rate  = 62.2 * 1.5 = 93 MB/s = 747 Mbps
+  Target compression ratio at 30 Mbps = ~25:1
+  Bit budget per pixel = 30M / (1920*1080*30) = 0.482 BPP
+
+PIXEL THROUGHPUT (4K30, future target with P-frames)
+  3840 * 2160 * 30 = 248.8 M samples/s (luma) — 4x of 1080p
+  YUV420 raw rate  = 373 MB/s = 2.99 Gbps
+  Target compression ratio at 30 Mbps = ~100:1
+  Bit budget per pixel = 0.121 BPP
+
+xc7z030 RESOURCE BUDGET (key items)
+  LUTs            : 78,600
+  FFs             : 157,200
+  BRAM18 / BRAM36 : 265 / 132.5  (~9.3 Mb, ~1.16 MB)
+  DSP48E1         : 400
+  PS              : Dual-core ARM Cortex-A9 @ 800 MHz
+  PS-PL           : AXI HP ports x4 (64-bit each), AXI ACP, AXI GP
+  External mem    : DDR3 on PS side (typ. 32-bit @ 533 MHz, ~4 GB/s peak)
+
+CLOCK TARGET
+  PL clock      : 200 MHz target (achievable on -1 speed grade with care)
+  PS DDR clock  : independent, runs at 533 MHz typical
+
+
+================================================================================
+2. PROFILE SCOPING (what we keep / drop from H.264)
+================================================================================
+
+Target: a strict subset of Baseline profile, I-only.
+
+KEEP                                       DROP
+----                                       ----
+4:2:0 chroma, 8-bit                        4:2:2, 4:4:4, 10-bit
+1 slice per frame                          Slice groups, FMO, ASO
+I_4x4 luma intra (9 modes)                 I_PCM
+I_16x16 luma intra (4 modes)               I_8x8 (High profile)
+Chroma 8x8 intra (4 modes)
+4x4 integer DCT + Hadamard for DC          8x8 transform (High profile)
+Standard H.264 quantization                Adaptive Q matrices
+CAVLC entropy coding                       CABAC (bit-serial, FPGA-hostile)
+Annex B byte stream                        AVCC / mp4 length-prefixed framing
+NV12 input (YUV420 semi-planar)
+IDR every frame (I-only)                   GOP structure with P/B frames
+
+DEFERRED FOR LATER
+  P-frame prediction (ME/MC)
+  Quarter-pel interpolation (6-tap filter)
+  Multiple reference frames
+  Deblocking filter (encoder side — see Section 5)
+  Wavefront parallel processing
+  Rate control loop (start with constant QP)
+
+
+================================================================================
+3. THROUGHPUT MATH
+================================================================================
+
+MB COUNT (1080p, v1)
+  MBs per frame  : (1920 / 16) * (1080 / 16) = 120 * 67.5 -> ROUND UP
+                   1080 must be padded to 1088 (height % 16 == 0). Effective
+                   frame is 1920 x 1088, with the last MB row of 8 px height
+                   padded internally and stripped at decode.
+                   MBs per frame = 120 * 68 = 8,160
+  MBs per second : 8,160 * 30 = 244,800
+
+CYCLE BUDGET PER MB AT 1080p30
+  At 200 MHz : 200,000,000 / 244,800 = 817 cycles/MB   (4x headroom vs 4K)
+  At 150 MHz : 613 cycles/MB
+  At 100 MHz : 408 cycles/MB                            (still comfortable)
+
+  v1 implication: Pipeline can run at 100-150 MHz comfortably and still meet
+  real-time. CAVLC (the bottleneck at 4K with ~120 cy/MB) is no longer
+  critical at 1080p — we have ~6x more headroom than CAVLC needs.
+
+  This relaxes nearly every architectural constraint and probably means we
+  can drop down to xc7z020 (53K LUTs, 4.9 Mb BRAM, 220 DSPs) in the future.
+
+MB COUNT (4K30, future target)
+  MBs per frame  : 240 * 135 = 32,400
+  MBs per second : 972,000
+  At 200 MHz: 205 cy/MB (the original tight budget; see prior revision)
+
+
+================================================================================
+4. PIPELINE & PARALLELISM (FIVE LEVELS)
+================================================================================
+
+Use parallelism in this priority order:
+
+LEVEL 1 — Sample-level (inside one 4x4 block)
+  H.264 4x4 integer transform is a butterfly: 4 parallel 1D row transforms,
+  transpose, 4 parallel 1D col transforms. Pure adders/shifts (no DSPs needed
+  for transform itself). One 4x4 per cycle throughput trivially.
+  Status: take it, it's free.
+
+LEVEL 2 — Block-level (16 4x4 sub-blocks inside one MB)
+  Spec scan order for 4x4 sub-blocks within an MB:
+       0  1  4  5
+       2  3  6  7
+       8  9 12 13
+      10 11 14 15
+  Each block needs reconstructed top, top-left, top-right, left neighbors.
+  Anti-diagonal blocks are independent and could run in parallel.
+  Status: defer. Start with serial 4x4 processing; revisit if budget tight.
+
+LEVEL 3 — MB-level stage pipelining (PRIMARY STRATEGY)
+  Multiple MBs in flight concurrently, each at a different pipeline stage.
+  Each stage is its own HW module with FIFOs between them.
+  Constraint: MB N+1's intra prediction needs MB N's reconstructed right
+  edge. Pipeline depth must respect this with skid buffer.
+  Status: this is the main parallelism strategy.
+
+LEVEL 4 — Wavefront (across MB rows)
+  MB(R+1, 0) can start once MB(R, 1) finishes. Allows multiple rows in flight.
+  Status: defer. Doubles control complexity for ~2x speedup that we don't need
+  if Level 3 pipelining is well-balanced.
+
+LEVEL 5 — Frame-level
+  Multiple frames in flight.
+  Status: skip. Multiplies BRAM/DDR by N for negligible gain.
+
+
+================================================================================
+5. I-FRAME-ONLY DECISION (impact on architecture)
+================================================================================
+
+REMOVED COMPONENTS
+  - Motion estimation engine (~30-50% of total logic, most DSP usage)
+  - Motion compensation + 6-tap interpolation filter
+  - Reference frame in DDR (12.4 MB per frame, 1-2 GB/s read traffic saved)
+  - Search window cache (~100-300 KB BRAM saved)
+  - Skip/direct mode logic, MV prediction state machines
+
+REMAINING ARCHITECTURE PROBLEM
+  Almost entirely about the intra dependency chain plus DDR write bandwidth
+  for the bitstream. Reads are simple raster-order; no random access needed.
+
+BITRATE RISK (FLAG)
+  All-intra 4K30 typically wants 80-120 Mbps for transparent quality.
+  At 30 Mbps cap, expect QP ~34-40, with visible blocking/ringing in
+  high-detail regions. The 28 dB target is forgiving and should be met on
+  most drone content (sky, terrain), but high-foliage scenes are at risk.
+  If measurement shows we miss 28 dB, the cheapest fix is adding P-frames.
+
+DEBLOCKING DECISION
+  For I-only, the encoder does NOT need to run the deblock filter:
+    - Intra prediction reads PRE-deblock samples by spec.
+    - With no inter prediction, deblocked output is never consumed by the
+      encoder. The decoder will deblock based on PPS flags we set.
+  Decision: drop deblock from v1 entirely. Saves ~15 KB BRAM and ~20 DSPs.
+  Add it back if/when we add P-frames (where it becomes mandatory in the
+  reference loop), or if on-FPGA PSNR measurement is wanted.
+
+
+================================================================================
+6. GOP DISCUSSION
+================================================================================
+
+DEFINITIONS
+  GOP = Group of Pictures. Structural unit between independently decodable
+        frames.
+  I    : intra-only frame, decodable standalone (given SPS/PPS).
+  IDR  : I-frame that ALSO invalidates all reference picture buffers. After
+         an IDR, no future frame may reference any frame before it. All IDRs
+         are I-frames; not all I-frames are IDRs (only matters with P/B).
+  P    : predicted from one earlier reference.
+  B    : predicted from earlier and later references.
+
+PROPERTY DRIVERS
+  Random access      : driven by IDR period (seek points).
+  Error resilience   : long GOPs propagate errors until next IDR.
+  Compression eff.   : long GOPs compress better (fewer expensive I-frames).
+  Latency            : independent of GOP for IPPP; B-frames add reorder.
+  DPB size           : multi-ref + B-frames inflate Decoded Picture Buffer.
+
+I-ONLY IMPLICATIONS
+  - GOP collapses to 1. Every frame is its own GOP, every frame is IDR.
+  - Random access is free (every frame is a seek point).
+  - Zero error propagation (corrupt frame affects only itself).
+  - No DPB needed (only the current-frame neighbor line buffer).
+  - Trivial NAL framing: [SPS][PPS][IDR slice] per access unit.
+  - SPS/PPS strategy: send once at stream start; optionally repeat every
+    1 second for late-joining receivers in broadcast scenarios.
+
+
+================================================================================
+7. SYSTEM BLOCK DIAGRAM
+================================================================================
+
+  +----------- PS (Cortex-A9) ----------+    +------- DDR3 -------+
+  |  Frame source (camera/file/test)    |<-->|  NV12 input frame  |
+  |  SPS/PPS + NAL framing (Annex B)    |    |    (~12.4 MB)      |
+  |  Constant-QP setpoint               |    |                    |
+  |  Status / IRQ handling              |<-->|  Bitstream out     |
+  +--+--------------------+-------------+    |    (~125 KB/frame) |
+     | AXI-Lite (ctrl)    | AXI HP0 RD       +--------------------+
+     |                    | AXI HP1 WR
+     v                    v
+  +-------------------- PL @ 200 MHz ----------------------+
+  |   Encoder pipeline (see Section 8)                      |
+  |     BRAM ~50 KB   DSP ~120 / 400   LUT ~40 K            |
+  +---------------------------------------------------------+
+
+
+================================================================================
+8. PL PIPELINE DIAGRAM (per-MB dataflow, deblock dropped)
+================================================================================
+
+                      DDR (NV12 input)
+                            |  AXI HP0
+                            v
+                      +-----------+
+                      | MB Fetch  |  16x16 Y + 8x8 U + 8x8 V per MB
+                      +-----+-----+
+                            |  src MB (384 B)
+                            v
+            +----------------------+        +-----------------------+
+            | Mode Decision        |<--top--| Neighbor Line Buffer  |
+            | SATD over            |<--left | (BRAM, 1 MB-row wide) |
+            |   9 luma 4x4 modes   |        +-----------+-----------+
+            | + 4 luma 16x16 modes |                    ^
+            | + 4 chroma 8x8 modes |                    |
+            +----------+-----------+                    |
+                       | mode + predictor               |
+                       v                                |
+                +-------------+                         |
+                | Pred + Sub  |                         |
+                | (residual)  |                         |
+                +------+------+                         |
+                       |  residual 4x4                  |
+                       v                                |
+                +-------------+                         |
+                |  4x4 T  +   |                         |
+                | DC Hadamard |                         |
+                +------+------+                         |
+                       |  coeffs                        |
+                  QP -->                                |
+                       v                                |
+                +-------------+ levels +-------------------------+
+                |  Quantize   +------->| Coeff FIFO (BRAM)       |
+                +------+------+        +------------+------------+
+                       |  levels                    |
+                       v                            v
+                +-------------+              +---------------+
+                |  iQ + iT    |              | CAVLC encoder |
+                +------+------+              | + bit packer  |
+                       |  recon residual     | + NAL framer  |
+                       v                     +-------+-------+
+                +-------------+                      | Annex B bytes
+                | Reconstruct |                      v
+                | (recon+pred)|                  +--------+
+                +------+------+                  | DMA WR |
+                       |  recon MB               +---+----+
+                       |  (PRE-deblock samples)      |
+                       +--> Neighbor Line Buf write  |  AXI HP1
+                                                     v
+                                                    DDR
+
+
+================================================================================
+9. PER-STAGE CYCLE BUDGETS
+================================================================================
+
+Throughput target: 1 MB per 205 cycles at 200 MHz.
+Pipelined: throughput = max(stage cycles); latency = sum(stage cycles).
+
+  Stage                     Cycles/MB   DSPs    Notes
+  ------------------------- ----------- ------- ----------------------------
+  0. MB Fetch (AXI HP)      ~60         0       Overlapped, prefetched
+  1. Mode Decision (SATD)   ~80         ~32     2 SATD engines + gradient
+                                                shortlist (3-4 modes/blk avg)
+  2. Pred + Residual        ~24         0       1 4x4/cycle, all-add
+  3. 4x4 T + DC Hadamard    ~24         0       Integer transform (no mults)
+  4. Quantize               ~24         16      16-wide DSP per 4x4
+  5. iQ + iT                ~24         16      Symmetric path
+  6. Reconstruct            ~24         0       Add + clip + neighbor write
+  7. CAVLC + bit pack       ~120        ~8      *** BOTTLENECK ***
+                                                4 parallel engines + barrel
+                                                shifter merge
+
+  Pipelined throughput      ~120 cy/MB  ~72     CAVLC sets the rate
+  Headroom vs 205 cy budget +85 cy              1.7x margin
+  End-to-end latency        ~370 cy             ~1.85 us/MB, ~6 ms/frame
+
+CAVLC IS THE INFLEXIBLE KNOB
+  - Engine count is the critical parameter.
+  - 4 engines is the v1 plan.
+  - 2 engines fits 250 MHz only — risky on -1 speed grade.
+
+TRADE KNOBS IF TIMING TIGHT
+  - Time-share Q/iQ           : -16 DSPs, +24 cy/MB (fits)
+  - 1 SATD engine + better    : -16 DSPs, +40 cy/MB (fits)
+    mode shortlist
+
+
+================================================================================
+10. AXI-LITE CONTROL REGISTER MAP
+================================================================================
+
+64-byte address space, 32-bit registers, byte addressed, little-endian.
+Single AXI-Lite slave; base address assigned in Vivado IPI.
+
+  Off    Name              Acc    Reset       Description
+  ----   ----------------  ----   ----------  ---------------------------------
+  0x00   ID_VERSION        RO     0xACE0_0100 [31:16] magic, [15:8] maj, [7:0] min
+  0x04   CTRL              RW     0           See bit map below
+  0x08   STATUS            RO     0           See bit map below
+  0x0C   STATUS_CLR        W1C    -           Write 1 to clear sticky bits
+  0x10   IRQ_EN            RW     0           [0] FRAME_DONE_EN, [1] ERROR_EN
+  0x14   IRQ_STATUS        RO/W1C 0           [0] FRAME_DONE, [1] ERROR
+  0x18   FRAME_WIDTH       RW     3840        Pixels, multiple of 16
+  0x1C   FRAME_HEIGHT      RW     2160        Pixels, multiple of 16
+  0x20   QP_LUMA           RW     30          [5:0] 0..51
+  0x24   QP_CHROMA_OFF     RW     0           [4:0] signed, -12..+12
+  0x28   FRAME_NUM         RW     0           Increments per frame
+  0x2C   reserved          -      -
+  0x30   SRC_ADDR_LO       RW     0           NV12 base, byte addr [31:0]
+  0x34   SRC_ADDR_HI       RW     0           Upper bits for >4GB addressing
+  0x38   SRC_Y_STRIDE      RW     3840        Bytes per luma row
+  0x3C   SRC_UV_STRIDE     RW     3840        Bytes per CbCr-interleaved row
+  0x40   BS_ADDR_LO        RW     0           Bitstream output base
+  0x44   BS_ADDR_HI        RW     0
+  0x48   BS_MAX_SIZE       RW     262144      Max bytes; sets BS_OVF if hit
+  0x4C   BS_BYTES_OUT      RO     0           Last frame's bitstream length
+  0x50   ENC_FLAGS         RW     0x7         [0] EN_I4x4 [1] EN_I16x16
+                                              [2] EN_CHROMA (debug)
+  0x54   PERF_CYCLES       RO     0           Cycles to encode last frame
+  0x58   PERF_STALLS       RO     0           DMA-stall cycles last frame
+  0x5C   PERF_MB_DONE      RO     0           MBs done last frame (=32400 OK)
+
+CTRL (0x04) BITS
+  [0]   GO                 W1S   Latch config and start one frame; HW clears
+  [1]   SOFT_RESET         W1S   Reset pipeline + FIFOs; HW clears
+  [2]   AUTO_INC_FRAMENUM  RW    HW increments FRAME_NUM after each frame
+  [3]   IDR_FLAG           RW    Mark frame as IDR (always 1 for I-only)
+  [31:4] reserved
+
+STATUS (0x08) BITS
+  [0]   BUSY               RO     Pipeline encoding
+  [1]   DONE               Sticky Frame finished (clear via STATUS_CLR[1])
+  [2]   ERR_DDR_RD         Sticky AXI HP0 fault
+  [3]   ERR_DDR_WR         Sticky AXI HP1 fault
+  [4]   ERR_FIFO_OVF       Sticky Internal FIFO overflow (config bug)
+  [5]   ERR_BS_OVF         Sticky Bitstream exceeded BS_MAX_SIZE
+  [6]   ERR_TIMING         Sticky Frame > 1/30 s (6.67M-cy watchdog @ 200 MHz)
+  [31:7] reserved
+
+
+================================================================================
+11. SOFTWARE FLOW (per frame)
+================================================================================
+
+  1. Wait until STATUS.BUSY == 0
+  2. Write SRC_ADDR_LO/HI    (DMA-coherent NV12 buffer)
+  3. Write BS_ADDR_LO/HI, BS_MAX_SIZE
+  4. Write QP_LUMA           (and QP_CHROMA_OFF if changing)
+  5. Write CTRL = (IDR_FLAG=1) | (GO=1)
+  6. Wait for IRQ FRAME_DONE (or poll STATUS.DONE)
+  7. Read BS_BYTES_OUT, copy bitstream out
+     (Prepend SPS/PPS NAL units if needed — see Section 12)
+  8. Write STATUS_CLR = 0x02 (clear DONE)
+  9. Repeat
+
+
+================================================================================
+12. SPS / PPS / SLICE HEADER (HOST-EMITTED BITSTREAM)
+================================================================================
+
+NAL HEADER BYTE
+  forbidden_zero_bit (1) | nal_ref_idc (2) | nal_unit_type (5)
+
+  SPS NAL header byte    = 0x67 (nal_ref_idc=3, nal_unit_type=7)
+  PPS NAL header byte    = 0x68 (nal_ref_idc=3, nal_unit_type=8)
+  IDR slice NAL header   = 0x65 (nal_ref_idc=3, nal_unit_type=5)
+  AUD NAL header (opt'l) = 0x09 (nal_ref_idc=0, nal_unit_type=9)
+
+START CODES (Annex B byte stream)
+  Long  : 0x00 0x00 0x00 0x01   (use before first NAL of access unit)
+  Short : 0x00 0x00 0x01        (use for subsequent NALs in same AU)
+
+EMULATION PREVENTION
+  Within any NAL payload (RBSP), insert 0x03 after any sequence
+  0x00 0x00 0x00, 0x00 0x00 0x01, 0x00 0x00 0x02, or 0x00 0x00 0x03 to
+  prevent confusion with start codes. The HW bit packer must do this for
+  slice payloads. Host can do it for SPS/PPS once at build time.
+
+------------------------------------------------------------------------
+SPS (Sequence Parameter Set) — fixed for our 4K30 I-only configuration
+------------------------------------------------------------------------
+  Field                                  u/ue/se(bits)   Value
+  -------------------------------------- --------------- -----
+  profile_idc                            u(8)            66    (Baseline)
+  constraint_set0_flag                   u(1)            1     (strict Baseline)
+  constraint_set1_flag                   u(1)            0
+  constraint_set2_flag                   u(1)            0
+  constraint_set3_flag                   u(1)            0
+  constraint_set4_flag                   u(1)            0
+  constraint_set5_flag                   u(1)            0
+  reserved_zero_2bits                    u(2)            0
+  level_idc                              u(8)            52    (Level 5.2)
+  seq_parameter_set_id                   ue(v)           0
+  log2_max_frame_num_minus4              ue(v)           0     (4-bit frame_num)
+  pic_order_cnt_type                     ue(v)           2     (no reorder)
+  num_ref_frames                         ue(v)           1     (legal minimum)
+  gaps_in_frame_num_value_allowed_flag   u(1)            0
+  pic_width_in_mbs_minus1                ue(v)           239   (240 MB cols)
+  pic_height_in_map_units_minus1         ue(v)           134   (135 MB rows)
+  frame_mbs_only_flag                    u(1)            1     (no interlace)
+  direct_8x8_inference_flag              u(1)            1
+  frame_cropping_flag                    u(1)            0
+  vui_parameters_present_flag            u(1)            0     (skip VUI v1)
+  rbsp_trailing_bits                     -                     1 + 0..7 zeros
+
+LEVEL CHECK
+  Level 5.2 caps: MaxMBPS = 2,073,600    we need 972,000   OK
+                  MaxFS   = 36,864 MBs   we need 32,400    OK
+                  MaxBR   = 240 Mbps     we need 30 Mbps   OK
+  Level 5.1 has MaxMBPS = 696,320 — does NOT fit (we exceed at 972,000).
+  Therefore level_idc = 52 is required.
+
+LEVEL_IDC NOTE
+  Some encoders use level_idc=51 with constraint_set3_flag=1 to signal
+  Level 5.1 with relaxed MBPS — DO NOT do this; it is decoder-undefined.
+
+VUI (DEFERRED)
+  Skipping VUI in v1 means the decoder assumes default SAR (unspecified),
+  no explicit frame rate, default colorimetry. For broadcast use, add VUI
+  later to signal SAR=1:1, timing_info (30 fps), color_primaries (BT.709
+  or BT.2020), and bitstream_restriction.
+
+SPS PAYLOAD SIZE
+  Approximately 11-13 bytes including NAL header and trailing bits.
+
+------------------------------------------------------------------------
+PPS (Picture Parameter Set)
+------------------------------------------------------------------------
+  Field                                       u/ue/se   Value
+  ------------------------------------------- --------- -----
+  pic_parameter_set_id                        ue(v)     0
+  seq_parameter_set_id                        ue(v)     0
+  entropy_coding_mode_flag                    u(1)      0     (CAVLC)
+  bottom_field_pic_order_in_frame_present     u(1)      0
+  num_slice_groups_minus1                     ue(v)     0     (1 slice group)
+  num_ref_idx_l0_default_active_minus1        ue(v)     0
+  num_ref_idx_l1_default_active_minus1        ue(v)     0
+  weighted_pred_flag                          u(1)      0
+  weighted_bipred_idc                         u(2)      0
+  pic_init_qp_minus26                         se(v)     +4    (init QP=30)
+  pic_init_qs_minus26                         se(v)     0
+  chroma_qp_index_offset                      se(v)     0
+  deblocking_filter_control_present_flag      u(1)      1     (so slice can
+                                                              signal disable)
+  constrained_intra_pred_flag                 u(1)      0
+  redundant_pic_cnt_present_flag              u(1)      0
+  rbsp_trailing_bits                          -               1 + 0..7 zeros
+
+PPS PAYLOAD SIZE
+  Approximately 5-7 bytes.
+
+------------------------------------------------------------------------
+SLICE HEADER (per IDR frame, emitted by HW or HW-assisted)
+------------------------------------------------------------------------
+  Field                                       u/ue/se     Value
+  ------------------------------------------- ----------- -----
+  first_mb_in_slice                           ue(v)       0
+  slice_type                                  ue(v)       7   (I, all-same)
+  pic_parameter_set_id                        ue(v)       0
+  frame_num                                   u(v)        N   (4 bits, mod 16)
+  idr_pic_id (IDR only)                       ue(v)       N mod 16
+  pic_order_cnt_lsb                           -           not present (poc_type=2)
+  no_output_of_prior_pics_flag                u(1)        0
+  long_term_reference_flag                    u(1)        0
+  slice_qp_delta                              se(v)       0   (use PPS init QP)
+  disable_deblocking_filter_idc               ue(v)       0   (decoder filters)
+  slice_alpha_c0_offset_div2                  se(v)       0
+  slice_beta_offset_div2                      se(v)       0
+  slice_data...                               -           CAVLC MB stream
+
+SLICE HEADER SIZE
+  Approximately 3-5 bytes before the MB data begins.
+
+------------------------------------------------------------------------
+ACCESS UNIT LAYOUT (per frame)
+------------------------------------------------------------------------
+  Stream-start (once, or every N frames for late-join recovery):
+    [00 00 00 01] [SPS NAL]
+    [00 00 00 01] [PPS NAL]
+
+  Per frame:
+    [00 00 00 01] [IDR slice NAL with embedded slice_header + slice_data]
+
+  Optional AUD between AUs:
+    [00 00 00 01] [09 <primary_pic_type=0 for I>] [trailing bits]
+
+PER-FRAME BITSTREAM OVERHEAD
+  Slice header        : ~3-5 bytes
+  SPS+PPS (if sent)   : ~16-20 bytes
+  Total NAL overhead  : ~30 bytes/frame max, ~7 kbps. Negligible vs 30 Mbps.
+
+RECOMMENDED STRATEGY
+  - Send SPS+PPS once at stream start.
+  - Resend every 30 frames (1 sec) for live broadcast late-join recovery.
+  - Send AUD optionally; some decoders prefer it, none require it for
+    well-formed Annex B streams.
+  - HW emits only the slice NAL; host prepends SPS/PPS as fixed byte blobs.
+
+
+================================================================================
+13. BRAM / FIFO SIZING (between pipeline stages)
+================================================================================
+
+xc7z030 BRAM resources
+  BRAM18  : 265 (~4.65 Mb)
+  BRAM36  : 132 (~4.6 Mb)   [each BRAM36 = 2x BRAM18]
+  Total   : ~9.3 Mb = ~1.16 MB
+
+Sizing each on-chip storage element:
+
+  Block                            Width x Depth      Bytes      BRAM18
+  -------------------------------- ------------------ ---------  ------
+  Source MB scratch (double-buf)   384 B x 2          768        1
+  Source DMA prefetch (skid)       64 b x 512         4 KB       1
+  Luma neighbor line buffer        8 b x 3856         ~4 KB      1
+   [bottom row of upper MB row +
+    16 spare for top-right reach]
+  Chroma U neighbor line buffer    8 b x 1928         ~2 KB      1 *
+  Chroma V neighbor line buffer    8 b x 1928         ~2 KB      *
+   [* U+V can share one BRAM18 by interleaving or split width]
+  Coeff FIFO (Q -> CAVLC)          16 b x ~3000       ~6 KB      2
+   [absorbs ~8 MBs of bursty Q output while CAVLC drains slower]
+  CAVLC merge / barrel scratch     64 b x 256         2 KB       1
+  Bitstream output FIFO (to DMA)   64 b x 1024        8 KB       2
+  Reconstruct write scratch        384 B x 2          768        1
+  Stage skid buffers (predicate,   ~2 KB total        2 KB       1
+   mode, residual handoffs)
+  Mode decision SATD scratch       16 b x ~512        ~1 KB      1
+  -------------------------------- ------------------ ---------  ------
+  TOTAL                                               ~32 KB     ~12
+
+  Out of 265 BRAM18 -> using ~4.5%. Massive headroom.
+
+WHY THESE SIZES
+  - Coeff FIFO depth: Quant produces 1 4x4/cycle (~24 cy/MB total work).
+    CAVLC consumes at ~120 cy/MB. Q is ~5x faster than CAVLC, so the FIFO
+    must absorb burstiness across MB boundaries. 8 MBs depth gives ~960
+    cycles of slack — comfortable buffer for any per-MB CAVLC latency
+    spikes (e.g., a high-detail MB with all 16 coeffs nonzero in every block).
+
+  - Bitstream FIFO 8 KB: AXI HP write bursts can stall briefly (DDR refresh,
+    arbitration). 8 KB at 30 Mbps = 2.1 ms of buffering, safely > worst-case
+    DDR stall (~few microseconds).
+
+  - Luma neighbor line buffer: stores ONE row of pixels (the bottom of the
+    previous MB row) at frame width = 3840 bytes. Plus 16 pixels of slop
+    on the right edge for top-right neighbor access in 4x4 prediction modes
+    that read past the current MB column. Add 1 byte for top-left.
+
+  - Chroma neighbor: same logic at half resolution per component.
+
+  - SATD scratch: stores intermediate sums per candidate mode for the
+    current 4x4 / 16x16 / 8x8 block. Small.
+
+FIFO TYPES
+  - Use FWFT (first-word fall-through) FIFOs at every stage handoff to
+    minimize forwarding latency.
+  - Almost-full / almost-empty thresholds set to leave 4 entries of margin
+    for back-pressure handshaking.
+  - All FIFOs sized in powers of two for clean address counters.
+
+CLOCK DOMAINS
+  All pipeline stages run on the single 200 MHz PL clock for v1.
+  AXI HP DMA may run on a separate clock (typ. 100 MHz for HP); use AXI
+  data-width converter + clock-crossing FIFO at the DMA boundaries.
+  These crossing FIFOs are the source DMA prefetch and bitstream output
+  FIFO listed above (already 64-bit on the AXI side).
+
+GROWTH HEADROOM (FOR FUTURE P-FRAME SUPPORT)
+  Adding inter prediction will require:
+    - Search window cache : ~80-200 KB (~ 50 BRAM18)
+    - Reference frame staging buffers : ~50 KB (~ 12 BRAM18)
+    - MV predictor / skip state : ~5 KB (~ 2 BRAM18)
+  Total addition ~64 BRAM18 — still well within the 265 budget.
+
+
+================================================================================
+14. DSP ALLOCATION SUMMARY
+================================================================================
+
+  Module                            DSP48E1  Notes
+  --------------------------------- -------- ------------------------------
+  4x4 forward integer transform     0        Adders/shifts only
+  4x4 inverse integer transform     0        Adders/shifts only
+  Hadamard DC (16x16 luma + chroma) 0        Adders only
+  Quantize (parallel 16-wide)       16       1 mult per coeff position
+  Inverse quantize                  16       Same
+  SATD engines (2x parallel)        ~32      Hadamard + abs/accumulate
+  CAVLC encoding tables             ~8       Mostly LUTs; few mults
+  Misc (rounding, scaling)          ~4
+  --------------------------------- -------- ------------------------------
+  TOTAL (v1 I-only)                 ~76 / 400      ~19% utilization
+
+  HEADROOM
+  Adding inter prediction (ME SAD tree, 6-tap quarter-pel filter) would
+  consume ~150-200 additional DSPs — still fits comfortably.
+
+
+================================================================================
+15. NEXT MILESTONES
+================================================================================
+
+  [ ] M1: C reference encoder (bit-exact, slow). Produces compliant Annex B
+        stream from a raw YUV file. Validates against ffmpeg/JM reference.
+  [ ] M2: FPGA-friendly C (fixed-point, no malloc, fixed loop bounds,
+        bounded memory, struct-of-arrays for vectorization).
+  [ ] M3: HLS implementation. Pragma-driven pipelining; extract per-stage
+        IPs that match the architecture in Sections 8-9.
+  [ ] M4: VHDL implementation of critical paths (CAVLC engine, quant array,
+        MB pipeline controller). HLS for the rest where acceptable.
+  [ ] M5: Integration on Zynq board. AXI-Lite control plane, AXI HP DMA.
+        Verify with on-board capture or stored YUV.
+  [ ] M6: Bitstream conformance against H.264 reference decoder (JM or
+        ffmpeg) on representative drone footage.
+  [ ] M7: PSNR characterization across QP sweep. Confirm 28 dB at 30 Mbps.
+
+
+================================================================================
+16. OPEN RISKS / DECISIONS DEFERRED
+================================================================================
+
+  R1  [CONFIRMED 2026-04-29 — see header] All-intra 4K30 at 30 Mbps fails
+      28 dB by ~2x on high-detail aerial content. v1 target was lowered to
+      1080p30 where I-only passes with ~30% bitrate margin. Reaching 4K30
+      requires P-frames.
+
+  R2  CAVLC throughput at 200 MHz is the critical timing path. If 4-engine
+      design fails timing, fallback is 2 engines at 250 MHz (hard) or
+      pushing CAVLC partly to PS via DMA (latency hit).
+
+  R3  Constant QP gives variable bitrate. Frame-size variance will be
+      large on scene changes. Acceptable for v1; future rate control
+      adds frame-level QP feedback.
+
+  R4  No VUI in SPS: some decoders may not recognize aspect ratio /
+      framerate. Acceptable for proof-of-concept; add VUI for production.
+
+  R5  Drone YUV source format: assumed NV12 from camera ISP. If sensor
+      output is RGB/Bayer, a CSC/ISP front-end is needed (out of scope
+      for codec).
+
+  R6  PS-PL DDR bandwidth contention: 30 Mbps write traffic plus 373 MB/s
+      read traffic for source frames is well under DDR3 capacity, but
+      shared with PS code/data accesses. Profile on real hardware.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

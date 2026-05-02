@@ -1,0 +1,53 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Generated test data
+*.yuv
+*.264
+*.h264
+*.mp4
+
+# Validation outputs
+results_*.csv
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+tools/__pycache__/
+
+# Local datasets (large, not part of repo — fetched separately)
+datasets/
+
+# H.264 spec PDF (ITU copyright — fetch separately if needed)
+T-REC-H.264-*.pdf
+
+# Backup files
+*.bak
+*.orig
+*.current
+
+# Worktree dirs created by claude-code
+.claude/worktrees/
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
