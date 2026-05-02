@@ -13,6 +13,7 @@
  */
 
 #include "encoder.h"
+#include "psnr.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +113,23 @@ int main(int argc, char **argv)
         fprintf(stderr, "encode failed: %d\n", rc);
         free(frame); free(recon); free(bs_buf);
         return 5;
+    }
+
+    /* Bitstream-emit path leaves PSNR / bpp unfilled (kernel is int-only,
+     * matching the FPGA register contract). Compute them host-side from the
+     * recon plane. The prototype encode_frame path still fills them itself. */
+    if (bs_path && recon) {
+        const u8 *src_y_p  = frame;
+        const u8 *src_uv_p = frame + y_size;
+        const u8 *rec_y_p  = recon;
+        const u8 *rec_uv_p = recon + y_size;
+        stats.psnr_y = psnr_plane(src_y_p, width, rec_y_p, width, width, height);
+        stats.psnr_u = psnr_chroma_component(src_uv_p, width, rec_uv_p, width,
+                                             width / 2, height / 2, 0);
+        stats.psnr_v = psnr_chroma_component(src_uv_p, width, rec_uv_p, width,
+                                             width / 2, height / 2, 1);
+        stats.psnr_avg = (stats.psnr_y * 6.0 + stats.psnr_u + stats.psnr_v) / 8.0;
+        stats.bpp      = (double)stats.total_bits / ((double)width * height);
     }
 
     if (recon_path) {

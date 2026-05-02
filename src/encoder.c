@@ -14,9 +14,9 @@
 #include "bitstream.h"
 #include "nal.h"
 #include "mb_state.h"
+#include "psnr.h"
 
 #include <string.h>
-#include <math.h>
 
 /* ===== static arena =====
  * Bounded per-frame buffers, sized for the architecture max (MAX_W x MAX_H).
@@ -711,38 +711,6 @@ static int encode_mb(const u8 *src_y,  int stride_y,
     return bits;
 }
 
-/* ===== PSNR helpers ===== */
-
-static double psnr_plane(const u8 *a, int stride_a,
-                         const u8 *b, int stride_b, int w, int h)
-{
-    i64 sse = 0;
-    for (int i = 0; i < h; i++)
-        for (int j = 0; j < w; j++) {
-            int d = (int)a[i * stride_a + j] - (int)b[i * stride_b + j];
-            sse += (i64)(d * d);
-        }
-    if (sse == 0) return 99.0;
-    double mse = (double)sse / ((double)w * h);
-    return 10.0 * log10((255.0 * 255.0) / mse);
-}
-
-static double psnr_chroma_component(const u8 *a_uv, int stride_a,
-                                    const u8 *b_uv, int stride_b,
-                                    int w, int h, int comp_offset)
-{
-    i64 sse = 0;
-    for (int i = 0; i < h; i++)
-        for (int j = 0; j < w; j++) {
-            int d = (int)a_uv[i * stride_a + j*2 + comp_offset]
-                  - (int)b_uv[i * stride_b + j*2 + comp_offset];
-            sse += (i64)(d * d);
-        }
-    if (sse == 0) return 99.0;
-    double mse = (double)sse / ((double)w * h);
-    return 10.0 * log10((255.0 * 255.0) / mse);
-}
-
 /* ===== top-level encode_frame ===== */
 
 int encode_frame(int width, int height, int qp,
@@ -1293,13 +1261,8 @@ int encode_frame_h264(int width, int height, int qp,
     if (n < 0) return -6;
     dst_pos += n;
 
-    /* PSNR vs source */
-    double psnr_y = psnr_plane(src_y, stride_y, recon_y_int, width, width, height);
-    double psnr_u = psnr_chroma_component(src_uv, stride_uv, recon_uv_int, width,
-                                          width/2, height/2, 0);
-    double psnr_v = psnr_chroma_component(src_uv, stride_uv, recon_uv_int, width,
-                                          width/2, height/2, 1);
-
+    /* Optional recon copy-out (test bench / measurement only — the FPGA IP
+     * does not write recon to host memory). */
     if (recon_y_out)
         for (int i = 0; i < height; i++)
             memcpy(&recon_y_out[i * recon_stride_y], &recon_y_int[i * width], width);
@@ -1307,15 +1270,19 @@ int encode_frame_h264(int width, int height, int qp,
         for (int i = 0; i < height/2; i++)
             memcpy(&recon_uv_out[i * recon_stride_uv], &recon_uv_int[i * width], width);
 
+    /* Kernel-level stats: integer-only quantities that map onto the FPGA
+     * hardware register set (architecture.txt §10: BS_BYTES_OUT, PERF_MB_DONE).
+     * PSNR / bpp are derived host-side by the test bench from the recon
+     * planes — see main.c. */
     if (stats) {
-        stats->psnr_y    = psnr_y;
-        stats->psnr_u    = psnr_u;
-        stats->psnr_v    = psnr_v;
-        stats->psnr_avg  = (psnr_y * 6.0 + psnr_u + psnr_v) / 8.0;
-        stats->bytes_out = dst_pos;
+        stats->bytes_out  = dst_pos;
         stats->total_bits = dst_pos * 8;
-        stats->bpp       = (double)(dst_pos * 8) / ((double)width * height);
-        stats->mb_count  = mb_count;
+        stats->mb_count   = mb_count;
+        stats->psnr_y    = 0.0;
+        stats->psnr_u    = 0.0;
+        stats->psnr_v    = 0.0;
+        stats->psnr_avg  = 0.0;
+        stats->bpp       = 0.0;
     }
 
     return 0;
