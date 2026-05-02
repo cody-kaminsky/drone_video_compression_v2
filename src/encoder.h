@@ -34,38 +34,23 @@ typedef struct {
     int    bytes_out;    /* (total_bits + 7) / 8 */
 } encode_stats_t;
 
-/* Encode one frame.
- *
- *   width, height : pixel dimensions (must be multiples of 16).
- *   qp            : luma QP, 0..51. Constant across the frame.
- *   src_y         : luma plane (width * height bytes, stride = stride_y).
- *   src_uv        : interleaved CbCr (NV12), height/2 rows of width bytes,
- *                   stride = stride_uv.
- *   recon_y_out   : optional output for reconstructed luma plane. May be
- *                   NULL to skip writing recon. If non-NULL, must hold
- *                   width * height bytes with stride = recon_stride_y.
- *   recon_uv_out  : optional reconstructed CbCr (NV12).
- *   stats         : output statistics.
- *
- * Returns 0 on success, negative on error.
- */
-int encode_frame(int width, int height, int qp,
-                 const u8 *src_y,  int stride_y,
-                 const u8 *src_uv, int stride_uv,
-                 u8 *recon_y_out,  int recon_stride_y,
-                 u8 *recon_uv_out, int recon_stride_uv,
-                 encode_stats_t *stats);
-
 /* Encode one frame and emit a real H.264 Annex B bitstream.
  *
- *   bs_out       : destination buffer for the bitstream (SPS+PPS+IDR slice).
- *                  May be NULL — in which case no bitstream is emitted (same
- *                  behavior as encode_frame()).
- *   bs_max_size  : capacity of bs_out in bytes.
- *   frame_num    : frame number for the slice header (mod 16 used).
+ *   width, height : pixel dimensions (must be multiples of 16, <= MAX_W/MAX_H).
+ *   qp            : luma QP, 0..51. Constant across the frame.
+ *   src_y         : luma plane (width*height bytes, stride = stride_y).
+ *   src_uv        : interleaved CbCr (NV12), height/2 rows of width bytes,
+ *                   stride = stride_uv.
+ *   recon_y_out / recon_uv_out: optional reconstructed planes (may be NULL).
+ *                   Used by the test bench to compute PSNR.
+ *   bs_out        : destination buffer for the bitstream (SPS+PPS+IDR slice).
+ *   bs_max_size   : capacity of bs_out in bytes.
+ *   frame_num     : frame number for the slice header (mod 16 used).
  *
- * On success, stats->bytes_out is the actual bitstream byte count.
- * v1 emits ONLY I_16x16-coded macroblocks (no I_4x4 in the stream yet).
+ * Each MB is coded as I_16x16 or I_4x4 — picked per-MB by the mode-decision
+ * stage. stats->bytes_out is the actual bitstream byte count. PSNR fields
+ * are NOT populated by the kernel (it's int-only); see psnr.h to compute
+ * them host-side from the recon planes.
  *
  * Returns 0 on success, negative on error. */
 int encode_frame_h264(int width, int height, int qp,

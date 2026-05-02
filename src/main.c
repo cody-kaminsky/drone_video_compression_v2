@@ -75,50 +75,35 @@ int main(int argc, char **argv)
         free(frame); return 4;
     }
 
-    u8 *recon = NULL;
-    if (recon_path) {
-        recon = (u8*)malloc(fr_size);
-        if (!recon) { free(frame); fprintf(stderr, "oom\n"); return 3; }
-    }
+    /* Recon is needed to compute PSNR (the kernel is int-only and doesn't
+     * compute it). Allocate even if the user doesn't ask to keep it. */
+    u8 *recon = (u8*)malloc(fr_size);
+    if (!recon) { free(frame); fprintf(stderr, "oom\n"); return 3; }
+
+    /* Bitstream-emit path is now the only path. At low QPs (<10) the
+     * bitstream can exceed the source size due to large quant levels
+     * needing many CAVLC bits. Cap at 4x source. */
+    int bs_cap = (int)fr_size * 4 + 1024;
+    u8 *bs_buf = (u8*)malloc((size_t)bs_cap);
+    if (!bs_buf) { fprintf(stderr, "oom\n"); free(frame); free(recon); return 3; }
 
     encode_stats_t stats;
-    int rc;
-    u8 *bs_buf = NULL;
-    int bs_len = 0;
-
-    if (bs_path) {
-        /* M2 bitstream-emitting path.
-         * At low QPs (<10) the bitstream can exceed the source size due to
-         * large quant levels needing many CAVLC bits. Cap at 4x source. */
-        int bs_cap = (int)fr_size * 4 + 1024;
-        bs_buf = (u8*)malloc((size_t)bs_cap);
-        if (!bs_buf) { fprintf(stderr, "oom\n"); free(frame); free(recon); return 3; }
-        rc = encode_frame_h264(width, height, qp,
+    int rc = encode_frame_h264(width, height, qp,
                                frame,           width,
                                frame + y_size,  width,
-                               recon,           recon ? width : 0,
-                               recon ? recon + y_size : NULL, recon ? width : 0,
+                               recon,           width,
+                               recon + y_size,  width,
                                bs_buf, bs_cap, 0,
                                &stats);
-        if (rc == 0) bs_len = stats.bytes_out;
-    } else {
-        rc = encode_frame(width, height, qp,
-                          frame,           width,
-                          frame + y_size,  width,
-                          recon,           recon ? width : 0,
-                          recon ? recon + y_size : NULL, recon ? width : 0,
-                          &stats);
-    }
     if (rc != 0) {
         fprintf(stderr, "encode failed: %d\n", rc);
         free(frame); free(recon); free(bs_buf);
         return 5;
     }
+    int bs_len = stats.bytes_out;
 
-    /* Bitstream-emit path leaves PSNR / bpp unfilled (kernel is int-only,
-     * matching the FPGA register contract). Compute them host-side from the
-     * recon plane. The prototype encode_frame path still fills them itself. */
-    if (bs_path && recon) {
+    /* Compute PSNR / bpp host-side from the recon planes. */
+    {
         const u8 *src_y_p  = frame;
         const u8 *src_uv_p = frame + y_size;
         const u8 *rec_y_p  = recon;

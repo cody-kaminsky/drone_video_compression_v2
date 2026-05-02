@@ -94,8 +94,21 @@ typedef struct {
     u8 recon_v[64];
 
     /* ===== derived flags used by stage 7 (cavlc) ===== */
-    int cbp_luma;     /* 0 or 1 (any nonzero luma AC) */
+    /* For I_16x16: cbp_luma is a single 0/1 flag (any nonzero AC across all
+     * 16 blocks). For I_4x4: cbp_luma is the spec's 4-bit field — bit i is
+     * set iff any 4x4 sub-block within 8x8 quadrant i has a nonzero coef. */
+    int cbp_luma;
     int cbp_chroma;   /* 0=none, 1=DC only, 2=AC */
+
+    /* ===== I_4x4 path fields =====
+     * mb_type_is_i4x4 = 1 if the MB is coded as I_4x4 (spec mb_type=0).
+     * In that case the per-block path is run inside mb_mode_decide, and
+     * stages 2-6 only handle chroma. Luma residual / transform / quant /
+     * recon are already complete in modes4 / ac_levels_y_full / recon_y.
+     */
+    int mb_type_is_i4x4;
+    int modes4[16];                    /* per-block I_4x4 mode, raster br*4+bc */
+    i16 ac_levels_y_full[16][16];      /* I_4x4 quantized levels: 16 coefs each */
 } mb_state_t;
 
 #endif

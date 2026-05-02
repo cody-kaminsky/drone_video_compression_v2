@@ -223,4 +223,21 @@ static const vlc_t run_before_tab[7][16] = {
                  { 0x1, 9}, { 0x1,10}, { 0x1,11}, {0,0}      },
 };
 
+/* ============================================================================
+ * Table 9-4(a): codeNum mapping for coded_block_pattern.
+ *   Used by I_NxN macroblocks in 4:2:0 (ChromaArrayType = 1).
+ *   Forward direction is codeNum -> cbp_value (parser). For emission we want
+ *   cbp_value -> codeNum, so we store the inverse: indexed by 6-bit cbp value
+ *   (CodedBlockPatternLuma | (CodedBlockPatternChroma << 4)) the entry is the
+ *   codeNum to encode with ue(v).
+ *
+ *   Source: ITU-T Rec. H.264 (05/2003) Table 9-4 column "Intra_4x4 or
+ *   Intra_8x8" with ChromaArrayType in {1, 2}.
+ * ============================================================================ */
+static const u8 cbp_intra_to_codenum[48] = {
+     3, 29, 30, 17, 31, 18, 37,  8, 32, 38, 19,  9, 20, 10, 11,  2,
+    16, 33, 34, 21, 35, 22, 39,  4, 36, 40, 23,  5, 24,  6,  7,  1,
+    41, 42, 43, 25, 44, 26, 46, 12, 45, 47, 27, 13, 28, 14, 15,  0,
+};
+
 #endif

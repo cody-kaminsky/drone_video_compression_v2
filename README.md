@@ -36,7 +36,7 @@ reconstruction byte-for-byte.
 - **NAL/RBSP framing** — Annex B start codes, emulation-prevention bytes
 - **Sequence/Picture Parameter Sets** — Baseline profile, level 4.0/5.0/5.2 auto-pick
 - **Slice header** — IDR, slice_type=7 (I-only), deblocking-disabled signaling
-- **Macroblock layer** — I_16x16 luma + Intra_8x8 chroma (4:2:0)
+- **Macroblock layer** — I_16x16 + I_4x4 luma + Intra_8x8 chroma (4:2:0), per-MB mode picked by estimated CAVLC cost
 - **4×4 integer transform** + Hadamard for DC blocks
 - **Quantization** — full intra/inter rounding offsets, per-position MF tables
 - **CAVLC entropy coding** — coeff_token, level_prefix/suffix, total_zeros,
@@ -47,7 +47,6 @@ reconstruction byte-for-byte.
 
 ## Not implemented (deferred)
 
-- I_4x4 luma intra (mb_type=0) — encoder picks I_16x16 only
 - In-loop deblocking filter — disabled in stream via PPS
 - B/P slices, motion estimation
 - CABAC
@@ -152,8 +151,6 @@ datasets/
   (≈2528 at suffix_length=6). The H.264 FRExt profiles widen `level_suffix`
   to handle this; we don't yet. Not a problem at any practical operating QP
   since QP<10 produces files larger than the raw input.
-- **Mode set**: only I_16x16 + Intra_8x8_chroma. I_4x4 is implemented but
-  estimate-only — not in the bitstream-emitting path.
 - **No deblocking filter**: signaled disabled in PPS; bitstream remains spec-
   compliant.
 
