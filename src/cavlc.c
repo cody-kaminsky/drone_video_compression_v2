@@ -323,8 +323,54 @@ static void emit_run_before(bitstream_t *bs, int run, int zeros_left)
     emit_vlc(bs, run_before_tab[idx][run]);
 }
 
+#ifdef CAVLC_SELFCHECK
+#include <stdio.h>
+/* Encode coefs to a scratch buffer, decode it back, and report any mismatch.
+ * Validates that the CAVLC encode/decode round-trip is consistent for the
+ * exact (coefs, n_coefs, bt, nC) tuple about to be emitted. */
+static int cavlc_encode_block_inner(bitstream_t *bs, const i16 *coefs, int n_coefs,
+                                    block_type_t bt, int nC);
 int cavlc_encode_block(bitstream_t *bs, const i16 *coefs, int n_coefs,
                        block_type_t bt, int nC)
+{
+    /* Self-check via scratch encode + decode. */
+    static u8 scratch[1024];
+    bitstream_t sbs;
+    bs_init(&sbs, scratch, sizeof scratch);
+    cavlc_encode_block_inner(&sbs, coefs, n_coefs, bt, nC);
+    /* Pad to byte align so bs_byte_count flushes everything. */
+    if (sbs.n_in_cur > 0) {
+        int pad = 8 - (sbs.n_in_cur % 8);
+        if (pad < 8) bs_put_bits(&sbs, 0, pad);
+    }
+    int n_bytes = bs_byte_count(&sbs);
+
+    bitreader_t br;
+    br_init(&br, scratch, n_bytes);
+    i16 decoded[16] = {0};
+    int dec_ok = (cavlc_decode_block(&br, decoded, n_coefs, bt, nC) == 0);
+    int mismatch = !dec_ok;
+    for (int i = 0; i < n_coefs; i++) {
+        if (decoded[i] != coefs[i]) mismatch = 1;
+    }
+    if (mismatch) {
+        fprintf(stderr, "CAVLC SELFCHECK MISMATCH bt=%d nC=%d n=%d\n", bt, nC, n_coefs);
+        fprintf(stderr, "  encoded: ");
+        for (int i = 0; i < n_coefs; i++) fprintf(stderr, "%d ", coefs[i]);
+        fprintf(stderr, "\n  decoded: ");
+        for (int i = 0; i < n_coefs; i++) fprintf(stderr, "%d ", decoded[i]);
+        fprintf(stderr, "\n");
+    }
+
+    /* Now do the real emit into the caller's bs. */
+    return cavlc_encode_block_inner(bs, coefs, n_coefs, bt, nC);
+}
+static int cavlc_encode_block_inner(bitstream_t *bs, const i16 *coefs, int n_coefs,
+                                    block_type_t bt, int nC)
+#else
+int cavlc_encode_block(bitstream_t *bs, const i16 *coefs, int n_coefs,
+                       block_type_t bt, int nC)
+#endif
 {
     int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
 

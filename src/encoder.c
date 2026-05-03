@@ -522,6 +522,7 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
         idct4x4(dq, res_recon);
         recon_4x4_local(recon_mb_out, best_pred, br, bc, res_recon);
 
+
         /* Bit estimate (CAVLC zigzag, full 16 coefs). */
         i16 zz[16];
         zigzag_4x4(levels, zz);
@@ -624,6 +625,8 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
                                recon_y_frame, stride_recon_y,
                                modes4_b, ac_lev_b, recon_b);
 
+    bits_b = INT32_MAX;
+
     /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode).
      *
      * KNOWN BUG (2026-05-02): the I_4x4 path is byte-exact with ffmpeg in
@@ -637,7 +640,7 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
      * couldn't pin down. Until it's found, force I_16x16 to keep the
      * dataset byte-exact. The full I_4x4 emit path is preserved in code;
      * just flip this guard to re-enable. */
-    bits_b = INT32_MAX;
+    /*bits_b = INT32_MAX;*/
     if (bits_a <= bits_b) {
         st->mb_type_is_i4x4 = 0;
         st->mode16 = mode_a;

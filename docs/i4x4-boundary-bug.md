@@ -43,6 +43,13 @@ So:
 `tests/test_cavlc_roundtrip.c` passes 563/563 across all block types
 including `BLK_LUMA_FULL` (16-coef I_4x4 blocks).
 
+Additionally I added a `#ifdef CAVLC_SELFCHECK` block in `cavlc.c`
+that, on every `cavlc_encode_block` call, encodes to a scratch buffer
+and decodes it back, comparing levels in/out. Built with `-DCAVLC_SELFCHECK`
+and ran the failing case (kodim01 QP30 with I_4x4 selector active):
+**zero CAVLC mismatches reported**. The CAVLC layer is consistent given
+the encoder's nC.
+
 ### Table 9-4 CBP intra mapping
 Cross-checked the 48-entry inverse map I added to `cavlc_tables.h`
 against the spec PDF (T-REC-H.264-200305-S, page 156, Table 9-4). All
@@ -104,6 +111,62 @@ With `bits_b = INT32_MAX`, the workaround forces path A (I_16x16)
 always, and dataset is byte-exact. With `bits_a = INT32_MAX`, force
 path B (I_4x4) — also byte-exact (sampled). The bug only manifests
 when the selector actually mixes paths.
+
+### Per-MB forcing — bug is content/mode-specific
+Forcing only **MB (0, 2)** to I_4x4 (rest I_16x16) on kodim01 at QP 30
+triggers the bug: 64 byte diffs in MB (0, 2) at rows 12..15 (the
+br=3 sub-blocks).
+
+But forcing only **MB (0, 1)** to I_4x4 (same neighbor structure —
+left neighbor MB (0, 0) is I_16x16) is **byte-exact**. Same with
+forcing only MB (0, 3). Same with forcing MB (0, 1) + MB (0, 2)
+together (MB (0, 2)'s left neighbor becomes I_4x4 in this case).
+
+Conclusion: the bug is NOT simply "I_4x4 with I_16x16 left neighbor".
+It depends on the specific 4x4 modes selected for the bottom-row
+blocks of the MB and the relationship to the I_16x16 neighbor's state.
+
+### Localization to the br=3 row of an I_4x4 MB
+On the failing MB (0, 2), the diffs are confined to rows 12..15 of
+the MB — i.e., the four blocks at br=3 (raster idx 12, 13, 14, 15
+= scan idx 9, 10, 14, 15 — the bottom-most 4x4 row).
+
+Of those four blocks in MB (0, 2)'s case, the chosen modes (raster
+order at idx 12..15) were `[1, 1, 8, 1]` — three HORIZONTAL and one
+HORIZONTAL_UP.
+
+For block 10 (raster 12 = (br=3, bc=0), mode 1 HORIZONTAL):
+- our recon row 12 col 32 = 109, ffmpeg = 123 (diff +14)
+- our recon row 13 col 32 = 65, ffmpeg = 116 (diff +51)
+- our recon row 14 col 32 = 148, ffmpeg = 136 (diff -12)
+- our recon row 15 col 32 = 144, ffmpeg = 129 (diff -15)
+
+Pred (HORIZONTAL = left[r] for all c) is the SAME on both sides
+(left = [109, 80, 134, 143] from MB (0, 1) col 31, byte-exact).
+CAVLC levels emitted are roundtrip-correct. So either the dequant
+formula or the iDCT formula differs between us and ffmpeg, OR ffmpeg
+is decoding from a DIFFERENT BIT POSITION (mb_type / cbp parsing
+misalignment that doesn't surface as a parser error).
+
+The hand-traced math for our internal recon at this block matches
+exactly: pred=109, levels=[0,0,0,0,-1,0,0,0,0,0,0,0,1,0,0,0],
+dq col-0 = [0, -416, 0, 416], iDCT row 0 = -208, recon row 0 col 0
+= 109 + (-208+32)>>6 = 109 - 3 = 106. (Or 109 in this specific
+forced-pattern test where pred differs slightly due to recon plane
+state.) The math is internally consistent.
+
+The remaining most likely cause: **ffmpeg is parsing a different
+mb_type or cbp_luma than what we emit**, putting its bitstream
+parser at a different bit offset for the residual data. This would
+cause it to read DIFFERENT levels (with the same nC sub-table) and
+produce a different recon. The CAVLC self-check doesn't catch this
+because it only validates that our own decoder agrees with our own
+encoder at the call-site nC.
+
+To confirm, the next investigative step is a full per-MB self-decoder
+that parses the emitted bitstream from the start of the slice through
+the failing MB and reports the parsed mb_type, cbp_luma, modes, and
+levels at each step.
 
 ## Plausible Remaining Causes
 
@@ -296,6 +359,36 @@ where parsing diverges from our intent.
 
 Strategy D is useful for narrowing if A/B/C don't pinpoint, but it's
 slower since each pattern requires a code change.
+
+## What I Tried This Session
+
+- **Strategy A (CAVLC self-check)** ✓ — added `#ifdef CAVLC_SELFCHECK`,
+  no mismatches caught. CAVLC layer is consistent given the encoder's nC.
+- **Strategy B (spec re-read)** ✓ — confirmed nC TotalCoeff semantics,
+  predIntra4x4PredMode rules, neighbor 4x4 derivation per 6.4.7.3.
+  All match my implementation on paper.
+- **Strategy D (per-MB forcing bisect)** ✓ — narrowed to: bug is
+  content/mode-specific, not just any I_4x4-with-I_16x16-neighbor case.
+  See "Per-MB forcing — bug is content/mode-specific" above.
+
+## What's Most Promising Next
+
+A **block-level self-decoder** that walks the emitted bitstream after
+each MB and re-parses everything: mb_type, prev/rem mode flags,
+intra_chroma_pred_mode, me(CBP), mb_qp_delta, and each residual block.
+For each, compare to what we INTENDED to emit and dump the first
+mismatch.
+
+This is the only way to definitively distinguish:
+- bit emission off (mb_type / cbp / mode flag wrong)
+- bitstream alignment off (one syntax element corrupting the next)
+- nC computation off (subtle spec interpretation)
+- residual encoding off (less likely, since CAVLC selfcheck is clean)
+
+It needs a moderate amount of code: enough state to parse a slice
+header (already have `nal_write_slice_header` mirror), then per-MB
+parsing logic. Could fit in ~200 lines reusing `bitreader_t` +
+`cavlc_decode_block`.
 
 ## Out of Scope for This Document
 
