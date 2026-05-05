@@ -2,19 +2,26 @@
 
 ## Status
 
-**Bug live, workaround in place.** The I_4x4 macroblock-emit path was
-grafted onto the staged pipeline (commit `8be8485`). The path works in
-isolation: every MB I_4x4 is byte-exact against ffmpeg's decoder, every
-MB I_16x16 is byte-exact, but **mixing the two is not** — when the path
-selector picks I_4x4 for some MBs and I_16x16 for others, the decoder's
-recon diverges from ours starting at the first I_4x4 ↔ I_16x16
-macroblock boundary.
+**RESOLVED 2026-05-04.** Bug was a spec misinterpretation in
+`emit_intra4x4_mode` (and the mirrored copy in `verify_mb_at`): when
+either neighbor 4x4 block belonged to an I_16x16 macroblock, the code
+forced `predIntra4x4PredMode = DC` instead of substituting effective
+mode `2` (DC) for that neighbor and then taking `Min(top, left)`. The
+distinction matters whenever the OTHER neighbor's mode is `< 2` (V or
+H): spec wants `Min(mode, 2) = mode`, but our code wrote `2`. Encoder
+and self-decoder shared the same wrong rule, so MB_SELFDECODE never
+caught it; pure-I_4x4 and pure-I_16x16 runs hit the wrong branch zero
+times, so they were byte-exact. Mixed mode was the only trigger.
 
-The current shipping baseline (`bits_b = INT32_MAX` in
-`mb_mode_decide`, commit `1b01aac`) forces I_16x16 selection. All 145
-dataset byte-exact tests pass with that workaround. The full I_4x4 emit
-path (Table 9-4 CBP, mode prediction, full-coef CAVLC blocks, etc.)
-remains compiled and intact.
+Fix: distinguish "neighbor unavailable" (off-frame edge) from
+"neighbor is I_16x16" (available, effective mode = DC). Force pred=DC
+only on true unavailability; otherwise compute Min over effective
+modes. After the fix, the dataset is 120/120 byte-exact (Kodak
+QP18/22/26/30/38) plus 20/20 on drone_sample with the selector
+active.
+
+The remainder of this document is the historical investigation log,
+preserved for reference.
 
 ## Symptoms
 
@@ -445,6 +452,107 @@ The most likely remaining culprits:
    9 modes. Especially HORIZONTAL_UP (mode 8) and the DDL/DDR/VR/HD
    modes that use top-right replication, which are mode-specific to
    I_4x4.
+
+## Session 2026-05-04 — Source-Level Cross-Check Findings
+
+Worked on items 1, 3, and partially 2 from the list above via
+source-level comparison against x264 (`C:\Users\kamin\Documents\
+Projects\x264`) and ffmpeg's `libavcodec/h264_cavlc.c` (master).
+**Build/run experiments were not possible in this session** — no
+gcc/clang/cl/ffmpeg/ffprobe present on PATH. All checks below are
+source-level diffs only.
+
+### 1. Table 9-4 cbp_intra ⇒ matches x264 byte-for-byte (RULED OUT)
+
+x264's `cbp_to_golomb[1][1]` (chroma=4:2:0, intra) at `encoder/
+cavlc.c:43-45` is identical to our `cbp_intra_to_codenum[48]` at
+`src/cavlc_tables.h:237`. Verified all 48 entries match in order via
+direct byte-comparison.
+
+### 3a. predict_4x4 mode 1 (HORIZONTAL) ⇒ matches x264 (RULED OUT)
+
+x264 `predict.c:501-507` writes `SRC(0..3, r) = SRC(-1, r)`. Our
+`intra.c:256-261` writes `pred[r,c] = left[r]` for c=0..3. Identical.
+
+### 3b. predict_4x4 mode 8 (HORIZONTAL_UP) ⇒ matches x264 (RULED OUT)
+
+x264 `predict.c:610-621` formulae traced through with l0..l3 = I,J,K,L
+and SRC(c,r) = pred[r,c]. Every one of x264's 16 destination writes
+matches our `intra.c:344-356` exactly (including replicated L in the
+bottom-right 6 cells).
+
+### 4. nC computation formula ⇒ matches x264 AND ffmpeg (RULED OUT)
+
+- x264 `common/macroblock.h:432-442` (`pred_non_zero_code`) uses
+  `i_ret = za + zb; if(i_ret < 0x80) i_ret = (i_ret + 1) >> 1; return
+  i_ret & 0x7f;` — sentinel-based "averaging when both available, pass
+  through when one available, 0 when both unavailable."
+- ffmpeg `h264_cavlc.c::pred_non_zero_count` uses
+  `int i = left + top; if(i<64) i = (i+1)>>1; return i&31;` — same
+  semantics with a different sentinel value (64 vs 0x80) because
+  ffmpeg's per-block max non-zero count is 16, x264's is also 16 but
+  it uses a different sentinel encoding.
+- Our `cavlc.c::cavlc_compute_nC` is the explicit-flag version of the
+  same formula: `(top+left+1)>>1` when both available, the available
+  one when only one, 0 when neither. Mathematically equivalent.
+
+### 5. nC storage convention for I_16x16 neighbor ⇒ matches ffmpeg (RULED OUT)
+
+This was the highest-suspicion candidate from the previous session
+(see "Plausible Remaining Causes" item 1). ffmpeg's
+`decode_residual()` writes `non_zero_count_cache[scan8[n]] =
+total_coeff` after parsing each AC block, and for I_16x16 AC blocks
+the call is `decode_residual(..., scan + 1, ..., 15)` — i.e. it parses
+a **15-coefficient** block (positions 1..15), so `total_coeff` is the
+count of nonzero AC coefs **with no DC contribution**.
+
+Our encoder stores AC count (`count_nonzero(&zz[1], 15)` in
+`encoder.c:1045`) for I_16x16 sub-blocks. **Same convention.**
+
+For I_4x4 blocks, ffmpeg parses 16-coef blocks and writes the full
+count. We do the same (`count_nonzero(zz, 16)` in `encoder.c:953`,
+gated on `quad_bit`).
+
+### What this leaves on the suspect list
+
+After this session, the only remaining candidates from the previous
+"Where the Bug Most Likely Lives Now" section are:
+- **Independent CAVLC parser comparison** — write a from-scratch
+  decoder (e.g. translate JM reference) into the self-checker. If our
+  `cavlc_decode_block` and the independent decoder disagree on the
+  same bits, the bug is in our cavlc layer. (Was not done this
+  session because no compiler available; sketched only.)
+- **predict_4x4 modes other than 1 and 8** — modes 3 (DDL), 4 (DDR),
+  5 (VR), 6 (HD), 7 (VL) need diffing too. Modes 0/2 (V/DC) are
+  trivial. None of these modes are USED by the failing block in MB
+  (0, 2) (modes were [1, 1, 8, 1]), but they may matter for other
+  failing patterns once selector is re-enabled.
+- **iquant_4x4 / idct4x4 against x264 dequant tables** — although the
+  pure I_4x4 byte-exactness test refutes a bare iquant/iDCT bug, an
+  edge-case-only bug (e.g. saturation, intermediate overflow) could
+  manifest only with specific level patterns.
+- **mb_qp_delta is always emitted as 0** — verified (`encoder.c:929,
+  1012`). QP carries forward unchanged through the slice. Not the
+  cause.
+
+### Concrete next steps that need a working build
+
+1. **Build with `MB_SELFDECODE`** and dump the parsed levels for
+   block (br=3, bc=0) of MB (0, 2) on kodim01 QP30 forced-(0,2)-as-
+   I_4x4. Save bytes 144-160 of the slice (or wherever this block
+   lives) to a small test file.
+2. **Run ffmpeg with bitstream debug** (`-debug bitstream`) on the
+   same .264 file and grep for the residual levels at MB (0, 2)
+   block 10. Compare to (1).
+3. If the levels differ: the divergence is in either CAVLC decoding
+   (and our self-decoder is mirroring our encoder bug) or in nC. Add
+   a printf in our self-decoder for the exact nC value used at this
+   block, then compare against ffmpeg's `pred_non_zero_count` debug
+   output (`-debug bitstream` exposes `pred_nnz`).
+4. If the levels match but residuals differ: the divergence is in
+   iquant or iDCT. Print our iquant output (the dq[] array) and
+   compare against ffmpeg's, which can be obtained by patching
+   `h264_cavlc.c` to log dequant'd coefs.
 
 ## Out of Scope for This Document
 

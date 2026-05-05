@@ -22,7 +22,6 @@
 #include "bitstream.h"
 #include "nal.h"
 #include "mb_state.h"
-#include "psnr.h"
 
 #include <string.h>
 
@@ -43,20 +42,25 @@
  * emitting path returns -6 on overflow if very low QPs blow the budget. */
 #define ARENA_RBSP_BYTES  (8 * 1024 * 1024)
 
-static u8  arena_recon_y    [MAX_W * MAX_H];
-static u8  arena_recon_uv   [MAX_W * (MAX_H / 2)];
-static int arena_luma_nc    [ARENA_LUMA_W4   * ARENA_LUMA_H4];
-static int arena_chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
-static int arena_chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
-static u8  arena_rbsp       [ARENA_RBSP_BYTES];
+/* nc / mode4 arenas use u8 storage: nc values are TotalCoeff counts in
+ * 0..16 and modes are 0..8 — both fit in 8 bits, and the lookups widen
+ * to int via implicit promotion. 4× BRAM savings vs int[] for the HLS
+ * port (1080p = 130 KB total at u8 vs 518 KB at int). */
+static u8 arena_recon_y    [MAX_W * MAX_H];
+static u8 arena_recon_uv   [MAX_W * (MAX_H / 2)];
+static u8 arena_luma_nc    [ARENA_LUMA_W4   * ARENA_LUMA_H4];
+static u8 arena_chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+static u8 arena_chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+static u8 arena_rbsp       [ARENA_RBSP_BYTES];
 
 /* Per-4x4-block luma intra prediction mode, indexed [gy * luma_w4 + gx]
  * (same indexing as arena_luma_nc). Used by the I_4x4 emit path to compute
  * predIntra4x4PredMode (spec 8.3.1.1) for prev/rem mode flag emission. For
- * blocks inside an I_16x16 MB the stored value is I4_DC = 2, which makes
- * the median-of-neighbors lookup behave per spec ("treat I_16x16 / inter /
- * unavailable neighbors as DC"). */
-static int arena_luma_mode4 [ARENA_LUMA_W4   * ARENA_LUMA_H4];
+ * blocks inside an I_16x16 MB the stored value is I4_DC = 2: spec says an
+ * I_16x16 neighbor contributes effective mode 2 (DC) to the Min(top, left)
+ * computation. Storing I4_DC directly avoids a sentinel + special-case
+ * lookup path. */
+static u8  arena_luma_mode4 [ARENA_LUMA_W4   * ARENA_LUMA_H4];
 
 /* ===== local helpers ===== */
 
@@ -377,14 +381,16 @@ static void gather_neighbors_4x4(int blk_idx, int mb_r, int mb_c, int mbs_w,
     }
 }
 
-/* ===== nC + per-block mode state ===== */
+/* ===== nC + per-block mode state =====
+ * Storage type is u8: counts 0..16 and modes 0..8 fit in 8 bits. Reads
+ * widen to int via implicit promotion. */
 typedef struct {
-    int *luma_nc;
-    int *chroma_u_nc;
-    int *chroma_v_nc;
+    u8 *luma_nc;
+    u8 *chroma_u_nc;
+    u8 *chroma_v_nc;
     /* luma_mode4: per-4x4-block intra prediction mode at frame scale. Used
      * by I_4x4 emission to compute predIntra4x4PredMode from neighbors. */
-    int *luma_mode4;
+    u8 *luma_mode4;
     int luma_w4, luma_h4;
     int chroma_w4, chroma_h4;
 } nc_state_t;
@@ -625,20 +631,7 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
                                recon_y_frame, stride_recon_y,
                                modes4_b, ac_lev_b, recon_b);
 
-    /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode).
-     *
-     * KNOWN BUG (2026-05-02): the I_4x4 path is byte-exact with ffmpeg in
-     * isolation (every MB I_4x4) and the I_16x16 path is byte-exact in
-     * isolation. But when SOME MBs pick I_4x4 and others pick I_16x16, the
-     * decoder's recon diverges from ours starting at the first I_4x4 ↔
-     * I_16x16 boundary (verified across all 24 Kodak images at QP 18-38).
-     * Spec analysis of the cross-MB state (luma_nc TotalCoeff semantics,
-     * luma_mode4 sentinel for I_16x16 neighbors, mode-prediction round-
-     * trip) all looks consistent — the bug is somewhere subtler that I
-     * couldn't pin down. Until it's found, force I_16x16 to keep the
-     * dataset byte-exact. The full I_4x4 emit path is preserved in code;
-     * just flip this guard to re-enable. */
-    bits_b = INT32_MAX;
+    /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode). */
     if (bits_a <= bits_b) {
         st->mb_type_is_i4x4 = 0;
         st->mode16 = mode_a;
@@ -808,60 +801,53 @@ static void mb_compute_cbp(mb_state_t *st)
     st->cbp_chroma = chroma_ac_nz ? 2 : (chroma_dc_nz ? 1 : 0);
 }
 
-/* Sentinel stored in ncs->luma_mode4 for 4x4 slots inside an I_16x16 MB.
- * Per spec 8.3.1.1, an I_16x16 neighbor forces predIntra4x4PredMode to DC
- * regardless of the other neighbor's mode — that's a stronger condition
- * than "treat as DC and run min()". We use -1 to distinguish this case
- * from a real I_4x4_DC neighbor (which contributes to min). */
-#define LUMA_MODE4_NONI4 (-1)
-
 /* Emit per-block I_4x4 mode signal (prev_intra4x4_pred_mode_flag + optional
  * rem_intra4x4_pred_mode). Spec 8.3.1.1 / 7.3.5.1.
  *
- * predIntra4x4PredMode = DC if either neighbor is unavailable or coded
- *   in Intra_16x16 (or in inter, which we don't have); else min of the two
- *   neighbor I_4x4 modes. Within the same I_4x4 MB, neighbors are always
- *   I_4x4 (just walk modes_in_mb in scan order). Outside, look up in
- *   luma_mode4 and treat the LUMA_MODE4_NONI4 sentinel as "force DC".
+ * Per spec 8.3.1.1:
+ *   - If EITHER neighbor is UNAVAILABLE (off-frame edge), pred = DC.
+ *   - Otherwise, pred = Min(intraMxMPredMode_top, intraMxMPredMode_left),
+ *     where intraMxMPredMode for an I_4x4 neighbor is its block mode, and
+ *     for an I_16x16 (or other non-I_NxN) neighbor is 2 (DC).
+ *
+ * Storage convention: luma_mode4 holds the effective intraMxMPredMode for
+ * each 4x4 slot — actual block mode (0..8) for I_4x4, I4_DC=2 for I_16x16.
+ * No sentinel; lookups read the value directly. Availability is tracked
+ * positionally (br/bc + mb_r/mb_c bounds).
  */
 static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
                                int actual_mode, int mb_r, int mb_c,
                                const int modes_in_mb[16],
-                               const int *luma_mode4, int luma_w4)
+                               const u8 *luma_mode4, int luma_w4)
 {
     int br = blk_scan_br[blk_scan_idx];
     int bc = blk_scan_bc[blk_scan_idx];
 
-    /* Top neighbor: -1 means unavailable or non-I_4x4. */
-    int mode_top = -1;
+    int top_avail = 0,  mode_top  = I4_DC;
+    int left_avail = 0, mode_left = I4_DC;
+
     if (br > 0) {
-        for (int s = 0; s < blk_scan_idx; s++) {
+        for (int s = 0; s < blk_scan_idx; s++)
             if (blk_scan_br[s] == br - 1 && blk_scan_bc[s] == bc) {
-                mode_top = modes_in_mb[s];   /* always a valid 0..8 mode */
-                break;
+                mode_top = modes_in_mb[s]; top_avail = 1; break;
             }
-        }
     } else if (mb_r > 0) {
-        int v = luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc)];
-        mode_top = (v >= 0 && v <= 8) ? v : -1;
+        mode_top = luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc)];
+        top_avail = 1;
     }
 
-    /* Left neighbor */
-    int mode_left = -1;
     if (bc > 0) {
-        for (int s = 0; s < blk_scan_idx; s++) {
+        for (int s = 0; s < blk_scan_idx; s++)
             if (blk_scan_br[s] == br && blk_scan_bc[s] == bc - 1) {
-                mode_left = modes_in_mb[s];
-                break;
+                mode_left = modes_in_mb[s]; left_avail = 1; break;
             }
-        }
     } else if (mb_c > 0) {
-        int v = luma_mode4[(mb_r*4 + br) * luma_w4 + (mb_c*4 - 1)];
-        mode_left = (v >= 0 && v <= 8) ? v : -1;
+        mode_left = luma_mode4[(mb_r*4 + br) * luma_w4 + (mb_c*4 - 1)];
+        left_avail = 1;
     }
 
     int pred_mode;
-    if (mode_top < 0 || mode_left < 0)
+    if (!top_avail || !left_avail)
         pred_mode = I4_DC;
     else
         pred_mode = (mode_top < mode_left) ? mode_top : mode_left;
@@ -962,7 +948,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
             /* Chroma AC */
             for (int comp = 0; comp < 2; comp++) {
-                int *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
+                u8 *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
                 i16 (*ac_levels)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
                 for (int br = 0; br < 2; br++)
                     for (int bc = 0; bc < 2; bc++) {
@@ -1043,10 +1029,9 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
         if (st->cbp_luma)
             cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
         ncs->luma_nc[gy * luma_w4 + gx] = count_nonzero(&zz[1], 15);
-        /* I_16x16-coded blocks: store the sentinel so future I_4x4 blocks
-         * recognise this as a non-I_4x4 neighbor and force predIntra4x4PredMode
-         * to DC per spec 8.3.1.1 (NOT min(..., DC)). */
-        ncs->luma_mode4[gy * luma_w4 + gx] = LUMA_MODE4_NONI4;
+        /* I_16x16 blocks store I4_DC: spec 8.3.1.1 says an I_16x16 neighbor
+         * contributes effective intraMxMPredMode = 2 (DC) to the Min(). */
+        ncs->luma_mode4[gy * luma_w4 + gx] = I4_DC;
     }
 
     /* Chroma DC: emitted in U,V order whenever cbp_chroma >= 1. */
@@ -1057,7 +1042,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
     /* Chroma AC */
     for (int comp = 0; comp < 2; comp++) {
-        int *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
+        u8 *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
         i16 (*ac_levels)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
         for (int br = 0; br < 2; br++)
             for (int bc = 0; bc < 2; bc++) {
@@ -1112,10 +1097,10 @@ static void init_codenum_inv(void) {
 
 static struct {
     int initialized;
-    int luma_nc[ARENA_LUMA_W4 * ARENA_LUMA_H4];
-    int luma_mode4[ARENA_LUMA_W4 * ARENA_LUMA_H4];
-    int chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
-    int chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+    u8 luma_nc[ARENA_LUMA_W4 * ARENA_LUMA_H4];
+    u8 luma_mode4[ARENA_LUMA_W4 * ARENA_LUMA_H4];
+    u8 chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+    u8 chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
     int luma_w4, chroma_w4;
     int n_failures;
 } dec_state;
@@ -1253,28 +1238,29 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
         for (int s = 0; s < 16; s++) {
             int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
 
-            /* Compute pred_mode (same logic as encoder's emit_intra4x4_mode). */
-            int mode_top = -1, mode_left = -1;
+            /* Compute pred_mode (matches emit_intra4x4_mode — spec 8.3.1.1). */
+            int top_avail = 0, mode_top = I4_DC;
+            int left_avail = 0, mode_left = I4_DC;
             if (br_ > 0) {
                 for (int t = 0; t < s; t++)
                     if (blk_scan_br[t] == br_ - 1 && blk_scan_bc[t] == bc_) {
-                        mode_top = dec_modes4[t]; break;
+                        mode_top = dec_modes4[t]; top_avail = 1; break;
                     }
             } else if (mb_r > 0) {
-                int v = dec_state.luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc_)];
-                mode_top = (v >= 0 && v <= 8) ? v : -1;
+                mode_top = dec_state.luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc_)];
+                top_avail = 1;
             }
             if (bc_ > 0) {
                 for (int t = 0; t < s; t++)
                     if (blk_scan_br[t] == br_ && blk_scan_bc[t] == bc_ - 1) {
-                        mode_left = dec_modes4[t]; break;
+                        mode_left = dec_modes4[t]; left_avail = 1; break;
                     }
             } else if (mb_c > 0) {
-                int v = dec_state.luma_mode4[(mb_r*4 + br_) * luma_w4 + (mb_c*4 - 1)];
-                mode_left = (v >= 0 && v <= 8) ? v : -1;
+                mode_left = dec_state.luma_mode4[(mb_r*4 + br_) * luma_w4 + (mb_c*4 - 1)];
+                left_avail = 1;
             }
             int pred_mode;
-            if (mode_top < 0 || mode_left < 0) pred_mode = I4_DC;
+            if (!top_avail || !left_avail) pred_mode = I4_DC;
             else pred_mode = (mode_top < mode_left) ? mode_top : mode_left;
 
             int prev_flag = (int)br_get_bits(&br, 1);
@@ -1330,7 +1316,7 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
             int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
             int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
             dec_state.luma_nc[gy * luma_w4 + gx] = 0;
-            dec_state.luma_mode4[gy * luma_w4 + gx] = dec_is_i4x4 ? dec_modes4[s] : -1;
+            dec_state.luma_mode4[gy * luma_w4 + gx] = dec_is_i4x4 ? dec_modes4[s] : I4_DC;
         }
         for (int br_ = 0; br_ < 2; br_++)
             for (int bc_ = 0; bc_ < 2; bc_++) {
@@ -1384,7 +1370,7 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
                 for (int k = 0; k < 15; k++) if (ac_dec[k] != 0) dec_count++;
             }
             dec_state.luma_nc[gy * luma_w4 + gx] = dec_count;
-            dec_state.luma_mode4[gy * luma_w4 + gx] = -1;  /* I_16x16 sentinel */
+            dec_state.luma_mode4[gy * luma_w4 + gx] = I4_DC;  /* effective mode for I_16x16 neighbor */
         }
     } else {
         /* I_4x4: 16 full blocks in scan order, conditional on quad bit.
@@ -1436,7 +1422,7 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
 
     /* === Chroma AC === */
     for (int comp = 0; comp < 2; comp++) {
-        int *cnc = (comp == 0) ? dec_state.chroma_u_nc : dec_state.chroma_v_nc;
+        u8 *cnc = (comp == 0) ? dec_state.chroma_u_nc : dec_state.chroma_v_nc;
         const i16 (*enc_ac)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
         for (int br_ = 0; br_ < 2; br_++)
             for (int bc_ = 0; bc_ < 2; bc_++) {
@@ -1583,10 +1569,10 @@ int encode_frame_h264(int width, int height, int qp,
     ncs.luma_h4     = luma_h4;
     ncs.chroma_w4   = chroma_w4;
     ncs.chroma_h4   = chroma_h4;
-    memset(ncs.luma_nc,     0, (size_t)luma_w4   * luma_h4   * sizeof(int));
-    memset(ncs.chroma_u_nc, 0, (size_t)chroma_w4 * chroma_h4 * sizeof(int));
-    memset(ncs.chroma_v_nc, 0, (size_t)chroma_w4 * chroma_h4 * sizeof(int));
-    memset(ncs.luma_mode4,  0, (size_t)luma_w4   * luma_h4   * sizeof(int));
+    memset(ncs.luma_nc,     0, (size_t)luma_w4   * luma_h4);
+    memset(ncs.chroma_u_nc, 0, (size_t)chroma_w4 * chroma_h4);
+    memset(ncs.chroma_v_nc, 0, (size_t)chroma_w4 * chroma_h4);
+    memset(ncs.luma_mode4,  0, (size_t)luma_w4   * luma_h4);
 
     int qp_c = chroma_qp(qp, 0);
 
