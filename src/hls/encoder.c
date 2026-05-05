@@ -57,14 +57,10 @@ static u8 arena_chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
 static u8 arena_chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
 static u8 arena_rbsp       [ARENA_RBSP_BYTES];
 
-/* Recon edge buffers (line-buffer pattern). At MAX_W = 3840 these total
- * ~15 KB versus ~15 MB for the full plane the C reference uses. Two
- * buffers per channel for ping-pong: one holds the row above, one holds
- * the row being filled. lb_begin_mb_row() swaps them. */
-static u8 arena_lb_top_a_y  [MAX_W];
-static u8 arena_lb_top_a_uv [MAX_W];
-static u8 arena_lb_top_b_y  [MAX_W];
-static u8 arena_lb_top_b_uv [MAX_W];
+/* The recon edge buffers now live inside line_buffer_t (two ping-pong
+ * banks, indexed by an integer flag rather than swapped pointers — see
+ * line_buffer.h for why). Total size at MAX_W = 3840: ~15 KB per
+ * line_buffer_t, allocated as a function-local in encode_frame_h264_hls. */
 
 /* Per-4x4-block luma intra prediction mode, indexed [gy * luma_w4 + gx]
  * (same indexing as arena_luma_nc). Used by the I_4x4 emit path to compute
@@ -1460,10 +1456,10 @@ int encode_frame_h264_hls(int width, int height, int qp,
      * keeps a full recon plane; cross-MB neighbors come from these edges
      * only. The host-visible recon plane (recon_y_out / recon_uv_out, if
      * non-NULL) is written MB-by-MB inside encode_mb_emit. */
-    line_buffer_t lb;
-    lb_init(&lb, width,
-            arena_lb_top_a_y, arena_lb_top_a_uv,
-            arena_lb_top_b_y, arena_lb_top_b_uv);
+    static line_buffer_t lb;       /* ~15 KB at MAX_W; large enough that
+                                       a function-local would blow the
+                                       stack. HLS allocates as BRAM. */
+    lb_init(&lb, width);
 
     nc_state_t ncs;
     ncs.luma_nc     = arena_luma_nc;

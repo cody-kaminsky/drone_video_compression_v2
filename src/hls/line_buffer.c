@@ -22,48 +22,48 @@ static int lb_i4_tr_avail(int blk_idx, int mb_c, int mbs_w, int top_valid)
     }
 }
 
-void lb_init(line_buffer_t *lb, int width,
-             u8 *top_y, u8 *top_uv, u8 *next_y, u8 *next_uv)
+/* Bank-index helpers — written explicitly to keep the access pattern
+ * trivially recognizable to the HLS scheduler. */
+static inline int lb_top_bank (const line_buffer_t *lb) { return  lb->top_idx;     }
+static inline int lb_next_bank(const line_buffer_t *lb) { return  lb->top_idx ^ 1; }
+
+void lb_init(line_buffer_t *lb, int width)
 {
-    lb->top_y      = top_y;
-    lb->top_uv     = top_uv;
-    lb->next_y     = next_y;
-    lb->next_uv    = next_uv;
     lb->width      = width;
+    lb->top_idx    = 0;
     lb->top_valid  = 0;
     lb->left_valid = 0;
-    /* Edge buffers don't need clearing; gather functions consult top_valid
+    /* Bank contents don't need clearing; gather functions consult top_valid
      * before reading them. */
 }
 
 void lb_begin_mb_row(line_buffer_t *lb)
 {
-    /* Promote next → top by pointer swap. The just-promoted top now holds
-     * the bottom row of the MB row we just finished; the just-cleared next
-     * is the buffer the upcoming row will fill. */
-    u8 *swap;
-    swap = lb->top_y;  lb->top_y  = lb->next_y;  lb->next_y  = swap;
-    swap = lb->top_uv; lb->top_uv = lb->next_uv; lb->next_uv = swap;
-    /* After the first row finishes, top_valid stays 1 forever. */
-    lb->top_valid  = lb->top_valid || (lb->next_y != NULL);
+    /* Flip the bank index. The bank we just filled (write side) becomes
+     * the read side for the next row; the previous read side is reused
+     * for writes. After the first row finishes, top_valid stays 1. */
+    lb->top_idx    = lb->top_idx ^ 1;
+    lb->top_valid  = 1;
     lb->left_valid = 0;
-    /* Note: lb_init starts both flags at 0; the first call to lb_begin_mb_row
-     * (before encoding row 0) will flip top_valid -- but we want top_valid
-     * to remain 0 for row 0, since there is no row above. So callers should
-     * NOT call lb_begin_mb_row before row 0; instead call it BEFORE row 1
-     * onwards. See encoder.c usage. */
 }
 
 void lb_commit_mb(line_buffer_t *lb, int mb_c,
                   const u8 recon_y[256],
                   const u8 recon_uv[128])
 {
-    /* Bottom row of luma: recon_y[15 * 16 + j] for j = 0..15. */
-    memcpy(&lb->next_y[mb_c * 16], &recon_y[15 * 16], 16);
+    int wb = lb_next_bank(lb);
 
-    /* Bottom row of NV12 chroma: recon_uv at chroma row 7, all 16 bytes
-     * (= 8 UV pairs). */
-    memcpy(&lb->next_uv[mb_c * 16], &recon_uv[7 * 16], 16);
+    /* Bottom row of luma: recon_y[15 * 16 + j] for j = 0..15. */
+    for (int j = 0; j < 16; j++) {
+        HLS_PRAGMA(UNROLL);
+        lb->buf_y[wb][mb_c * 16 + j] = recon_y[15 * 16 + j];
+    }
+
+    /* Bottom row of NV12 chroma: recon_uv at chroma row 7, all 16 bytes. */
+    for (int j = 0; j < 16; j++) {
+        HLS_PRAGMA(UNROLL);
+        lb->buf_uv[wb][mb_c * 16 + j] = recon_uv[7 * 16 + j];
+    }
 
     /* Right column of luma (col 15 of every row). */
     for (int r = 0; r < 16; r++) {
@@ -88,15 +88,25 @@ void lb_gather_luma_16x16(const line_buffer_t *lb, int mb_c,
                           u8 top[16], u8 left[16], u8 *tl,
                           int *avail_top, int *avail_left, int *avail_tl)
 {
+    int rb = lb_top_bank(lb);
+
     *avail_top  = lb->top_valid;
     *avail_left = (mb_c > 0) && lb->left_valid;
     *avail_tl   = (*avail_top && *avail_left);
 
-    if (*avail_top)
-        memcpy(top, &lb->top_y[mb_c * 16], 16);
-    if (*avail_left)
-        memcpy(left, lb->left_y, 16);
-    *tl = (*avail_tl) ? lb->top_y[mb_c * 16 - 1] : (u8)128;
+    if (*avail_top) {
+        for (int j = 0; j < 16; j++) {
+            HLS_PRAGMA(UNROLL);
+            top[j] = lb->buf_y[rb][mb_c * 16 + j];
+        }
+    }
+    if (*avail_left) {
+        for (int i = 0; i < 16; i++) {
+            HLS_PRAGMA(UNROLL);
+            left[i] = lb->left_y[i];
+        }
+    }
+    *tl = (*avail_tl) ? lb->buf_y[rb][mb_c * 16 - 1] : (u8)128;
 }
 
 void lb_gather_chroma_8x8(const line_buffer_t *lb, int mb_c,
@@ -104,28 +114,29 @@ void lb_gather_chroma_8x8(const line_buffer_t *lb, int mb_c,
                           u8 top_v[8], u8 left_v[8], u8 *tl_v,
                           int *avail_top, int *avail_left, int *avail_tl)
 {
+    int rb = lb_top_bank(lb);
+
     *avail_top  = lb->top_valid;
     *avail_left = (mb_c > 0) && lb->left_valid;
     *avail_tl   = (*avail_top && *avail_left);
 
     if (*avail_top) {
-        const u8 *row = &lb->top_uv[mb_c * 16];   /* 8 UV pairs = 16 bytes */
         for (int j = 0; j < 8; j++) {
-            top_u[j] = row[j * 2 + 0];
-            top_v[j] = row[j * 2 + 1];
+            HLS_PRAGMA(UNROLL);
+            top_u[j] = lb->buf_uv[rb][mb_c * 16 + j * 2 + 0];
+            top_v[j] = lb->buf_uv[rb][mb_c * 16 + j * 2 + 1];
         }
     }
     if (*avail_left) {
         for (int i = 0; i < 8; i++) {
+            HLS_PRAGMA(UNROLL);
             left_u[i] = lb->left_uv[i * 2 + 0];
             left_v[i] = lb->left_uv[i * 2 + 1];
         }
     }
     if (*avail_tl) {
-        /* Top-left UV pair: 2 bytes immediately preceding the current MB
-         * in the top_uv row. */
-        *tl_u = lb->top_uv[mb_c * 16 - 2];
-        *tl_v = lb->top_uv[mb_c * 16 - 1];
+        *tl_u = lb->buf_uv[rb][mb_c * 16 - 2];
+        *tl_v = lb->buf_uv[rb][mb_c * 16 - 1];
     } else {
         *tl_u = 128; *tl_v = 128;
     }
@@ -137,6 +148,7 @@ void lb_gather_4x4(const line_buffer_t *lb, int blk_idx,
                    u8 top[8], u8 left[4], u8 *tl,
                    int *avail_top, int *avail_left, int *avail_tl)
 {
+    int rb = lb_top_bank(lb);
     int br = lb_i4_scan_br[blk_idx];
     int bc = lb_i4_scan_bc[blk_idx];
 
@@ -151,8 +163,8 @@ void lb_gather_4x4(const line_buffer_t *lb, int blk_idx,
             for (int j = 0; j < 4; j++)
                 top[j] = recon_mb_y[ly * 16 + bc*4 + j];
         } else {
-            const u8 *row = &lb->top_y[mb_c * 16 + bc*4];
-            for (int j = 0; j < 4; j++) top[j] = row[j];
+            for (int j = 0; j < 4; j++)
+                top[j] = lb->buf_y[rb][mb_c * 16 + bc*4 + j];
         }
     }
 
@@ -171,12 +183,12 @@ void lb_gather_4x4(const line_buffer_t *lb, int blk_idx,
                 for (int j = 0; j < 4; j++) {
                     int gx = bc*4 + 4 + j;
                     if (gx < 16) top[4 + j] = recon_mb_y[ly * 16 + gx];
-                    else         top[4 + j] = lb->top_y[mb_c * 16 + gx];
+                    else         top[4 + j] = lb->buf_y[rb][mb_c * 16 + gx];
                 }
             }
         } else {
-            const u8 *row = &lb->top_y[mb_c * 16 + bc*4 + 4];
-            for (int j = 0; j < 4; j++) top[4 + j] = row[j];
+            for (int j = 0; j < 4; j++)
+                top[4 + j] = lb->buf_y[rb][mb_c * 16 + bc*4 + 4 + j];
         }
     } else if (*avail_top) {
         u8 v = top[3];
@@ -206,12 +218,12 @@ void lb_gather_4x4(const line_buffer_t *lb, int blk_idx,
         } else if (bc > 0) {
             /* (br == 0, bc > 0): TL is in the row above, at column bc*4-1
              * within the current MB's column range. */
-            *tl = lb->top_y[mb_c * 16 + bc*4 - 1];
+            *tl = lb->buf_y[rb][mb_c * 16 + bc*4 - 1];
         } else {
             /* (br == 0, bc == 0): TL is the corner pixel just above-left
              * of the MB. In the row above it's the last pixel of the
-             * left-MB-above's bottom row, i.e., top_y[mb_c*16 - 1]. */
-            *tl = lb->top_y[mb_c * 16 - 1];
+             * left-MB-above's bottom row, i.e., buf_y[rb][mb_c*16 - 1]. */
+            *tl = lb->buf_y[rb][mb_c * 16 - 1];
         }
     } else {
         *tl = 128;
