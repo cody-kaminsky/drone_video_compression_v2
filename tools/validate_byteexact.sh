@@ -1,10 +1,13 @@
 #!/bin/bash
 # Validate byte-exact ffmpeg decode against our internal recon for a dataset.
-# Usage: validate_byteexact.sh <image_dir> <qp1,qp2,...>
+# Usage: validate_byteexact.sh <image_dir> [qp1,qp2,...] [binary]
+#   binary defaults to build/dcc_encoder.exe; pass build/dcc_hls.exe to
+#   test the HLS port.
 set -e
 DIR="$1"
 QPS="${2:-18,22,26,30,38}"
-PATTERN="${3:-*.png *.jpg *.jpeg}"
+ENCODER="${3:-build/dcc_encoder.exe}"
+PATTERN="${4:-*.png *.jpg *.jpeg}"
 
 PASS_TOTAL=0
 FAIL_TOTAL=0
@@ -32,7 +35,7 @@ for img in $DIR/*.png $DIR/*.jpg $DIR/*.jpeg; do
 
   IFS=',' read -ra QP_ARR <<< "$QPS"
   for qp in "${QP_ARR[@]}"; do
-    enc_log=$(build/dcc_encoder.exe "$yuv" "$w" "$h" "$qp" "build/v_${bn_noext}_recon.yuv" "build/v_${bn_noext}.264" 2>&1)
+    enc_log=$("$ENCODER" "$yuv" "$w" "$h" "$qp" "build/v_${bn_noext}_recon.yuv" "build/v_${bn_noext}.264" 2>&1)
     psnr_y=$(echo "$enc_log" | grep PSNR_Y | awk '{print $3}')
     bpp=$(echo "$enc_log" | grep "STAT BPP" | awk '{print $3}')
 
