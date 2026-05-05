@@ -50,6 +50,9 @@ T-REC-H.264-*.pdf
 # Vitis HLS IDE artifacts (per-project)
 src/hls/_ide/
 src/hls/.gitignore
+src/_ide/
+src/.gitignore
+src/dcc_h264_encoder/
 hls_proj/
 
 # Temporary files

@@ -47,9 +47,9 @@ void lb_begin_mb_row(line_buffer_t *lb)
     lb->left_valid = 0;
 }
 
-void lb_commit_mb(line_buffer_t *lb, int mb_c,
-                  const u8 recon_y[256],
-                  const u8 recon_uv[128])
+void lb_commit_recon(line_buffer_t *lb, int mb_c,
+                     const u8 recon_y[256],
+                     const u8 recon_uv[128])
 {
     int wb = lb_next_bank(lb);
 
@@ -79,6 +79,50 @@ void lb_commit_mb(line_buffer_t *lb, int mb_c,
         lb->left_uv[r * 2 + 1] = recon_uv[r * 16 + 15];  /* V */
     }
 
+    lb->left_valid = 1;
+}
+
+void lb_commit_nc(line_buffer_t *lb, int mb_c,
+                  const u8 nc_y_local   [16],
+                  const u8 nc_u_local   [4],
+                  const u8 nc_v_local   [4],
+                  const u8 mode4_y_local[16])
+{
+    int wb = lb_next_bank(lb);
+
+    /* Luma: bottom row of 4x4 blocks (br=3), nc and mode4. 4 entries. */
+    for (int bc = 0; bc < 4; bc++) {
+        HLS_PRAGMA(UNROLL);
+        int idx = 3*4 + bc;
+        lb->nc_y_top   [wb][mb_c * 4 + bc] = nc_y_local   [idx];
+        lb->mode4_y_top[wb][mb_c * 4 + bc] = mode4_y_local[idx];
+    }
+
+    /* Luma: right column of 4x4 blocks (bc=3) → left register. 4 entries. */
+    for (int br = 0; br < 4; br++) {
+        HLS_PRAGMA(UNROLL);
+        int idx = br*4 + 3;
+        lb->nc_y_left   [br] = nc_y_local   [idx];
+        lb->mode4_y_left[br] = mode4_y_local[idx];
+    }
+
+    /* Chroma U: bottom row (br=1), nc. 2 entries. */
+    for (int bc = 0; bc < 2; bc++) {
+        HLS_PRAGMA(UNROLL);
+        lb->nc_u_top[wb][mb_c * 2 + bc] = nc_u_local[1*2 + bc];
+        lb->nc_v_top[wb][mb_c * 2 + bc] = nc_v_local[1*2 + bc];
+    }
+
+    /* Chroma U/V: right column (bc=1). 2 entries each. */
+    for (int br = 0; br < 2; br++) {
+        HLS_PRAGMA(UNROLL);
+        lb->nc_u_left[br] = nc_u_local[br*2 + 1];
+        lb->nc_v_left[br] = nc_v_local[br*2 + 1];
+    }
+
+    /* Mark the left column as live so the next MB on this row sees it.
+     * lb_commit_recon also sets this (encoder calls both); the self-
+     * decoder only calls lb_commit_nc, so we must set it here too. */
     lb->left_valid = 1;
 }
 

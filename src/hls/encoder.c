@@ -38,38 +38,28 @@
  * predictable static analysis for the HLS port.
  */
 
-#define ARENA_LUMA_W4     (MAX_W / 4)
-#define ARENA_LUMA_H4     (MAX_H / 4)
-#define ARENA_CHROMA_W4   (MAX_W / 8)
-#define ARENA_CHROMA_H4   (MAX_H / 8)
-
 /* RBSP slice payload buffer.
- * 8 MB comfortably holds 4K at sane QPs and any 1080p QP. The bitstream-
- * emitting path returns -6 on overflow if very low QPs blow the budget. */
-#define ARENA_RBSP_BYTES  (8 * 1024 * 1024)
+ *
+ * gcc build (dcc_hls.exe test bench): 8 MB so very low QPs / lossless
+ *   never overflow on 4K input. RAM is free.
+ *
+ * vitis_hls synthesis: 64 KB. Even at 1080p QP-0 we don't expect more
+ * than ~50 KB of bitstream per frame; the encoder returns -6 on overflow.
+ * On real hardware bytes should stream out to bs_out (the m_axi master)
+ * as they're produced — eliminating this buffer entirely is part of
+ * future M3 dataflow work. */
+#ifdef __SYNTHESIS__
+  #define ARENA_RBSP_BYTES  (64 * 1024)
+#else
+  #define ARENA_RBSP_BYTES  (8 * 1024 * 1024)
+#endif
 
-/* nc / mode4 arenas use u8 storage: nc values are TotalCoeff counts in
- * 0..16 and modes are 0..8 — both fit in 8 bits, and the lookups widen
- * to int via implicit promotion. 4× BRAM savings vs int[] for the HLS
- * port (1080p = 130 KB total at u8 vs 518 KB at int). */
-static u8 arena_luma_nc    [ARENA_LUMA_W4   * ARENA_LUMA_H4];
-static u8 arena_chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
-static u8 arena_chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+/* All cross-MB state — recon edges, nC counts, mode4 — lives inside
+ * line_buffer_t as line buffers (line_buffer.h). At MAX_W=3840 that's
+ * ~21 KB total, vs the previous frame-scale arenas which were ~3.3 MB.
+ * The slice RBSP buffer is the only frame-scale on-chip allocation
+ * left; on real hardware it streams to DDR via the bs_out AXI master. */
 static u8 arena_rbsp       [ARENA_RBSP_BYTES];
-
-/* The recon edge buffers now live inside line_buffer_t (two ping-pong
- * banks, indexed by an integer flag rather than swapped pointers — see
- * line_buffer.h for why). Total size at MAX_W = 3840: ~15 KB per
- * line_buffer_t, allocated as a function-local in encode_frame_h264_hls. */
-
-/* Per-4x4-block luma intra prediction mode, indexed [gy * luma_w4 + gx]
- * (same indexing as arena_luma_nc). Used by the I_4x4 emit path to compute
- * predIntra4x4PredMode (spec 8.3.1.1) for prev/rem mode flag emission. For
- * blocks inside an I_16x16 MB the stored value is I4_DC = 2: spec says an
- * I_16x16 neighbor contributes effective mode 2 (DC) to the Min(top, left)
- * computation. Storing I4_DC directly avoids a sentinel + special-case
- * lookup path. */
-static u8  arena_luma_mode4 [ARENA_LUMA_W4   * ARENA_LUMA_H4];
 
 /* ===== local helpers ===== */
 
@@ -237,19 +227,8 @@ static const u8 i4_scan_br[16] = {0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3};
 static const u8 i4_scan_bc[16] = {0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3};
 
 
-/* ===== nC + per-block mode state =====
- * Storage type is u8: counts 0..16 and modes 0..8 fit in 8 bits. Reads
- * widen to int via implicit promotion. */
-typedef struct {
-    u8 *luma_nc;
-    u8 *chroma_u_nc;
-    u8 *chroma_v_nc;
-    /* luma_mode4: per-4x4-block intra prediction mode at frame scale. Used
-     * by I_4x4 emission to compute predIntra4x4PredMode from neighbors. */
-    u8 *luma_mode4;
-    int luma_w4, luma_h4;
-    int chroma_w4, chroma_h4;
-} nc_state_t;
+/* nc_state_t is gone — all per-4x4-block CAVLC context (TotalCoeff and
+ * intraMxMPredMode) now lives in line_buffer_t. See line_buffer.h. */
 
 
 /* ============================================================================
@@ -681,9 +660,9 @@ static void mb_compute_cbp(mb_state_t *st)
  * positionally (br/bc + mb_r/mb_c bounds).
  */
 static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
-                               int actual_mode, int mb_r, int mb_c,
+                               int actual_mode, int mb_c,
                                const int modes_in_mb[16],
-                               const u8 *luma_mode4, int luma_w4)
+                               const line_buffer_t *lb)
 {
     int br = blk_scan_br[blk_scan_idx];
     int bc = blk_scan_bc[blk_scan_idx];
@@ -696,8 +675,8 @@ static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
             if (blk_scan_br[s] == br - 1 && blk_scan_bc[s] == bc) {
                 mode_top = modes_in_mb[s]; top_avail = 1; break;
             }
-    } else if (mb_r > 0) {
-        mode_top = luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc)];
+    } else if (lb->top_valid) {
+        mode_top = lb_mode4_y_top(lb, mb_c*4 + bc);
         top_avail = 1;
     }
 
@@ -706,8 +685,8 @@ static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
             if (blk_scan_br[s] == br && blk_scan_bc[s] == bc - 1) {
                 mode_left = modes_in_mb[s]; left_avail = 1; break;
             }
-    } else if (mb_c > 0) {
-        mode_left = luma_mode4[(mb_r*4 + br) * luma_w4 + (mb_c*4 - 1)];
+    } else if (mb_c > 0 && lb->left_valid) {
+        mode_left = lb->mode4_y_left[br];
         left_avail = 1;
     }
 
@@ -742,11 +721,61 @@ static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
  *
  * Always updates ncs->luma_nc / luma_mode4 / chroma_*_nc so subsequent MBs
  * see correct neighbor state. Architecture.txt §8 "CAVLC + bit pack". */
-static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
+/* Read luma nC for an in-progress MB at MB-relative (br, bc).
+ *   br > 0  : from local scratch (already-emitted block in same MB).
+ *   br == 0 : from the line buffer's top row.
+ * Returns 0 when the top neighbor is unavailable (mb_r == 0). */
+static inline int read_top_nc_y(const line_buffer_t *lb, const u8 nc_y[16],
+                                int mb_c, int br, int bc, int *avail)
+{
+    if (br > 0)         { *avail = 1; return nc_y[(br-1)*4 + bc]; }
+    if (lb->top_valid)  { *avail = 1; return lb_nc_y_top(lb, mb_c*4 + bc); }
+    *avail = 0; return 0;
+}
+
+static inline int read_left_nc_y(const line_buffer_t *lb, const u8 nc_y[16],
+                                 int mb_c, int br, int bc, int *avail)
+{
+    if (bc > 0)                            { *avail = 1; return nc_y[br*4 + (bc-1)]; }
+    if (mb_c > 0 && lb->left_valid)        { *avail = 1; return lb->nc_y_left[br]; }
+    *avail = 0; return 0;
+}
+
+static inline int read_top_nc_c(const line_buffer_t *lb, const u8 nc_c[4],
+                                int mb_c, int br, int bc, int comp, int *avail)
+{
+    if (br > 0)         { *avail = 1; return nc_c[(br-1)*2 + bc]; }
+    if (lb->top_valid)  {
+        *avail = 1;
+        return (comp == 0) ? lb_nc_u_top(lb, mb_c*2 + bc)
+                           : lb_nc_v_top(lb, mb_c*2 + bc);
+    }
+    *avail = 0; return 0;
+}
+
+static inline int read_left_nc_c(const line_buffer_t *lb, const u8 nc_c[4],
+                                 int mb_c, int br, int bc, int comp, int *avail)
+{
+    if (bc > 0)                          { *avail = 1; return nc_c[br*2 + (bc-1)]; }
+    if (mb_c > 0 && lb->left_valid)      {
+        *avail = 1;
+        return (comp == 0) ? lb->nc_u_left[br] : lb->nc_v_left[br];
+    }
+    *avail = 0; return 0;
+}
+
+static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
 {
     int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
-    int luma_w4   = ncs->luma_w4;
-    int chroma_w4 = ncs->chroma_w4;
+
+    /* Per-MB scratch: nC and mode4 of every 4x4 block in this MB. Filled
+     * as blocks are processed; committed to the line buffer at the end. */
+    u8 nc_y_local    [16] = {0};
+    u8 nc_u_local    [4]  = {0};
+    u8 nc_v_local    [4]  = {0};
+    u8 mode4_y_local [16] = {0};
+
+    int mb_c = st->mb_c;
 
     if (st->mb_type_is_i4x4) {
         /* mb_type = 0 (I_NxN). ue(0) = '1' (1 bit). */
@@ -757,13 +786,10 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
             int br = blk_scan_br[s];
             int bc = blk_scan_bc[s];
             int actual = st->modes4[br*4 + bc];
-            /* modes_in_mb is indexed by scan position s, not raster br*4+bc.
-             * Build a transient view in scan order. */
             int modes_scan[16];
             for (int t = 0; t < 16; t++)
                 modes_scan[t] = st->modes4[blk_scan_br[t]*4 + blk_scan_bc[t]];
-            emit_intra4x4_mode(bs, s, actual, st->mb_r, st->mb_c,
-                               modes_scan, ncs->luma_mode4, luma_w4);
+            emit_intra4x4_mode(bs, s, actual, mb_c, modes_scan, lb);
         }
 
         /* intra_chroma_pred_mode */
@@ -773,14 +799,11 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
         int cbp_value = (st->cbp_luma & 0xF) | ((st->cbp_chroma & 0x3) << 4);
         bs_put_ue(bs, cbp_intra_to_codenum[cbp_value]);
 
-        /* mb_qp_delta + residuals only if cbp_luma|cbp_chroma != 0
-         * (spec 7.3.5.1 "if any nonzero residual"). */
         int has_residual = (st->cbp_luma != 0) || (st->cbp_chroma != 0);
         if (has_residual) {
             bs_put_se(bs, 0);   /* mb_qp_delta = 0 */
 
-            /* Luma blocks in scan order. Each block belongs to 8x8 quadrant
-             * (s / 4); emit only if cbp_luma's bit for that quadrant is set. */
+            /* Luma blocks in scan order. */
             for (int s = 0; s < 16; s++) {
                 int br = blk_scan_br[s];
                 int bc = blk_scan_bc[s];
@@ -790,19 +813,16 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
                 for (int k = 0; k < 16; k++)
                     zz[k] = st->ac_levels_y_full[idx][zz_scan_4x4[k]];
 
-                int gx = st->mb_c * 4 + bc;
-                int gy = st->mb_r * 4 + br;
-                int top_nc  = (gy > 0) ? ncs->luma_nc[(gy - 1) * luma_w4 + gx] : 0;
-                int left_nc = (gx > 0) ? ncs->luma_nc[gy * luma_w4 + (gx - 1)] : 0;
-                int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
+                int avt, avl;
+                int top_nc  = read_top_nc_y (lb, nc_y_local, mb_c, br, bc, &avt);
+                int left_nc = read_left_nc_y(lb, nc_y_local, mb_c, br, bc, &avl);
+                int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
 
                 int quad_bit = (st->cbp_luma >> (s / 4)) & 1;
                 if (quad_bit)
                     cavlc_encode_block(bs, zz, 16, BLK_LUMA_FULL, nC);
-                /* nC count: full 16-coef when emitted, 0 when skipped (the
-                 * spec reads totalCoeff of 0 from blocks not emitted). */
-                ncs->luma_nc[gy * luma_w4 + gx] = quad_bit ? count_nonzero(zz, 16) : 0;
-                ncs->luma_mode4[gy * luma_w4 + gx] = st->modes4[idx];
+                nc_y_local   [idx] = quad_bit ? (u8)count_nonzero(zz, 16) : 0;
+                mode4_y_local[idx] = (u8)st->modes4[idx];
             }
 
             /* Chroma DC */
@@ -813,7 +833,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
             /* Chroma AC */
             for (int comp = 0; comp < 2; comp++) {
-                u8 *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
+                u8 *nc_c = (comp == 0) ? nc_u_local : nc_v_local;
                 i16 (*ac_levels)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
                 for (int br = 0; br < 2; br++)
                     for (int bc = 0; bc < 2; bc++) {
@@ -821,112 +841,99 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
                         i16 zz[16];
                         for (int k = 0; k < 16; k++)
                             zz[k] = ac_levels[idx][zz_scan_4x4[k]];
-                        int gx = st->mb_c * 2 + bc;
-                        int gy = st->mb_r * 2 + br;
-                        int top_nc  = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
-                        int left_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
-                        int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
+
+                        int avt, avl;
+                        int top_nc  = read_top_nc_c (lb, nc_c, mb_c, br, bc, comp, &avt);
+                        int left_nc = read_left_nc_c(lb, nc_c, mb_c, br, bc, comp, &avl);
+                        int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
+
                         if (st->cbp_chroma == 2)
                             cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
-                        cnc[gy * chroma_w4 + gx] =
-                            (st->cbp_chroma == 2) ? count_nonzero(&zz[1], 15) : 0;
+                        nc_c[idx] = (st->cbp_chroma == 2)
+                                  ? (u8)count_nonzero(&zz[1], 15) : 0;
                     }
             }
         } else {
-            /* No residual emitted at all — but neighbor state must still
-             * reflect "this MB had zero coefs everywhere" so subsequent MBs
-             * compute correct nC. */
+            /* No residual emitted at all — locals stay at 0; modes carry through. */
             for (int s = 0; s < 16; s++) {
-                int br = blk_scan_br[s], bc = blk_scan_bc[s];
-                int idx = br*4 + bc;
-                int gx = st->mb_c * 4 + bc;
-                int gy = st->mb_r * 4 + br;
-                ncs->luma_nc[gy * luma_w4 + gx] = 0;
-                ncs->luma_mode4[gy * luma_w4 + gx] = st->modes4[idx];
+                int idx = blk_scan_br[s]*4 + blk_scan_bc[s];
+                mode4_y_local[idx] = (u8)st->modes4[idx];
             }
+        }
+    } else {
+        /* ===== I_16x16 path ===== */
+        int mb_type = 1 + st->mode16 + 4 * st->cbp_chroma + 12 * st->cbp_luma;
+        bs_put_ue(bs, mb_type);
+        bs_put_ue(bs, st->mode_chroma);     /* intra_chroma_pred_mode */
+        bs_put_se(bs, 0);                   /* mb_qp_delta = 0 (always I_16x16) */
+
+        /* Luma DC block — nC from block-0 neighbors (br=0, bc=0). */
+        {
+            int avt, avl;
+            int top_nc  = read_top_nc_y (lb, nc_y_local, mb_c, 0, 0, &avt);
+            int left_nc = read_left_nc_y(lb, nc_y_local, mb_c, 0, 0, &avl);
+            int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
+
+            i16 zz[16];
+            for (int k = 0; k < 16; k++) zz[k] = st->dc_levels_y[zz_scan_4x4[k]];
+            cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
+        }
+
+        /* Luma AC blocks in scan order. */
+        for (int s = 0; s < 16; s++) {
+            int br = blk_scan_br[s];
+            int bc = blk_scan_bc[s];
+            int idx = br*4 + bc;
+
+            i16 zz[16];
+            for (int k = 0; k < 16; k++)
+                zz[k] = st->ac_levels_y[idx][zz_scan_4x4[k]];
+
+            int avt, avl;
+            int top_nc  = read_top_nc_y (lb, nc_y_local, mb_c, br, bc, &avt);
+            int left_nc = read_left_nc_y(lb, nc_y_local, mb_c, br, bc, &avl);
+            int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
+
+            if (st->cbp_luma)
+                cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
+            nc_y_local   [idx] = (u8)count_nonzero(&zz[1], 15);
+            /* I_16x16 blocks store I4_DC per spec 8.3.1.1 (effective mode 2). */
+            mode4_y_local[idx] = (u8)I4_DC;
+        }
+
+        /* Chroma DC: emitted in U,V order whenever cbp_chroma >= 1. */
+        if (st->cbp_chroma >= 1) {
+            cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+            cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+        }
+
+        /* Chroma AC */
+        for (int comp = 0; comp < 2; comp++) {
+            u8 *nc_c = (comp == 0) ? nc_u_local : nc_v_local;
+            i16 (*ac_levels)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
             for (int br = 0; br < 2; br++)
                 for (int bc = 0; bc < 2; bc++) {
-                    int gx = st->mb_c * 2 + bc, gy = st->mb_r * 2 + br;
-                    ncs->chroma_u_nc[gy * chroma_w4 + gx] = 0;
-                    ncs->chroma_v_nc[gy * chroma_w4 + gx] = 0;
+                    int idx = br*2 + bc;
+                    i16 zz[16];
+                    for (int k = 0; k < 16; k++)
+                        zz[k] = ac_levels[idx][zz_scan_4x4[k]];
+
+                    int avt, avl;
+                    int top_nc  = read_top_nc_c (lb, nc_c, mb_c, br, bc, comp, &avt);
+                    int left_nc = read_left_nc_c(lb, nc_c, mb_c, br, bc, comp, &avl);
+                    int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
+
+                    if (st->cbp_chroma == 2)
+                        cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                    nc_c[idx] = (u8)count_nonzero(&zz[1], 15);
                 }
         }
-        return bs->byte_pos * 8 + bs->n_in_cur - start_bits;
     }
 
-    /* ===== I_16x16 path ===== */
-    /* mb_type for I_16x16: spec Table 7-11
-     * mb_type = 1 + PredMode + 4*CBPChroma + 12*CBPLuma. */
-    int mb_type = 1 + st->mode16 + 4 * st->cbp_chroma + 12 * st->cbp_luma;
-    bs_put_ue(bs, mb_type);
-    bs_put_ue(bs, st->mode_chroma);     /* intra_chroma_pred_mode */
-    bs_put_se(bs, 0);                   /* mb_qp_delta = 0 (always for I_16x16) */
-
-    /* Luma DC block (always emitted for I_16x16). nC from block-0 neighbors. */
-    {
-        int gx0 = st->mb_c * 4;
-        int gy0 = st->mb_r * 4;
-        int top_nc  = (gy0 > 0) ? ncs->luma_nc[(gy0 - 1) * luma_w4 + gx0] : 0;
-        int left_nc = (gx0 > 0) ? ncs->luma_nc[gy0 * luma_w4 + (gx0 - 1)] : 0;
-        int nC = cavlc_compute_nC(top_nc, left_nc, gy0 > 0, gx0 > 0);
-
-        i16 zz[16];
-        for (int k = 0; k < 16; k++) zz[k] = st->dc_levels_y[zz_scan_4x4[k]];
-        cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
-    }
-
-    /* Luma AC blocks in I_4x4 sub-block scan order. */
-    for (int s = 0; s < 16; s++) {
-        int br = blk_scan_br[s];
-        int bc = blk_scan_bc[s];
-        int idx = br*4 + bc;
-
-        i16 zz[16];
-        for (int k = 0; k < 16; k++)
-            zz[k] = st->ac_levels_y[idx][zz_scan_4x4[k]];
-
-        int gx = st->mb_c * 4 + bc;
-        int gy = st->mb_r * 4 + br;
-        int top_nc  = (gy > 0) ? ncs->luma_nc[(gy - 1) * luma_w4 + gx] : 0;
-        int left_nc = (gx > 0) ? ncs->luma_nc[gy * luma_w4 + (gx - 1)] : 0;
-        int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
-
-        if (st->cbp_luma)
-            cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
-        ncs->luma_nc[gy * luma_w4 + gx] = count_nonzero(&zz[1], 15);
-        /* I_16x16 blocks store I4_DC: spec 8.3.1.1 says an I_16x16 neighbor
-         * contributes effective intraMxMPredMode = 2 (DC) to the Min(). */
-        ncs->luma_mode4[gy * luma_w4 + gx] = I4_DC;
-    }
-
-    /* Chroma DC: emitted in U,V order whenever cbp_chroma >= 1. */
-    if (st->cbp_chroma >= 1) {
-        cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
-        cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
-    }
-
-    /* Chroma AC */
-    for (int comp = 0; comp < 2; comp++) {
-        u8 *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
-        i16 (*ac_levels)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
-        for (int br = 0; br < 2; br++)
-            for (int bc = 0; bc < 2; bc++) {
-                int idx = br*2 + bc;
-                i16 zz[16];
-                for (int k = 0; k < 16; k++)
-                    zz[k] = ac_levels[idx][zz_scan_4x4[k]];
-
-                int gx = st->mb_c * 2 + bc;
-                int gy = st->mb_r * 2 + br;
-                int top_nc  = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
-                int left_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
-                int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
-
-                if (st->cbp_chroma == 2)
-                    cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
-                cnc[gy * chroma_w4 + gx] = count_nonzero(&zz[1], 15);
-            }
-    }
+    /* Commit per-MB nC + mode4 to the line buffer. The recon plane commit
+     * (lb_commit_recon) is already done by the caller before mb_cavlc_emit
+     * to keep neighbor data correct for following MBs. */
+    lb_commit_nc(lb, mb_c, nc_y_local, nc_u_local, nc_v_local, mode4_y_local);
 
     return bs->byte_pos * 8 + bs->n_in_cur - start_bits;
 }
@@ -960,68 +967,75 @@ static void init_codenum_inv(void) {
     codenum_inv_done = 1;
 }
 
+/* Self-decoder mirrors the encoder's line buffer. Comparing the two after
+ * each MB tells us whether the bitstream we just emitted decodes back to
+ * the same neighbor state the encoder relies on for subsequent MBs. */
 static struct {
     int initialized;
-    u8 luma_nc[ARENA_LUMA_W4 * ARENA_LUMA_H4];
-    u8 luma_mode4[ARENA_LUMA_W4 * ARENA_LUMA_H4];
-    u8 chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
-    u8 chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
-    int luma_w4, chroma_w4;
+    line_buffer_t mirror_lb;
     int n_failures;
 } dec_state;
 
-static void dec_state_init(int luma_w4, int chroma_w4)
+static void dec_state_init(int width)
 {
     init_codenum_inv();
-    memset(dec_state.luma_nc,     0, sizeof dec_state.luma_nc);
-    memset(dec_state.luma_mode4,  0, sizeof dec_state.luma_mode4);
-    memset(dec_state.chroma_u_nc, 0, sizeof dec_state.chroma_u_nc);
-    memset(dec_state.chroma_v_nc, 0, sizeof dec_state.chroma_v_nc);
-    dec_state.luma_w4 = luma_w4;
-    dec_state.chroma_w4 = chroma_w4;
+    lb_init(&dec_state.mirror_lb, width);
     dec_state.initialized = 1;
     dec_state.n_failures = 0;
 }
 
-/* Called after each MB verify. Compares dec_state.luma_nc and luma_mode4
- * to encoder's ncs. Reports first divergence. */
-static int verify_state_match(const mb_state_t *st, const nc_state_t *ncs)
+/* Compare encoder's post-commit line buffer to the self-decoder's mirror.
+ * Both should hold identical state if encode/parse round-trips correctly. */
+static int verify_state_match(const mb_state_t *st, const line_buffer_t *enc_lb)
 {
-    int luma_w4 = dec_state.luma_w4, chroma_w4 = dec_state.chroma_w4;
+    const line_buffer_t *dec_lb = &dec_state.mirror_lb;
     int mb_r = st->mb_r, mb_c = st->mb_c;
-    /* Check the 16 4x4 luma slots of THIS MB */
-    for (int br = 0; br < 4; br++)
-        for (int bc = 0; bc < 4; bc++) {
-            int gx = mb_c*4 + bc, gy = mb_r*4 + br;
-            int e = ncs->luma_nc[gy * luma_w4 + gx];
-            int d = dec_state.luma_nc[gy * luma_w4 + gx];
-            if (e != d) {
-                fprintf(stderr, "STATE MISMATCH MB(%d,%d) luma_nc[%d,%d] enc=%d dec=%d\n",
-                        mb_r, mb_c, br, bc, e, d);
-                return -1;
-            }
-            int em = ncs->luma_mode4[gy * luma_w4 + gx];
-            int dm = dec_state.luma_mode4[gy * luma_w4 + gx];
-            if (em != dm) {
-                fprintf(stderr, "STATE MISMATCH MB(%d,%d) luma_mode4[%d,%d] enc=%d dec=%d\n",
-                        mb_r, mb_c, br, bc, em, dm);
-                return -1;
-            }
+    int rb = enc_lb->top_idx ^ 1;   /* the just-written bank holds this MB's bottom row */
+    /* nC luma: 4 slots in the bottom-row bank for this MB. */
+    for (int bc = 0; bc < 4; bc++) {
+        int e  = enc_lb->nc_y_top   [rb][mb_c*4 + bc];
+        int d  = dec_lb->nc_y_top   [rb][mb_c*4 + bc];
+        int em = enc_lb->mode4_y_top[rb][mb_c*4 + bc];
+        int dm = dec_lb->mode4_y_top[rb][mb_c*4 + bc];
+        if (e != d) {
+            fprintf(stderr, "STATE MISMATCH MB(%d,%d) nc_y bottom-row bc=%d enc=%d dec=%d\n",
+                    mb_r, mb_c, bc, e, d);
+            return -1;
         }
-    /* Check chroma 4x4 slots */
-    for (int br = 0; br < 2; br++)
-        for (int bc = 0; bc < 2; bc++) {
-            int gx = mb_c*2 + bc, gy = mb_r*2 + br;
-            int eu = ncs->chroma_u_nc[gy * chroma_w4 + gx];
-            int du = dec_state.chroma_u_nc[gy * chroma_w4 + gx];
-            int ev = ncs->chroma_v_nc[gy * chroma_w4 + gx];
-            int dv = dec_state.chroma_v_nc[gy * chroma_w4 + gx];
-            if (eu != du || ev != dv) {
-                fprintf(stderr, "STATE MISMATCH MB(%d,%d) chroma_nc[%d,%d] enc=(%d,%d) dec=(%d,%d)\n",
-                        mb_r, mb_c, br, bc, eu, ev, du, dv);
-                return -1;
-            }
+        if (em != dm) {
+            fprintf(stderr, "STATE MISMATCH MB(%d,%d) mode4 bottom-row bc=%d enc=%d dec=%d\n",
+                    mb_r, mb_c, bc, em, dm);
+            return -1;
         }
+    }
+    for (int br = 0; br < 4; br++) {
+        if (enc_lb->nc_y_left[br] != dec_lb->nc_y_left[br]) {
+            fprintf(stderr, "STATE MISMATCH MB(%d,%d) nc_y_left[%d] enc=%d dec=%d\n",
+                    mb_r, mb_c, br, enc_lb->nc_y_left[br], dec_lb->nc_y_left[br]);
+            return -1;
+        }
+        if (enc_lb->mode4_y_left[br] != dec_lb->mode4_y_left[br]) {
+            fprintf(stderr, "STATE MISMATCH MB(%d,%d) mode4_y_left[%d] enc=%d dec=%d\n",
+                    mb_r, mb_c, br, enc_lb->mode4_y_left[br], dec_lb->mode4_y_left[br]);
+            return -1;
+        }
+    }
+    /* Chroma: bottom row 2 entries each + left 2 entries each. */
+    for (int bc = 0; bc < 2; bc++) {
+        if (enc_lb->nc_u_top[rb][mb_c*2 + bc] != dec_lb->nc_u_top[rb][mb_c*2 + bc] ||
+            enc_lb->nc_v_top[rb][mb_c*2 + bc] != dec_lb->nc_v_top[rb][mb_c*2 + bc]) {
+            fprintf(stderr, "STATE MISMATCH MB(%d,%d) chroma bottom-row bc=%d\n",
+                    mb_r, mb_c, bc);
+            return -1;
+        }
+    }
+    for (int br = 0; br < 2; br++) {
+        if (enc_lb->nc_u_left[br] != dec_lb->nc_u_left[br] ||
+            enc_lb->nc_v_left[br] != dec_lb->nc_v_left[br]) {
+            fprintf(stderr, "STATE MISMATCH MB(%d,%d) chroma left br=%d\n", mb_r, mb_c, br);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -1037,13 +1051,21 @@ static int verify_state_match(const mb_state_t *st, const nc_state_t *ncs)
  *   bs              — the bitstream we emitted to
  *   mb_start_bit    — bit offset in bs where this MB started (before mb_cavlc_emit)
  *   st              — encoder's intended MB state (modes, levels, recon, cbp)
- *   ncs             — encoder's intended neighbor state (already updated post-emit)
+ *   enc_lb          — encoder's post-commit line buffer (for cross-checks).
+ *                     The self-decoder maintains its own dec_state.mirror_lb.
  */
 static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
-                        const mb_state_t *st, const nc_state_t *ncs)
+                        const mb_state_t *st, const line_buffer_t *enc_lb)
 {
-    int mb_r = st->mb_r, mb_c = st->mb_c;
-    int luma_w4 = dec_state.luma_w4, chroma_w4 = dec_state.chroma_w4;
+    (void)enc_lb;  /* used only by verify_state_match after we return */
+    int mb_c = st->mb_c;
+    line_buffer_t *dec_lb = &dec_state.mirror_lb;
+
+    /* Per-MB scratch — same shape as the encoder uses. */
+    u8 dec_nc_y_local   [16] = {0};
+    u8 dec_nc_u_local   [4]  = {0};
+    u8 dec_nc_v_local   [4]  = {0};
+    u8 dec_mode4_y_local[16] = {0};
 
     /* Build a scratch buffer covering committed bytes + leftover bits in bs->cur. */
     static u8 scratch[1 << 17];   /* 128 KB; one MB at QP=0 lossless ~2 KB */
@@ -1111,8 +1133,8 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
                     if (blk_scan_br[t] == br_ - 1 && blk_scan_bc[t] == bc_) {
                         mode_top = dec_modes4[t]; top_avail = 1; break;
                     }
-            } else if (mb_r > 0) {
-                mode_top = dec_state.luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc_)];
+            } else if (dec_lb->top_valid) {
+                mode_top = lb_mode4_y_top(dec_lb, mb_c*4 + bc_);
                 top_avail = 1;
             }
             if (bc_ > 0) {
@@ -1120,8 +1142,8 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
                     if (blk_scan_br[t] == br_ && blk_scan_bc[t] == bc_ - 1) {
                         mode_left = dec_modes4[t]; left_avail = 1; break;
                     }
-            } else if (mb_c > 0) {
-                mode_left = dec_state.luma_mode4[(mb_r*4 + br_) * luma_w4 + (mb_c*4 - 1)];
+            } else if (mb_c > 0 && dec_lb->left_valid) {
+                mode_left = dec_lb->mode4_y_left[br_];
                 left_avail = 1;
             }
             int pred_mode;
@@ -1176,29 +1198,25 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
     }
 
     if (!has_residual) {
-        /* No residual; update neighbor state to zero and modes4 sentinel. */
+        /* No residual; locals stay at 0; mode4 carries through from dec_modes4
+         * (I_4x4) or stays I4_DC (I_16x16, but I_16x16 always has residual). */
         for (int s = 0; s < 16; s++) {
-            int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
-            int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
-            dec_state.luma_nc[gy * luma_w4 + gx] = 0;
-            dec_state.luma_mode4[gy * luma_w4 + gx] = dec_is_i4x4 ? dec_modes4[s] : I4_DC;
+            int idx = blk_scan_br[s]*4 + blk_scan_bc[s];
+            dec_mode4_y_local[idx] = (u8)(dec_is_i4x4 ? dec_modes4[s] : I4_DC);
         }
-        for (int br_ = 0; br_ < 2; br_++)
-            for (int bc_ = 0; bc_ < 2; bc_++) {
-                int gx = mb_c*2 + bc_, gy = mb_r*2 + br_;
-                dec_state.chroma_u_nc[gy * chroma_w4 + gx] = 0;
-                dec_state.chroma_v_nc[gy * chroma_w4 + gx] = 0;
-            }
+        lb_commit_nc(dec_lb, mb_c,
+                     dec_nc_y_local, dec_nc_u_local, dec_nc_v_local,
+                     dec_mode4_y_local);
         return 0;
     }
 
     /* === Luma residuals === */
     if (!dec_is_i4x4) {
-        /* Luma DC block (always for I_16x16). nC from block-0 neighbors. */
-        int gx0 = mb_c*4, gy0 = mb_r*4;
-        int top_nc  = (gy0 > 0) ? dec_state.luma_nc[(gy0 - 1) * luma_w4 + gx0] : 0;
-        int left_nc = (gx0 > 0) ? dec_state.luma_nc[gy0 * luma_w4 + (gx0 - 1)] : 0;
-        int nC = cavlc_compute_nC(top_nc, left_nc, gy0 > 0, gx0 > 0);
+        /* Luma DC block (always for I_16x16). nC from block-0 (br=0,bc=0). */
+        int avt, avl;
+        int top_nc  = read_top_nc_y (dec_lb, dec_nc_y_local, mb_c, 0, 0, &avt);
+        int left_nc = read_left_nc_y(dec_lb, dec_nc_y_local, mb_c, 0, 0, &avl);
+        int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
         i16 dc_dec[16];
         if (cavlc_decode_block(&br, dc_dec, 16, BLK_LUMA_DC_16x16, nC) < 0)
             VERIFY_FAIL("luma DC decode error (nC=%d)", nC);
@@ -1213,60 +1231,58 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
         for (int s = 0; s < 16; s++) {
             int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
             int idx = br_*4 + bc_;
-            int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
-            int t_nc = (gy > 0) ? dec_state.luma_nc[(gy - 1) * luma_w4 + gx] : 0;
-            int l_nc = (gx > 0) ? dec_state.luma_nc[gy * luma_w4 + (gx - 1)] : 0;
-            int nC = cavlc_compute_nC(t_nc, l_nc, gy > 0, gx > 0);
+
+            int t_avail, l_avail;
+            int t_nc = read_top_nc_y (dec_lb, dec_nc_y_local, mb_c, br_, bc_, &t_avail);
+            int l_nc = read_left_nc_y(dec_lb, dec_nc_y_local, mb_c, br_, bc_, &l_avail);
+            int nCac = cavlc_compute_nC(t_nc, l_nc, t_avail, l_avail);
 
             i16 ac_dec[16] = {0};
             int dec_count = 0;
             if (dec_cbp_luma) {
-                if (cavlc_decode_block(&br, ac_dec, 15, BLK_LUMA_AC, nC) < 0)
-                    VERIFY_FAIL("blk_scan=%d luma AC decode error (nC=%d)", s, nC);
+                if (cavlc_decode_block(&br, ac_dec, 15, BLK_LUMA_AC, nCac) < 0)
+                    VERIFY_FAIL("blk_scan=%d luma AC decode error (nC=%d)", s, nCac);
                 for (int k = 0; k < 15; k++) {
-                    /* Encoder's emit: zz[1..15] from raster order; decoder reads
-                     * 15 coefs into positions [0..14] of ac_dec. */
                     i16 expected = st->ac_levels_y[idx][zz_scan_4x4[k+1]];
                     if (ac_dec[k] != expected)
                         VERIFY_FAIL("blk_scan=%d (br=%d bc=%d raster=%d) luma AC[zz=%d raster=%d] enc=%d dec=%d (nC=%d top=%d left=%d)",
                                     s, br_, bc_, idx, k+1, zz_scan_4x4[k+1],
-                                    expected, ac_dec[k], nC, t_nc, l_nc);
+                                    expected, ac_dec[k], nCac, t_nc, l_nc);
                 }
                 for (int k = 0; k < 15; k++) if (ac_dec[k] != 0) dec_count++;
             }
-            dec_state.luma_nc[gy * luma_w4 + gx] = dec_count;
-            dec_state.luma_mode4[gy * luma_w4 + gx] = I4_DC;  /* effective mode for I_16x16 neighbor */
+            dec_nc_y_local   [idx] = (u8)dec_count;
+            dec_mode4_y_local[idx] = (u8)I4_DC;   /* I_16x16 → effective mode 2 */
         }
     } else {
-        /* I_4x4: 16 full blocks in scan order, conditional on quad bit.
-         * Also reconstruct each block from the parsed levels and compare to
-         * the encoder's internal recon (st->recon_y). */
+        /* I_4x4: 16 full blocks in scan order, conditional on quad bit. */
         for (int s = 0; s < 16; s++) {
             int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
             int idx = br_*4 + bc_;
-            int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
-            int t_nc = (gy > 0) ? dec_state.luma_nc[(gy - 1) * luma_w4 + gx] : 0;
-            int l_nc = (gx > 0) ? dec_state.luma_nc[gy * luma_w4 + (gx - 1)] : 0;
-            int nC = cavlc_compute_nC(t_nc, l_nc, gy > 0, gx > 0);
+
+            int t_avail, l_avail;
+            int t_nc = read_top_nc_y (dec_lb, dec_nc_y_local, mb_c, br_, bc_, &t_avail);
+            int l_nc = read_left_nc_y(dec_lb, dec_nc_y_local, mb_c, br_, bc_, &l_avail);
+            int nCblk = cavlc_compute_nC(t_nc, l_nc, t_avail, l_avail);
 
             int quad_bit = (dec_cbp_luma >> (s / 4)) & 1;
             i16 ac_dec[16] = {0};
             int dec_count = 0;
             if (quad_bit) {
-                if (cavlc_decode_block(&br, ac_dec, 16, BLK_LUMA_FULL, nC) < 0)
+                if (cavlc_decode_block(&br, ac_dec, 16, BLK_LUMA_FULL, nCblk) < 0)
                     VERIFY_FAIL("blk_scan=%d (br=%d bc=%d raster=%d) luma FULL decode error (nC=%d top=%d left=%d)",
-                                s, br_, bc_, idx, nC, t_nc, l_nc);
+                                s, br_, bc_, idx, nCblk, t_nc, l_nc);
                 for (int k = 0; k < 16; k++) {
                     i16 expected = st->ac_levels_y_full[idx][zz_scan_4x4[k]];
                     if (ac_dec[k] != expected)
                         VERIFY_FAIL("blk_scan=%d (br=%d bc=%d raster=%d) luma FULL[zz=%d raster=%d] enc=%d dec=%d (nC=%d top_nc=%d left_nc=%d)",
                                     s, br_, bc_, idx, k, zz_scan_4x4[k],
-                                    expected, ac_dec[k], nC, t_nc, l_nc);
+                                    expected, ac_dec[k], nCblk, t_nc, l_nc);
                 }
                 for (int k = 0; k < 16; k++) if (ac_dec[k] != 0) dec_count++;
             }
-            dec_state.luma_nc[gy * luma_w4 + gx] = dec_count;
-            dec_state.luma_mode4[gy * luma_w4 + gx] = dec_modes4[s];
+            dec_nc_y_local   [idx] = (u8)dec_count;
+            dec_mode4_y_local[idx] = (u8)dec_modes4[s];
         }
     }
 
@@ -1287,34 +1303,40 @@ static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
 
     /* === Chroma AC === */
     for (int comp = 0; comp < 2; comp++) {
-        u8 *cnc = (comp == 0) ? dec_state.chroma_u_nc : dec_state.chroma_v_nc;
+        u8 *nc_c_local = (comp == 0) ? dec_nc_u_local : dec_nc_v_local;
         const i16 (*enc_ac)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
         for (int br_ = 0; br_ < 2; br_++)
             for (int bc_ = 0; bc_ < 2; bc_++) {
                 int idx = br_*2 + bc_;
-                int gx = mb_c*2 + bc_, gy = mb_r*2 + br_;
-                int t_nc = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
-                int l_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
-                int nC = cavlc_compute_nC(t_nc, l_nc, gy > 0, gx > 0);
+
+                int t_avail, l_avail;
+                int t_nc = read_top_nc_c (dec_lb, nc_c_local, mb_c, br_, bc_, comp, &t_avail);
+                int l_nc = read_left_nc_c(dec_lb, nc_c_local, mb_c, br_, bc_, comp, &l_avail);
+                int nCblk = cavlc_compute_nC(t_nc, l_nc, t_avail, l_avail);
+
                 i16 ac_dec[16] = {0};
                 int dec_count = 0;
                 if (dec_cbp_chroma == 2) {
-                    if (cavlc_decode_block(&br, ac_dec, 15, BLK_CHROMA_AC, nC) < 0)
+                    if (cavlc_decode_block(&br, ac_dec, 15, BLK_CHROMA_AC, nCblk) < 0)
                         VERIFY_FAIL("chroma %c AC blk(%d,%d) decode error (nC=%d)",
-                                    comp ? 'V' : 'U', br_, bc_, nC);
+                                    comp ? 'V' : 'U', br_, bc_, nCblk);
                     for (int k = 0; k < 15; k++) {
                         i16 expected = enc_ac[idx][zz_scan_4x4[k+1]];
                         if (ac_dec[k] != expected)
                             VERIFY_FAIL("chroma %c AC blk(%d,%d) [zz=%d] enc=%d dec=%d (nC=%d)",
                                         comp ? 'V' : 'U', br_, bc_, k+1,
-                                        expected, ac_dec[k], nC);
+                                        expected, ac_dec[k], nCblk);
                     }
                     for (int k = 0; k < 15; k++) if (ac_dec[k] != 0) dec_count++;
                 }
-                cnc[gy * chroma_w4 + gx] = dec_count;
+                nc_c_local[idx] = (u8)dec_count;
             }
     }
 
+    /* Commit per-MB nC + mode4 to the dec mirror line buffer. */
+    lb_commit_nc(dec_lb, mb_c,
+                 dec_nc_y_local, dec_nc_u_local, dec_nc_v_local,
+                 dec_mode4_y_local);
     return 0;
 }
 #endif /* MB_SELFDECODE */
@@ -1325,29 +1347,30 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                           u8 *recon_uv_out, int recon_stride_uv_out,
                           line_buffer_t *lb,
                           int mb_r, int mb_c, int mbs_w,
-                          int qp_y, int qp_c, nc_state_t *ncs,
-                          bitstream_t *bs)
+                          int qp_y, int qp_c, bitstream_t *bs)
 {
     mb_state_t st = {0};
 
-    /* Partition the per-MB intermediate arrays so the HLS scheduler can
-     * issue one element per cycle on the inner 4x4 / 16-coef loops below.
-     * dim=2 partitions the second index (the 16-coef axis), keeping the
-     * 16-block-index axis as a normal BRAM port. */
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_y_full dim=2 complete);
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_y      dim=2 complete);
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_u      dim=2 complete);
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_v      dim=2 complete);
+    /* Partition the per-MB working arrays. Cyclic factor=4 is enough for
+     * II=1 on the 4-iteration inner loops while keeping the bulk of these
+     * arrays in BRAM rather than LUT-RAM (which is what `complete` forces
+     * for arrays too small to be 1+ BRAM18K). The really small ones
+     * (dc_levels[16], luma_top[16] etc.) stay `complete` since their
+     * partition count is small enough not to LUT-burst. */
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_y_full dim=2 cyclic factor=4);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_y      dim=2 cyclic factor=4);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_u      dim=2 cyclic factor=4);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_v      dim=2 cyclic factor=4);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.dc_levels_y      dim=1 complete);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.dc_levels_u      dim=1 complete);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.dc_levels_v      dim=1 complete);
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.luma_top         dim=1 complete);
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.luma_left        dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.luma_top         dim=1 cyclic factor=4);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.luma_left        dim=1 cyclic factor=4);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.cu_top           dim=1 complete);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.cu_left          dim=1 complete);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.cv_top           dim=1 complete);
     HLS_PRAGMA(ARRAY_PARTITION variable=st.cv_left          dim=1 complete);
-    HLS_PRAGMA(ARRAY_PARTITION variable=st.modes4           dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.modes4           dim=1 cyclic factor=4);
 
     st.mb_r = mb_r;
     st.mb_c = mb_c;
@@ -1373,8 +1396,9 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
             mb_recon_uv_nv12[i*16 + j*2 + 1] = st.recon_v[i*8 + j];
         }
 
-    /* Update the line buffer so subsequent MBs see this MB's edges. */
-    lb_commit_mb(lb, mb_c, st.recon_y, mb_recon_uv_nv12);
+    /* Update the line buffer's recon edges so subsequent MBs see them.
+     * The nC / mode4 commit happens at the end of mb_cavlc_emit below. */
+    lb_commit_recon(lb, mb_c, st.recon_y, mb_recon_uv_nv12);
 
     /* Optional host-side recon plane (PSNR test bench / FPGA AXI HP DDR
      * write-out). Only written when the caller passes a buffer; the
@@ -1390,11 +1414,11 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
 #ifdef MB_SELFDECODE
     int mb_start_bit = bs->byte_pos * 8 + bs->n_in_cur;
 #endif
-    int rc = mb_cavlc_emit(&st, ncs, bs);
+    int rc = mb_cavlc_emit(&st, lb, bs);
 #ifdef MB_SELFDECODE
     if (dec_state.initialized) {
-        verify_mb_at(bs, mb_start_bit, &st, ncs);
-        verify_state_match(&st, ncs);
+        verify_mb_at(bs, mb_start_bit, &st, lb);
+        verify_state_match(&st, lb);
     }
 #endif
     return rc;
@@ -1417,10 +1441,6 @@ int encode_frame_h264_hls(int width, int height, int qp,
     int mbs_w = width  / 16;
     int mbs_h = height / 16;
     int mb_count = mbs_w * mbs_h;
-    int luma_w4 = mbs_w * 4;
-    int luma_h4 = mbs_h * 4;
-    int chroma_w4 = mbs_w * 2;
-    int chroma_h4 = mbs_h * 2;
 
     /* === SPS + PPS === */
     int dst_pos = 0;
@@ -1452,47 +1472,36 @@ int encode_frame_h264_hls(int width, int height, int qp,
     bs_put_ue(&bs, 1);                       /* disable_deblocking_filter_idc */
     /* When idc != 1, alpha/beta offsets are NOT signaled. */
 
-    /* Recon edge buffers (line-buffer pattern). The HLS port no longer
-     * keeps a full recon plane; cross-MB neighbors come from these edges
-     * only. The host-visible recon plane (recon_y_out / recon_uv_out, if
-     * non-NULL) is written MB-by-MB inside encode_mb_emit. */
-    static line_buffer_t lb;       /* ~15 KB at MAX_W; large enough that
-                                       a function-local would blow the
-                                       stack. HLS allocates as BRAM. */
+    /* Line buffer holds ALL the cross-MB state the encoder needs: recon
+     * edges, nC counts, mode4. ~21 KB at MAX_W; static so HLS can bind
+     * it to BRAM (a stack-local that big would blow the synth budget). */
+    static line_buffer_t lb;
     lb_init(&lb, width);
-
-    nc_state_t ncs;
-    ncs.luma_nc     = arena_luma_nc;
-    ncs.chroma_u_nc = arena_chroma_u_nc;
-    ncs.chroma_v_nc = arena_chroma_v_nc;
-    ncs.luma_mode4  = arena_luma_mode4;
-    ncs.luma_w4     = luma_w4;
-    ncs.luma_h4     = luma_h4;
-    ncs.chroma_w4   = chroma_w4;
-    ncs.chroma_h4   = chroma_h4;
-    memset(ncs.luma_nc,     0, (size_t)luma_w4   * luma_h4);
-    memset(ncs.chroma_u_nc, 0, (size_t)chroma_w4 * chroma_h4);
-    memset(ncs.chroma_v_nc, 0, (size_t)chroma_w4 * chroma_h4);
-    memset(ncs.luma_mode4,  0, (size_t)luma_w4   * luma_h4);
 
     int qp_c = chroma_qp(qp, 0);
 
 #ifdef MB_SELFDECODE
-    dec_state_init(luma_w4, chroma_w4);
+    dec_state_init(width);
 #endif
 
     /* Per-MB encoding into the slice RBSP. Trip counts span 1080p (8160
      * MBs) up to 4K-ish at MAX dims (32400 MBs); avg = 1080p target. */
     for (int r = 0; r < mbs_h; r++) {
         HLS_PRAGMA(LOOP_TRIPCOUNT min=68 max=170 avg=68);
-        if (r > 0) lb_begin_mb_row(&lb);
+        if (r > 0) {
+            lb_begin_mb_row(&lb);
+#ifdef MB_SELFDECODE
+            if (dec_state.initialized)
+                lb_begin_mb_row(&dec_state.mirror_lb);
+#endif
+        }
         for (int c = 0; c < mbs_w; c++) {
             HLS_PRAGMA(LOOP_TRIPCOUNT min=120 max=240 avg=120);
             encode_mb_emit(src_y, stride_y, src_uv, stride_uv,
                            recon_y_out, recon_stride_y,
                            recon_uv_out, recon_stride_uv,
                            &lb, r, c, mbs_w,
-                           qp, qp_c, &ncs, &bs);
+                           qp, qp_c, &bs);
         }
     }
 

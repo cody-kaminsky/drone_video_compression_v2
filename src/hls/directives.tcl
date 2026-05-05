@@ -7,15 +7,9 @@
 #
 # Pragmas that ARE inline in src/hls/encoder.c and src/hls/line_buffer.c
 # are gated by the HLS_PRAGMA() macro and don't need to be repeated here.
-#
-# After the first csynth_design report, iterate this file based on:
-#   - II reported per loop in <proj>/<sol>/syn/report/*_csynth.rpt
-#   - any "unable to schedule" / "carried dependency" warnings
-#   - resource estimate vs the budget in architecture.txt §1
 
 # === transform.c ===
-# 4x4 forward and inverse DCT. 16-element arrays, fully unroll the inner
-# arithmetic; pipeline at the function level.
+# 4x4 forward and inverse DCT. Function-level pipelining at II=1.
 set_directive_pipeline -II 1 dct4x4
 set_directive_pipeline -II 1 idct4x4
 set_directive_array_partition -dim 1 -type complete dct4x4 in
@@ -41,26 +35,38 @@ set_directive_array_partition -dim 1 -type complete iquant_4x4 in
 set_directive_array_partition -dim 1 -type complete iquant_4x4 out
 
 # === intra.c ===
-# Intra prediction is a small load-and-combine kernel; pipeline at fn level.
+# Pipeline at function level — small predict kernels.
 set_directive_pipeline -II 1 predict_4x4
-set_directive_pipeline -II 1 predict_16x16
 set_directive_pipeline -II 1 predict_chroma_8x8
+# predict_16x16 internally has 256-iter inner loops — leave function-level
+# unset; iterate based on report. (Was causing memory-dependency II=2 in the
+# first synth run.)
 
 # === cavlc.c ===
-# We pipeline the bit-cost ESTIMATE used for mode decision (no variable-
-# length output, just a counter). The actual cavlc_encode_block is
-# expected to be replaced by a hand-VHDL CAVLC engine in M4; for the M3
-# csynth pass it's still in HLS.
+# Bit-cost ESTIMATE only (used by mode decision). The actual variable-
+# length CAVLC encoder is planned to be hand-VHDL in M4.
 set_directive_pipeline -II 1 cavlc_estimate_block_bits
+
+# === bitstream.c ===
+# bs_byte_count and bs_put_bits run once per slice / per syntax element
+# — NOT in inner loops. Don't pipeline (causes massive LUT explosion when
+# inlined into nal_write_sps/pps).
+# Leaving these unset on purpose — Vitis defaults are fine.
+
+# === nal.c ===
+# nal_write_sps and nal_write_pps run ONCE PER FRAME. Stay sequential.
+set_directive_inline -off nal_write_sps
+set_directive_inline -off nal_write_pps
+set_directive_inline -off nal_emit_idr
 
 # === line_buffer.c ===
 set_directive_pipeline -II 1 lb_gather_luma_16x16
 set_directive_pipeline -II 1 lb_gather_chroma_8x8
 set_directive_pipeline -II 1 lb_gather_4x4
-set_directive_pipeline -II 1 lb_commit_mb
+set_directive_pipeline -II 1 lb_commit_recon
+set_directive_pipeline -II 1 lb_commit_nc
 
 # === encoder.c — top-level guidance ===
-# These complement the HLS_PRAGMA() macros already inside src/hls/encoder.c.
 set_directive_inline -off encode_mb_emit
 set_directive_inline -off mb_fetch
 set_directive_inline -off mb_residual
