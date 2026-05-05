@@ -625,8 +625,6 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
                                recon_y_frame, stride_recon_y,
                                modes4_b, ac_lev_b, recon_b);
 
-    bits_b = INT32_MAX;
-
     /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode).
      *
      * KNOWN BUG (2026-05-02): the I_4x4 path is byte-exact with ffmpeg in
@@ -640,7 +638,7 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
      * couldn't pin down. Until it's found, force I_16x16 to keep the
      * dataset byte-exact. The full I_4x4 emit path is preserved in code;
      * just flip this guard to re-enable. */
-    /*bits_b = INT32_MAX;*/
+    bits_b = INT32_MAX;
     if (bits_a <= bits_b) {
         st->mb_type_is_i4x4 = 0;
         st->mode16 = mode_a;
@@ -1083,6 +1081,393 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
     return bs->byte_pos * 8 + bs->n_in_cur - start_bits;
 }
 
+#ifdef MB_SELFDECODE
+/* ============================================================================
+ * Per-MB self-decoder
+ * ============================================================================
+ * Walks the bitstream after each mb_cavlc_emit call. Re-parses the MB's
+ * mb_type, mode flags, CBP, mb_qp_delta, and residual blocks from scratch,
+ * comparing each parsed value to the encoder's intent. Maintains parallel
+ * decoder state (luma_nc, luma_mode4, etc.) advanced after each MB to mirror
+ * what a spec-compliant decoder would track.
+ *
+ * On any mismatch — parsed value != intent, OR residual decode fails, OR
+ * neighbor counts diverge — emits a diagnostic to stderr.
+ *
+ * Compile with -DMB_SELFDECODE to enable. Adds ~6.5 MB of .bss and one
+ * full re-parse per MB.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Inverse Table 9-4(a): codeNum -> cbp_value for I_NxN. */
+static u8 codenum_to_cbp_intra[48];
+static int codenum_inv_done = 0;
+static void init_codenum_inv(void) {
+    if (codenum_inv_done) return;
+    for (int v = 0; v < 48; v++)
+        codenum_to_cbp_intra[cbp_intra_to_codenum[v]] = (u8)v;
+    codenum_inv_done = 1;
+}
+
+static struct {
+    int initialized;
+    int luma_nc[ARENA_LUMA_W4 * ARENA_LUMA_H4];
+    int luma_mode4[ARENA_LUMA_W4 * ARENA_LUMA_H4];
+    int chroma_u_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+    int chroma_v_nc[ARENA_CHROMA_W4 * ARENA_CHROMA_H4];
+    int luma_w4, chroma_w4;
+    int n_failures;
+} dec_state;
+
+static void dec_state_init(int luma_w4, int chroma_w4)
+{
+    init_codenum_inv();
+    memset(dec_state.luma_nc,     0, sizeof dec_state.luma_nc);
+    memset(dec_state.luma_mode4,  0, sizeof dec_state.luma_mode4);
+    memset(dec_state.chroma_u_nc, 0, sizeof dec_state.chroma_u_nc);
+    memset(dec_state.chroma_v_nc, 0, sizeof dec_state.chroma_v_nc);
+    dec_state.luma_w4 = luma_w4;
+    dec_state.chroma_w4 = chroma_w4;
+    dec_state.initialized = 1;
+    dec_state.n_failures = 0;
+}
+
+/* Called after each MB verify. Compares dec_state.luma_nc and luma_mode4
+ * to encoder's ncs. Reports first divergence. */
+static int verify_state_match(const mb_state_t *st, const nc_state_t *ncs)
+{
+    int luma_w4 = dec_state.luma_w4, chroma_w4 = dec_state.chroma_w4;
+    int mb_r = st->mb_r, mb_c = st->mb_c;
+    /* Check the 16 4x4 luma slots of THIS MB */
+    for (int br = 0; br < 4; br++)
+        for (int bc = 0; bc < 4; bc++) {
+            int gx = mb_c*4 + bc, gy = mb_r*4 + br;
+            int e = ncs->luma_nc[gy * luma_w4 + gx];
+            int d = dec_state.luma_nc[gy * luma_w4 + gx];
+            if (e != d) {
+                fprintf(stderr, "STATE MISMATCH MB(%d,%d) luma_nc[%d,%d] enc=%d dec=%d\n",
+                        mb_r, mb_c, br, bc, e, d);
+                return -1;
+            }
+            int em = ncs->luma_mode4[gy * luma_w4 + gx];
+            int dm = dec_state.luma_mode4[gy * luma_w4 + gx];
+            if (em != dm) {
+                fprintf(stderr, "STATE MISMATCH MB(%d,%d) luma_mode4[%d,%d] enc=%d dec=%d\n",
+                        mb_r, mb_c, br, bc, em, dm);
+                return -1;
+            }
+        }
+    /* Check chroma 4x4 slots */
+    for (int br = 0; br < 2; br++)
+        for (int bc = 0; bc < 2; bc++) {
+            int gx = mb_c*2 + bc, gy = mb_r*2 + br;
+            int eu = ncs->chroma_u_nc[gy * chroma_w4 + gx];
+            int du = dec_state.chroma_u_nc[gy * chroma_w4 + gx];
+            int ev = ncs->chroma_v_nc[gy * chroma_w4 + gx];
+            int dv = dec_state.chroma_v_nc[gy * chroma_w4 + gx];
+            if (eu != du || ev != dv) {
+                fprintf(stderr, "STATE MISMATCH MB(%d,%d) chroma_nc[%d,%d] enc=(%d,%d) dec=(%d,%d)\n",
+                        mb_r, mb_c, br, bc, eu, ev, du, dv);
+                return -1;
+            }
+        }
+    return 0;
+}
+
+#define VERIFY_FAIL(fmt, ...) do { \
+    fprintf(stderr, "verify FAIL MB(%d,%d): " fmt "\n", st->mb_r, st->mb_c, ##__VA_ARGS__); \
+    dec_state.n_failures++; \
+    if (dec_state.n_failures >= 3) exit(1); \
+    return -1; \
+} while(0)
+
+/* Verify the just-emitted MB. Returns 0 on match, -1 on mismatch.
+ *
+ *   bs              — the bitstream we emitted to
+ *   mb_start_bit    — bit offset in bs where this MB started (before mb_cavlc_emit)
+ *   st              — encoder's intended MB state (modes, levels, recon, cbp)
+ *   ncs             — encoder's intended neighbor state (already updated post-emit)
+ */
+static int verify_mb_at(bitstream_t *bs, int mb_start_bit,
+                        const mb_state_t *st, const nc_state_t *ncs)
+{
+    int mb_r = st->mb_r, mb_c = st->mb_c;
+    int luma_w4 = dec_state.luma_w4, chroma_w4 = dec_state.chroma_w4;
+
+    /* Build a scratch buffer covering committed bytes + leftover bits in bs->cur. */
+    static u8 scratch[1 << 17];   /* 128 KB; one MB at QP=0 lossless ~2 KB */
+    int mb_start_byte = mb_start_bit / 8;
+    int bit_off = mb_start_bit % 8;
+    int n_committed = bs->byte_pos - mb_start_byte;
+    if (n_committed < 0 || n_committed >= (int)sizeof scratch - 8)
+        VERIFY_FAIL("scratch overflow n_committed=%d", n_committed);
+    memcpy(scratch, bs->buf + mb_start_byte, (size_t)n_committed);
+    /* Append leftover bits from bs->cur (MSB-first) as best-effort bytes. */
+    if (bs->n_in_cur > 0) {
+        u32 c = bs->cur;
+        int rem = bs->n_in_cur;
+        int idx = n_committed;
+        while (rem >= 8) {
+            scratch[idx++] = (u8)((c >> 24) & 0xFF);
+            c <<= 8; rem -= 8;
+        }
+        if (rem > 0) {
+            scratch[idx++] = (u8)((c >> 24) & 0xFF);
+        }
+        n_committed = idx;
+    }
+
+    bitreader_t br;
+    br_init(&br, scratch, n_committed);
+    if (bit_off > 0) br_get_bits(&br, bit_off);
+
+    /* === mb_type === */
+    int mb_type = (int)br_get_ue(&br);
+    int dec_is_i4x4 = (mb_type == 0);
+    int dec_mode16 = -1, dec_cbpL_flag = -1, dec_cbpC = -1;
+    if (!dec_is_i4x4) {
+        if (mb_type < 1 || mb_type > 24)
+            VERIFY_FAIL("invalid mb_type=%d", mb_type);
+        int t = mb_type - 1;
+        dec_mode16    = t % 4;
+        dec_cbpC      = (t / 4) % 3;
+        dec_cbpL_flag = t / 12;
+    }
+
+    if (dec_is_i4x4 != st->mb_type_is_i4x4)
+        VERIFY_FAIL("mb_type_is_i4x4 enc=%d dec=%d (mb_type=%d)",
+                    st->mb_type_is_i4x4, dec_is_i4x4, mb_type);
+    if (!dec_is_i4x4) {
+        if (dec_mode16 != st->mode16)
+            VERIFY_FAIL("mode16 enc=%d dec=%d", st->mode16, dec_mode16);
+        if (dec_cbpC != st->cbp_chroma)
+            VERIFY_FAIL("I16 cbp_chroma enc=%d dec=%d", st->cbp_chroma, dec_cbpC);
+        if (dec_cbpL_flag != st->cbp_luma)
+            VERIFY_FAIL("I16 cbp_luma_flag enc=%d dec=%d", st->cbp_luma, dec_cbpL_flag);
+    }
+
+    /* === I_NxN: 16 prev/rem mode flags === */
+    int dec_modes4[16] = {0};
+    if (dec_is_i4x4) {
+        for (int s = 0; s < 16; s++) {
+            int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
+
+            /* Compute pred_mode (same logic as encoder's emit_intra4x4_mode). */
+            int mode_top = -1, mode_left = -1;
+            if (br_ > 0) {
+                for (int t = 0; t < s; t++)
+                    if (blk_scan_br[t] == br_ - 1 && blk_scan_bc[t] == bc_) {
+                        mode_top = dec_modes4[t]; break;
+                    }
+            } else if (mb_r > 0) {
+                int v = dec_state.luma_mode4[(mb_r*4 - 1) * luma_w4 + (mb_c*4 + bc_)];
+                mode_top = (v >= 0 && v <= 8) ? v : -1;
+            }
+            if (bc_ > 0) {
+                for (int t = 0; t < s; t++)
+                    if (blk_scan_br[t] == br_ && blk_scan_bc[t] == bc_ - 1) {
+                        mode_left = dec_modes4[t]; break;
+                    }
+            } else if (mb_c > 0) {
+                int v = dec_state.luma_mode4[(mb_r*4 + br_) * luma_w4 + (mb_c*4 - 1)];
+                mode_left = (v >= 0 && v <= 8) ? v : -1;
+            }
+            int pred_mode;
+            if (mode_top < 0 || mode_left < 0) pred_mode = I4_DC;
+            else pred_mode = (mode_top < mode_left) ? mode_top : mode_left;
+
+            int prev_flag = (int)br_get_bits(&br, 1);
+            int actual;
+            if (prev_flag) actual = pred_mode;
+            else {
+                int rem = (int)br_get_bits(&br, 3);
+                actual = (rem < pred_mode) ? rem : rem + 1;
+            }
+            dec_modes4[s] = actual;
+
+            int idx = br_*4 + bc_;
+            if (actual != st->modes4[idx])
+                VERIFY_FAIL("blk_scan=%d (br=%d bc=%d) mode enc=%d dec=%d (pred=%d top=%d left=%d prev=%d)",
+                            s, br_, bc_, st->modes4[idx], actual,
+                            pred_mode, mode_top, mode_left, prev_flag);
+        }
+    }
+
+    /* === intra_chroma_pred_mode === */
+    int dec_mode_chroma = (int)br_get_ue(&br);
+    if (dec_mode_chroma != st->mode_chroma)
+        VERIFY_FAIL("mode_chroma enc=%d dec=%d", st->mode_chroma, dec_mode_chroma);
+
+    /* === me(cbp) for I_NxN === */
+    int dec_cbp_luma = dec_is_i4x4 ? 0 : dec_cbpL_flag;
+    int dec_cbp_chroma = dec_is_i4x4 ? 0 : dec_cbpC;
+    if (dec_is_i4x4) {
+        int cbp_codenum = (int)br_get_ue(&br);
+        if (cbp_codenum < 0 || cbp_codenum >= 48)
+            VERIFY_FAIL("invalid cbp codeNum=%d", cbp_codenum);
+        int cbp_value = codenum_to_cbp_intra[cbp_codenum];
+        dec_cbp_luma   = cbp_value & 0xF;
+        dec_cbp_chroma = (cbp_value >> 4) & 3;
+        if (dec_cbp_luma != st->cbp_luma)
+            VERIFY_FAIL("I4 cbp_luma enc=%d dec=%d (codenum=%d cbp_value=%d)",
+                        st->cbp_luma, dec_cbp_luma, cbp_codenum, cbp_value);
+        if (dec_cbp_chroma != st->cbp_chroma)
+            VERIFY_FAIL("I4 cbp_chroma enc=%d dec=%d", st->cbp_chroma, dec_cbp_chroma);
+    }
+
+    /* === mb_qp_delta + residuals === */
+    int has_residual = !dec_is_i4x4 || (dec_cbp_luma != 0) || (dec_cbp_chroma != 0);
+    if (has_residual) {
+        int qp_delta = (int)br_get_se(&br);
+        if (qp_delta != 0)
+            VERIFY_FAIL("qp_delta enc=0 dec=%d", qp_delta);
+    }
+
+    if (!has_residual) {
+        /* No residual; update neighbor state to zero and modes4 sentinel. */
+        for (int s = 0; s < 16; s++) {
+            int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
+            int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
+            dec_state.luma_nc[gy * luma_w4 + gx] = 0;
+            dec_state.luma_mode4[gy * luma_w4 + gx] = dec_is_i4x4 ? dec_modes4[s] : -1;
+        }
+        for (int br_ = 0; br_ < 2; br_++)
+            for (int bc_ = 0; bc_ < 2; bc_++) {
+                int gx = mb_c*2 + bc_, gy = mb_r*2 + br_;
+                dec_state.chroma_u_nc[gy * chroma_w4 + gx] = 0;
+                dec_state.chroma_v_nc[gy * chroma_w4 + gx] = 0;
+            }
+        return 0;
+    }
+
+    /* === Luma residuals === */
+    if (!dec_is_i4x4) {
+        /* Luma DC block (always for I_16x16). nC from block-0 neighbors. */
+        int gx0 = mb_c*4, gy0 = mb_r*4;
+        int top_nc  = (gy0 > 0) ? dec_state.luma_nc[(gy0 - 1) * luma_w4 + gx0] : 0;
+        int left_nc = (gx0 > 0) ? dec_state.luma_nc[gy0 * luma_w4 + (gx0 - 1)] : 0;
+        int nC = cavlc_compute_nC(top_nc, left_nc, gy0 > 0, gx0 > 0);
+        i16 dc_dec[16];
+        if (cavlc_decode_block(&br, dc_dec, 16, BLK_LUMA_DC_16x16, nC) < 0)
+            VERIFY_FAIL("luma DC decode error (nC=%d)", nC);
+        for (int k = 0; k < 16; k++) {
+            i16 expected = st->dc_levels_y[zz_scan_4x4[k]];
+            if (dc_dec[k] != expected)
+                VERIFY_FAIL("luma DC[zz=%d raster=%d] enc=%d dec=%d (nC=%d)",
+                            k, zz_scan_4x4[k], expected, dc_dec[k], nC);
+        }
+
+        /* Luma AC blocks in scan order. */
+        for (int s = 0; s < 16; s++) {
+            int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
+            int idx = br_*4 + bc_;
+            int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
+            int t_nc = (gy > 0) ? dec_state.luma_nc[(gy - 1) * luma_w4 + gx] : 0;
+            int l_nc = (gx > 0) ? dec_state.luma_nc[gy * luma_w4 + (gx - 1)] : 0;
+            int nC = cavlc_compute_nC(t_nc, l_nc, gy > 0, gx > 0);
+
+            i16 ac_dec[16] = {0};
+            int dec_count = 0;
+            if (dec_cbp_luma) {
+                if (cavlc_decode_block(&br, ac_dec, 15, BLK_LUMA_AC, nC) < 0)
+                    VERIFY_FAIL("blk_scan=%d luma AC decode error (nC=%d)", s, nC);
+                for (int k = 0; k < 15; k++) {
+                    /* Encoder's emit: zz[1..15] from raster order; decoder reads
+                     * 15 coefs into positions [0..14] of ac_dec. */
+                    i16 expected = st->ac_levels_y[idx][zz_scan_4x4[k+1]];
+                    if (ac_dec[k] != expected)
+                        VERIFY_FAIL("blk_scan=%d (br=%d bc=%d raster=%d) luma AC[zz=%d raster=%d] enc=%d dec=%d (nC=%d top=%d left=%d)",
+                                    s, br_, bc_, idx, k+1, zz_scan_4x4[k+1],
+                                    expected, ac_dec[k], nC, t_nc, l_nc);
+                }
+                for (int k = 0; k < 15; k++) if (ac_dec[k] != 0) dec_count++;
+            }
+            dec_state.luma_nc[gy * luma_w4 + gx] = dec_count;
+            dec_state.luma_mode4[gy * luma_w4 + gx] = -1;  /* I_16x16 sentinel */
+        }
+    } else {
+        /* I_4x4: 16 full blocks in scan order, conditional on quad bit.
+         * Also reconstruct each block from the parsed levels and compare to
+         * the encoder's internal recon (st->recon_y). */
+        for (int s = 0; s < 16; s++) {
+            int br_ = blk_scan_br[s], bc_ = blk_scan_bc[s];
+            int idx = br_*4 + bc_;
+            int gx = mb_c*4 + bc_, gy = mb_r*4 + br_;
+            int t_nc = (gy > 0) ? dec_state.luma_nc[(gy - 1) * luma_w4 + gx] : 0;
+            int l_nc = (gx > 0) ? dec_state.luma_nc[gy * luma_w4 + (gx - 1)] : 0;
+            int nC = cavlc_compute_nC(t_nc, l_nc, gy > 0, gx > 0);
+
+            int quad_bit = (dec_cbp_luma >> (s / 4)) & 1;
+            i16 ac_dec[16] = {0};
+            int dec_count = 0;
+            if (quad_bit) {
+                if (cavlc_decode_block(&br, ac_dec, 16, BLK_LUMA_FULL, nC) < 0)
+                    VERIFY_FAIL("blk_scan=%d (br=%d bc=%d raster=%d) luma FULL decode error (nC=%d top=%d left=%d)",
+                                s, br_, bc_, idx, nC, t_nc, l_nc);
+                for (int k = 0; k < 16; k++) {
+                    i16 expected = st->ac_levels_y_full[idx][zz_scan_4x4[k]];
+                    if (ac_dec[k] != expected)
+                        VERIFY_FAIL("blk_scan=%d (br=%d bc=%d raster=%d) luma FULL[zz=%d raster=%d] enc=%d dec=%d (nC=%d top_nc=%d left_nc=%d)",
+                                    s, br_, bc_, idx, k, zz_scan_4x4[k],
+                                    expected, ac_dec[k], nC, t_nc, l_nc);
+                }
+                for (int k = 0; k < 16; k++) if (ac_dec[k] != 0) dec_count++;
+            }
+            dec_state.luma_nc[gy * luma_w4 + gx] = dec_count;
+            dec_state.luma_mode4[gy * luma_w4 + gx] = dec_modes4[s];
+        }
+    }
+
+    /* === Chroma DC (UV) === */
+    if (dec_cbp_chroma >= 1) {
+        i16 udc_dec[4], vdc_dec[4];
+        if (cavlc_decode_block(&br, udc_dec, 4, BLK_CHROMA_DC, -1) < 0)
+            VERIFY_FAIL("chroma U DC decode error");
+        if (cavlc_decode_block(&br, vdc_dec, 4, BLK_CHROMA_DC, -1) < 0)
+            VERIFY_FAIL("chroma V DC decode error");
+        for (int k = 0; k < 4; k++) {
+            if (udc_dec[k] != st->dc_levels_u[k])
+                VERIFY_FAIL("chroma U DC[%d] enc=%d dec=%d", k, st->dc_levels_u[k], udc_dec[k]);
+            if (vdc_dec[k] != st->dc_levels_v[k])
+                VERIFY_FAIL("chroma V DC[%d] enc=%d dec=%d", k, st->dc_levels_v[k], vdc_dec[k]);
+        }
+    }
+
+    /* === Chroma AC === */
+    for (int comp = 0; comp < 2; comp++) {
+        int *cnc = (comp == 0) ? dec_state.chroma_u_nc : dec_state.chroma_v_nc;
+        const i16 (*enc_ac)[16] = (comp == 0) ? st->ac_levels_u : st->ac_levels_v;
+        for (int br_ = 0; br_ < 2; br_++)
+            for (int bc_ = 0; bc_ < 2; bc_++) {
+                int idx = br_*2 + bc_;
+                int gx = mb_c*2 + bc_, gy = mb_r*2 + br_;
+                int t_nc = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
+                int l_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
+                int nC = cavlc_compute_nC(t_nc, l_nc, gy > 0, gx > 0);
+                i16 ac_dec[16] = {0};
+                int dec_count = 0;
+                if (dec_cbp_chroma == 2) {
+                    if (cavlc_decode_block(&br, ac_dec, 15, BLK_CHROMA_AC, nC) < 0)
+                        VERIFY_FAIL("chroma %c AC blk(%d,%d) decode error (nC=%d)",
+                                    comp ? 'V' : 'U', br_, bc_, nC);
+                    for (int k = 0; k < 15; k++) {
+                        i16 expected = enc_ac[idx][zz_scan_4x4[k+1]];
+                        if (ac_dec[k] != expected)
+                            VERIFY_FAIL("chroma %c AC blk(%d,%d) [zz=%d] enc=%d dec=%d (nC=%d)",
+                                        comp ? 'V' : 'U', br_, bc_, k+1,
+                                        expected, ac_dec[k], nC);
+                    }
+                    for (int k = 0; k < 15; k++) if (ac_dec[k] != 0) dec_count++;
+                }
+                cnc[gy * chroma_w4 + gx] = dec_count;
+            }
+    }
+
+    return 0;
+}
+#endif /* MB_SELFDECODE */
+
 static int encode_mb_emit(const u8 *src_y,  int stride_y,
                           const u8 *src_uv, int stride_uv,
                           u8 *recon_y, int recon_stride_y,
@@ -1117,7 +1502,18 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                                st.recon_u, st.recon_v);
 
     mb_compute_cbp(&st);
-    return mb_cavlc_emit(&st, ncs, bs);
+
+#ifdef MB_SELFDECODE
+    int mb_start_bit = bs->byte_pos * 8 + bs->n_in_cur;
+#endif
+    int rc = mb_cavlc_emit(&st, ncs, bs);
+#ifdef MB_SELFDECODE
+    if (dec_state.initialized) {
+        verify_mb_at(bs, mb_start_bit, &st, ncs);
+        verify_state_match(&st, ncs);
+    }
+#endif
+    return rc;
 }
 
 int encode_frame_h264(int width, int height, int qp,
@@ -1193,6 +1589,10 @@ int encode_frame_h264(int width, int height, int qp,
     memset(ncs.luma_mode4,  0, (size_t)luma_w4   * luma_h4   * sizeof(int));
 
     int qp_c = chroma_qp(qp, 0);
+
+#ifdef MB_SELFDECODE
+    dec_state_init(luma_w4, chroma_w4);
+#endif
 
     /* Per-MB encoding into the slice RBSP */
     for (int r = 0; r < mbs_h; r++) {

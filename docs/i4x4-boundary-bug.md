@@ -371,24 +371,80 @@ slower since each pattern requires a code change.
   content/mode-specific, not just any I_4x4-with-I_16x16-neighbor case.
   See "Per-MB forcing — bug is content/mode-specific" above.
 
-## What's Most Promising Next
+## Per-MB Self-Decoder (Most Important Finding)
 
-A **block-level self-decoder** that walks the emitted bitstream after
-each MB and re-parses everything: mb_type, prev/rem mode flags,
-intra_chroma_pred_mode, me(CBP), mb_qp_delta, and each residual block.
-For each, compare to what we INTENDED to emit and dump the first
-mismatch.
+Built a full per-MB self-decoder under `#ifdef MB_SELFDECODE`
+(see `verify_mb_at` in `src/encoder.c`). After each `mb_cavlc_emit`
+call, the verifier:
 
-This is the only way to definitively distinguish:
-- bit emission off (mb_type / cbp / mode flag wrong)
-- bitstream alignment off (one syntax element corrupting the next)
-- nC computation off (subtle spec interpretation)
-- residual encoding off (less likely, since CAVLC selfcheck is clean)
+1. Copies the MB's emitted bytes to a scratch buffer (including
+   leftover bits from `bs->cur`).
+2. Re-parses with our own `cavlc_decode_block`: mb_type, 16 prev/rem
+   mode flags (with full predIntra4x4PredMode lookup matching the
+   encoder's logic), intra_chroma_pred_mode, me(CBP), mb_qp_delta,
+   then each residual block (luma DC for I_16x16, full luma blocks
+   for I_4x4, chroma DC, chroma AC).
+3. Compares each parsed value to encoder intent (`mb_state_t` +
+   `nc_state_t`).
+4. Maintains a parallel `dec_state` (luma_nc, luma_mode4, chroma_*_nc)
+   that mirrors what a spec decoder would track. After each MB, also
+   compares dec_state to encoder's ncs.
 
-It needs a moderate amount of code: enough state to parse a slice
-header (already have `nal_write_slice_header` mirror), then per-MB
-parsing logic. Could fit in ~200 lines reusing `bitreader_t` +
-`cavlc_decode_block`.
+**Result: zero mismatches across the entire frame on kodim01 QP 30
+with the I_4x4 selector active.** Every parsed mb_type, every mode
+flag, every CBP, every block's levels, and every neighbor count agrees
+with the encoder's intent.
+
+**Yet ffmpeg still produces a different recon at MB (0, 2)
+rows 12..15.** This means our encoder, decoder, and tracked state are
+all internally self-consistent but **collectively diverge from
+ffmpeg's spec interpretation in a way that only manifests when an
+I_4x4 MB has an I_16x16 left neighbor with specific block patterns**.
+
+## Where the Bug Most Likely Lives Now
+
+The self-decoder rules out:
+- bit emission errors (bits round-trip)
+- bitstream alignment issues (no parser confusion)
+- mb_type / mode flag / CBP encoding (round-trip clean)
+- residual CAVLC encoding (round-trip clean)
+- nC tracking divergence (state matches encoder)
+
+What's NOT verified by the self-decoder:
+- Whether our `cavlc_encode_block` / `cavlc_decode_block` agree with
+  ffmpeg's parser on the same bits. They could BOTH be wrong in the
+  same way (mirrored bug), and self-check would still pass.
+- Whether our `predict_4x4` produces the same predicted samples as
+  ffmpeg for specific mode + neighbor combinations.
+- Whether our `iquant_4x4` / `idct4x4` produce the same residual as
+  ffmpeg given the same input levels.
+
+But pure I_4x4 (every MB I_4x4) is byte-exact and pure I_16x16 (every
+MB I_16x16) is byte-exact, which means each of those component
+functions IS correct in isolation. The bug only emerges from a
+specific INTERACTION at the I_4x4 ↔ I_16x16 boundary.
+
+The most likely remaining culprits:
+- Some subtle nC or "inter neighbor / I_PCM neighbor" rule we get
+  wrong for the cross-MB case where the encoder happens to also
+  apply it consistently.
+- A cbp_intra encoding (Table 9-4) entry that's wrong but whose wrong
+  value happens to round-trip with our decoder.
+
+## Where to Go Next
+
+1. **Cross-check `cbp_intra_to_codenum` against x264** — `tools/
+   diff_x264.py` already cross-checks CAVLC tables; extend it to
+   cross-check Table 9-4. If our table differs from x264's, we found
+   it.
+2. **Replace `cavlc_decode_block` in the self-checker with an
+   independently-implemented CAVLC parser** (e.g. lifted from JM
+   reference or x264). If the alternative parser produces different
+   levels from the same bits, the bug is in our cavlc layer.
+3. **Diff `predict_4x4` against x264 / JM reference** for each of the
+   9 modes. Especially HORIZONTAL_UP (mode 8) and the DDL/DDR/VR/HD
+   modes that use top-right replication, which are mode-specific to
+   I_4x4.
 
 ## Out of Scope for This Document
 
