@@ -27,6 +27,7 @@
 #include "nal.h"
 #include "mb_state.h"
 #include "line_buffer.h"
+#include "hls_pragmas.h"
 
 #include <string.h>
 
@@ -531,6 +532,7 @@ static void mb_residual(mb_state_t *st)
 {
     for (int br = 0; br < 2; br++)
         for (int bc = 0; bc < 2; bc++) {
+            HLS_PRAGMA(PIPELINE);
             residual_4x4_8x8(st->src_u, st->pred_u, br, bc, st->res_u[br*2 + bc]);
             residual_4x4_8x8(st->src_v, st->pred_v, br, bc, st->res_v[br*2 + bc]);
         }
@@ -540,6 +542,7 @@ static void mb_residual(mb_state_t *st)
 static void mb_transform(mb_state_t *st)
 {
     for (int idx = 0; idx < 4; idx++) {
+        HLS_PRAGMA(PIPELINE);
         i16 dct[16];
         dct4x4(st->res_u[idx], dct);
         st->dc_extract_u[idx] = dct[0];
@@ -549,6 +552,7 @@ static void mb_transform(mb_state_t *st)
     hadamard2x2(st->dc_extract_u, st->dc_had_u);
 
     for (int idx = 0; idx < 4; idx++) {
+        HLS_PRAGMA(PIPELINE);
         i16 dct[16];
         dct4x4(st->res_v[idx], dct);
         st->dc_extract_v[idx] = dct[0];
@@ -562,6 +566,7 @@ static void mb_transform(mb_state_t *st)
 static void mb_quantize(mb_state_t *st)
 {
     for (int idx = 0; idx < 4; idx++) {
+        HLS_PRAGMA(PIPELINE);
         quant_4x4(st->dct_ac_u[idx], st->ac_levels_u[idx], st->qp_c, 1);
         quant_4x4(st->dct_ac_v[idx], st->ac_levels_v[idx], st->qp_c, 1);
     }
@@ -573,29 +578,39 @@ static void mb_quantize(mb_state_t *st)
 static void mb_reconstruct(mb_state_t *st)
 {
     i32 dc_dq_u[4], dc_recon_u[4];
+    HLS_PRAGMA(ARRAY_PARTITION variable=dc_dq_u    dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=dc_recon_u dim=1 complete);
     iquant_dc_2x2(st->dc_levels_u, dc_dq_u, st->qp_c);
     ihadamard2x2(dc_dq_u, dc_recon_u);
     for (int br = 0; br < 2; br++)
         for (int bc = 0; bc < 2; bc++) {
+            HLS_PRAGMA(PIPELINE);
             int idx = br*2 + bc;
             i32 ac_dq[16];
+            HLS_PRAGMA(ARRAY_PARTITION variable=ac_dq dim=1 complete);
             iquant_4x4(st->ac_levels_u[idx], ac_dq, st->qp_c);
             ac_dq[0] = dc_recon_u[idx];
             i32 res[16];
+            HLS_PRAGMA(ARRAY_PARTITION variable=res dim=1 complete);
             idct4x4(ac_dq, res);
             recon_4x4_8x8(st->recon_u, st->pred_u, br, bc, res);
         }
 
     i32 dc_dq_v[4], dc_recon_v[4];
+    HLS_PRAGMA(ARRAY_PARTITION variable=dc_dq_v    dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=dc_recon_v dim=1 complete);
     iquant_dc_2x2(st->dc_levels_v, dc_dq_v, st->qp_c);
     ihadamard2x2(dc_dq_v, dc_recon_v);
     for (int br = 0; br < 2; br++)
         for (int bc = 0; bc < 2; bc++) {
+            HLS_PRAGMA(PIPELINE);
             int idx = br*2 + bc;
             i32 ac_dq[16];
+            HLS_PRAGMA(ARRAY_PARTITION variable=ac_dq dim=1 complete);
             iquant_4x4(st->ac_levels_v[idx], ac_dq, st->qp_c);
             ac_dq[0] = dc_recon_v[idx];
             i32 res[16];
+            HLS_PRAGMA(ARRAY_PARTITION variable=res dim=1 complete);
             idct4x4(ac_dq, res);
             recon_4x4_8x8(st->recon_v, st->pred_v, br, bc, res);
         }
@@ -1318,6 +1333,26 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                           bitstream_t *bs)
 {
     mb_state_t st = {0};
+
+    /* Partition the per-MB intermediate arrays so the HLS scheduler can
+     * issue one element per cycle on the inner 4x4 / 16-coef loops below.
+     * dim=2 partitions the second index (the 16-coef axis), keeping the
+     * 16-block-index axis as a normal BRAM port. */
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_y_full dim=2 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_y      dim=2 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_u      dim=2 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.ac_levels_v      dim=2 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.dc_levels_y      dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.dc_levels_u      dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.dc_levels_v      dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.luma_top         dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.luma_left        dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.cu_top           dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.cu_left          dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.cv_top           dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.cv_left          dim=1 complete);
+    HLS_PRAGMA(ARRAY_PARTITION variable=st.modes4           dim=1 complete);
+
     st.mb_r = mb_r;
     st.mb_c = mb_c;
     st.qp_y = qp_y;
@@ -1450,10 +1485,13 @@ int encode_frame_h264_hls(int width, int height, int qp,
     dec_state_init(luma_w4, chroma_w4);
 #endif
 
-    /* Per-MB encoding into the slice RBSP */
+    /* Per-MB encoding into the slice RBSP. Trip counts span 1080p (8160
+     * MBs) up to 4K-ish at MAX dims (32400 MBs); avg = 1080p target. */
     for (int r = 0; r < mbs_h; r++) {
+        HLS_PRAGMA(LOOP_TRIPCOUNT min=68 max=170 avg=68);
         if (r > 0) lb_begin_mb_row(&lb);
         for (int c = 0; c < mbs_w; c++) {
+            HLS_PRAGMA(LOOP_TRIPCOUNT min=120 max=240 avg=120);
             encode_mb_emit(src_y, stride_y, src_uv, stride_uv,
                            recon_y_out, recon_stride_y,
                            recon_uv_out, recon_stride_uv,

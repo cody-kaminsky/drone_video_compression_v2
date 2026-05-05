@@ -1,6 +1,7 @@
 /* line_buffer.c — see line_buffer.h for design. */
 
 #include "line_buffer.h"
+#include "hls_pragmas.h"
 #include <string.h>
 
 /* I_4x4 scan tables — duplicated from encoder.c. The line buffer only
@@ -65,12 +66,15 @@ void lb_commit_mb(line_buffer_t *lb, int mb_c,
     memcpy(&lb->next_uv[mb_c * 16], &recon_uv[7 * 16], 16);
 
     /* Right column of luma (col 15 of every row). */
-    for (int r = 0; r < 16; r++)
+    for (int r = 0; r < 16; r++) {
+        HLS_PRAGMA(UNROLL);
         lb->left_y[r] = recon_y[r * 16 + 15];
+    }
 
     /* Right column of chroma — last UV pair of every chroma row.
      * NV12: each chroma row is 16 bytes; cols 14, 15 are the last UV pair. */
     for (int r = 0; r < 8; r++) {
+        HLS_PRAGMA(UNROLL);
         lb->left_uv[r * 2 + 0] = recon_uv[r * 16 + 14];  /* U */
         lb->left_uv[r * 2 + 1] = recon_uv[r * 16 + 15];  /* V */
     }

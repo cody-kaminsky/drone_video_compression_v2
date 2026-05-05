@@ -47,6 +47,11 @@ T-REC-H.264-*.pdf
 # Worktree dirs created by claude-code
 .claude/worktrees/
 
+# Vitis HLS IDE artifacts (per-project)
+src/hls/_ide/
+src/hls/.gitignore
+hls_proj/
+
 # Temporary files
 /tmp/
 *.tmp
