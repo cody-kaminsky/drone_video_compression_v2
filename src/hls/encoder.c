@@ -81,6 +81,30 @@ static inline int hls_bits_estimate(const i16 *zz, int n_coefs)
   #define BITS_ESTIMATE(zz, n, bt, qp)  cavlc_estimate_block_bits((zz), (n), (bt), (qp))
 #endif
 
+/* ============================================================================
+ * CAVLC encode stub (M4 preview).
+ *
+ * Under __SYNTHESIS__, cavlc_encode_block is a no-op. This previews what
+ * the kernel will look like once M4 phase 2 finishes — i.e., once the
+ * HLS encoder is refactored to stream level packets to the hand-VHDL
+ * CAVLC engine instead of running CAVLC inline.
+ *
+ * IMPORTANT: under __SYNTHESIS__ the synthesized hardware does NOT emit
+ * residual data, so cosim will not produce a valid bitstream and ffmpeg-
+ * decode parity will fail. This is a synthesis-report preview only —
+ * not a step toward a working RTL.
+ *
+ * The gcc build keeps the real cavlc_encode_block via the macro switch,
+ * so dcc_hls.exe stays byte-exact with the C reference.
+ *
+ * Once the VHDL CAVLC engine is in place, this macro gets replaced with
+ * an hls::stream<level_packet_t>::write(...) call. */
+#ifdef __SYNTHESIS__
+  #define CAVLC_ENCODE_BLOCK(bs, zz, n, bt, nC)  ((void)(zz), (void)(nC))
+#else
+  #define CAVLC_ENCODE_BLOCK(bs, zz, n, bt, nC)  cavlc_encode_block((bs), (zz), (n), (bt), (nC))
+#endif
+
 /* ===== static arena =====
  * Bounded per-frame buffers, sized for the architecture max (MAX_W x MAX_H).
  * Replacing malloc/free in the encode path is the M2 transition step toward
@@ -917,15 +941,15 @@ static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
 
                 int quad_bit = (st->cbp_luma >> (s / 4)) & 1;
                 if (quad_bit)
-                    cavlc_encode_block(bs, zz, 16, BLK_LUMA_FULL, nC);
+                    CAVLC_ENCODE_BLOCK(bs, zz, 16, BLK_LUMA_FULL, nC);
                 nc_y_local   [idx] = quad_bit ? (u8)count_nonzero(zz, 16) : 0;
                 mode4_y_local[idx] = (u8)st->modes4[idx];
             }
 
             /* Chroma DC */
             if (st->cbp_chroma >= 1) {
-                cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
-                cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+                CAVLC_ENCODE_BLOCK(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+                CAVLC_ENCODE_BLOCK(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
             }
 
             /* Chroma AC */
@@ -945,7 +969,7 @@ static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
                         int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
 
                         if (st->cbp_chroma == 2)
-                            cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                            CAVLC_ENCODE_BLOCK(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
                         nc_c[idx] = (st->cbp_chroma == 2)
                                   ? (u8)count_nonzero(&zz[1], 15) : 0;
                     }
@@ -973,7 +997,7 @@ static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
 
             i16 zz[16];
             for (int k = 0; k < 16; k++) zz[k] = st->dc_levels_y[zz_scan_4x4[k]];
-            cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
+            CAVLC_ENCODE_BLOCK(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
         }
 
         /* Luma AC blocks in scan order. */
@@ -992,7 +1016,7 @@ static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
             int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
 
             if (st->cbp_luma)
-                cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
+                CAVLC_ENCODE_BLOCK(bs, &zz[1], 15, BLK_LUMA_AC, nC);
             nc_y_local   [idx] = (u8)count_nonzero(&zz[1], 15);
             /* I_16x16 blocks store I4_DC per spec 8.3.1.1 (effective mode 2). */
             mode4_y_local[idx] = (u8)I4_DC;
@@ -1000,8 +1024,8 @@ static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
 
         /* Chroma DC: emitted in U,V order whenever cbp_chroma >= 1. */
         if (st->cbp_chroma >= 1) {
-            cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
-            cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+            CAVLC_ENCODE_BLOCK(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+            CAVLC_ENCODE_BLOCK(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
         }
 
         /* Chroma AC */
@@ -1021,7 +1045,7 @@ static int mb_cavlc_emit(mb_state_t *st, line_buffer_t *lb, bitstream_t *bs)
                     int nC = cavlc_compute_nC(top_nc, left_nc, avt, avl);
 
                     if (st->cbp_chroma == 2)
-                        cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                        CAVLC_ENCODE_BLOCK(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
                     nc_c[idx] = (u8)count_nonzero(&zz[1], 15);
                 }
         }
