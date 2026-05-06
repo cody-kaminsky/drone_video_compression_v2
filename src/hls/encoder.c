@@ -31,6 +31,56 @@
 
 #include <string.h>
 
+/* ============================================================================
+ * Bit-cost ESTIMATE for mode decision.
+ *
+ * mb_mode_decide and try_path_i4x4 call this to pick the cheaper coding
+ * candidate; ABSOLUTE accuracy doesn't matter, only ranking. The real
+ * cavlc_estimate_block_bits is a near-replay of the CAVLC encoder with
+ * counters instead of bit emit — it has variable-length inner loops that
+ * synthesize to ~3700 LUT each, called 30+ times per MB → dominates the
+ * mb_mode_decide LUT footprint.
+ *
+ * Under __SYNTHESIS__ we substitute a closed-form heuristic that's purely
+ * data-flow over the 16 coefficients — fixed trip count, fixed latency,
+ * tiny LUT cost. The ranking it produces is monotonic-correct vs the real
+ * estimator on typical residuals (more coefs and higher magnitudes → more
+ * bits), which is all mode decision needs.
+ *
+ * Cost: synthesized hardware will pick a slightly different mode than
+ * gcc-built dcc_hls.exe on borderline MBs. Bitstreams won't be
+ * bit-identical, but both remain spec-conformant — the test bench
+ * verifies via ffmpeg-decode parity, not byte equality with C reference.
+ *
+ * gcc build keeps the real estimator so dcc_hls.exe stays bit-exact with
+ * the C reference for byte-exact validation.
+ *
+ * Heuristic shape: ~1 bit per coefficient for the coeff_token + trailing
+ * sign bits, plus a per-level bit cost growing logarithmically with
+ * |level| (Golomb encoding). Approximated as 2 bits per nonzero plus
+ * |level| / 2 (bit cost of the level VLC for small levels). */
+static inline int hls_bits_estimate(const i16 *zz, int n_coefs)
+{
+    int bits = 1;   /* base coeff_token cost */
+    int sum_mag = 0;
+    int n_nz = 0;
+    for (int k = 0; k < n_coefs; k++) {
+        HLS_PRAGMA(UNROLL);
+        int v = zz[k];
+        int a = v < 0 ? -v : v;
+        if (a) { n_nz++; sum_mag += a; }
+    }
+    bits += 2 * n_nz;          /* per-coef token / sign bits */
+    bits += sum_mag;           /* magnitude bits (≈ Golomb for small levels) */
+    return bits;
+}
+
+#ifdef __SYNTHESIS__
+  #define BITS_ESTIMATE(zz, n, bt, qp)  hls_bits_estimate((zz), (n))
+#else
+  #define BITS_ESTIMATE(zz, n, bt, qp)  cavlc_estimate_block_bits((zz), (n), (bt), (qp))
+#endif
+
 /* ===== static arena =====
  * Bounded per-frame buffers, sized for the architecture max (MAX_W x MAX_H).
  * Replacing malloc/free in the encode path is the M2 transition step toward
@@ -364,7 +414,7 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
         /* Bit estimate (CAVLC zigzag, full 16 coefs). */
         i16 zz[16];
         zigzag_4x4(levels, zz);
-        bits += cavlc_estimate_block_bits(zz, 16, BLK_LUMA_FULL, 0);
+        bits += BITS_ESTIMATE(zz, 16, BLK_LUMA_FULL, 0);
     }
 
     return bits;
@@ -445,10 +495,10 @@ static void mb_mode_decide(int mbs_w, const line_buffer_t *lb, mb_state_t *st)
         int bits = 6 + 3 + 1;          /* mb_type + intra_chroma_mode + qp_delta */
         i16 zz[16];
         for (int k = 0; k < 16; k++) zz[k] = dc_lev_a[zz_scan_4x4[k]];
-        bits += cavlc_estimate_block_bits(zz, 16, BLK_LUMA_DC_16x16, 0);
+        bits += BITS_ESTIMATE(zz, 16, BLK_LUMA_DC_16x16, 0);
         for (int idx = 0; idx < 16; idx++) {
             for (int k = 0; k < 16; k++) zz[k] = ac_lev_a[idx][zz_scan_4x4[k]];
-            bits += cavlc_estimate_block_bits(&zz[1], 15, BLK_LUMA_AC, 0);
+            bits += BITS_ESTIMATE(&zz[1], 15, BLK_LUMA_AC, 0);
         }
         bits_a = bits;
     }
@@ -1442,15 +1492,31 @@ int encode_frame_h264_hls(int width, int height, int qp,
     int mbs_h = height / 16;
     int mb_count = mbs_w * mbs_h;
 
-    /* === SPS + PPS === */
+    /* === SPS + PPS ===
+     *
+     * Both are deterministic functions of (width, height, qp_init) — for a
+     * fixed encode target they're CONSTANT. Variable-length-code emission
+     * (bs_put_ue / bs_put_se / RBSP escape) is HLS-hostile: synthesizing
+     * "write 17 bytes of constants" through the bitstream emitters costs
+     * ~40k LUT (~50% of the xc7z030 budget) for code that runs once per
+     * frame. So under __SYNTHESIS__ we skip them — the FPGA host (PS)
+     * pre-fills SPS+PPS into the DDR output buffer once at boot.
+     *
+     * The gcc test bench keeps emitting them so dcc_hls.exe still produces
+     * a complete .264 file for byte-exact validation against ffmpeg. */
     int dst_pos = 0;
-    int n = nal_write_sps(bs_out + dst_pos, bs_max_size - dst_pos,
-                          width, height, qp);
+    int n;
+#ifndef __SYNTHESIS__
+    n = nal_write_sps(bs_out + dst_pos, bs_max_size - dst_pos,
+                      width, height, qp);
     if (n < 0) return -4;
     dst_pos += n;
     n = nal_write_pps(bs_out + dst_pos, bs_max_size - dst_pos, qp);
     if (n < 0) return -4;
     dst_pos += n;
+#else
+    (void)n;  /* unused under synthesis */
+#endif
 
     /* === Slice RBSP === */
     bitstream_t bs;
@@ -1509,10 +1575,29 @@ int encode_frame_h264_hls(int width, int height, int qp,
     int rbsp_len = bs_byte_count(&bs);
     if (bs.overflow) return -6;
 
-    /* Wrap in IDR NAL */
+    /* === IDR NAL wrap ===
+     *
+     * nal_emit_idr writes the Annex B start code (00 00 00 01), the NAL
+     * header byte (0x65 = nal_ref_idc=3, type=5), then the RBSP with
+     * emulation-prevention escape bytes (0x03 inserted after any 00 00).
+     *
+     * Like SPS/PPS, this is byte-wise variable-length output and is
+     * HLS-hostile. Under __SYNTHESIS__ we just memcpy the raw RBSP to
+     * bs_out; the host adds start code + NAL header + escape on the PS
+     * side, where it's a few microseconds of ARM CPU. */
+#ifdef __SYNTHESIS__
+    /* Raw RBSP copy — host wraps with NAL framing on the PS side. */
+    if (dst_pos + rbsp_len > bs_max_size) return -6;
+    for (int i = 0; i < rbsp_len; i++) {
+        HLS_PRAGMA(LOOP_TRIPCOUNT min=128 max=65536 avg=8192);
+        bs_out[dst_pos + i] = arena_rbsp[i];
+    }
+    dst_pos += rbsp_len;
+#else
     n = nal_emit_idr(bs_out + dst_pos, bs_max_size - dst_pos, arena_rbsp, rbsp_len);
     if (n < 0) return -6;
     dst_pos += n;
+#endif
 
     /* Kernel-level stats: integer-only quantities that map onto the FPGA
      * hardware register set (architecture.txt §10: BS_BYTES_OUT, PERF_MB_DONE).
