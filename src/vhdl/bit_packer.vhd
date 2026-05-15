@@ -12,6 +12,7 @@
 --
 -- Producer rules:
 --   - bits_i is right-aligned in 32 bits; only the low length_i bits matter.
+--     CALLER MUST ENSURE upper (32 - length_i) bits are zero.
 --   - length_i in 0..32. length_i = 0 with valid_i = '1' is a no-op handshake.
 --   - ready_o = '1' iff state = NORMAL and n_in_accum <= 32. With max input
 --     of 32 bits, that guarantees room (n_in_accum + 32 <= 64).
@@ -91,8 +92,7 @@ begin
         variable did_emit  : boolean;
         variable last_byte : boolean;
         variable len_int   : integer range 0 to 32;
-        variable masked    : unsigned(31 downto 0);
-        variable padded    : unsigned(63 downto 0);
+        variable shift_amt : integer range 0 to 64;
         variable do_accept : boolean;
     begin
         if rising_edge(clk) then
@@ -159,22 +159,12 @@ begin
                 do_accept := (valid_i = '1' and ready_int = '1');
                 if do_accept then
                     len_int := to_integer(length_i);
-                    if len_int = 32 then
-                        masked := bits_i;
-                    elsif len_int = 0 then
-                        masked := (others => '0');
-                    else
-                        masked := bits_i and
-                                  (shift_left(to_unsigned(1, 32), len_int)
-                                   - to_unsigned(1, 32));
+                    if len_int > 0 then
+                        shift_amt := 64 - n_v - len_int;
+                        accum_v := accum_v or
+                                   shift_left(resize(bits_i, 64), shift_amt);
                     end if;
-                    if len_int = 0 then
-                        padded := (others => '0');
-                    else
-                        padded := shift_left(resize(masked, 64), 64 - len_int);
-                    end if;
-                    accum_v := accum_v or shift_right(padded, n_v);
-                    n_v     := n_v + len_int;
+                    n_v := n_v + len_int;
                 end if;
 
                 ----------------------------------------------------------
