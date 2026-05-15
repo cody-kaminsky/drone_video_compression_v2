@@ -127,6 +127,8 @@ begin
         assert open_status = open_ok
             report "Could not open " & OUT_FILE severity failure;
 
+        report "Files opened, starting test..." severity note;
+
         while not endfile(f_in) loop
             -- Read input vector
             readline(f_in, L_in);
@@ -216,6 +218,12 @@ begin
             end if;
 
             vc := vc + 1;
+
+            -- Progress report every 100 vectors
+            if vc mod 100 = 0 then
+                report "Progress: vector " & integer'image(vc) &
+                       " at " & time'image(now) severity note;
+            end if;
 
             -- Small gap between vectors
             wait until rising_edge(clk);
