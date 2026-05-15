@@ -74,10 +74,16 @@ package cavlc_pkg is
     -- Bit packer ports. The bit packer is a separate sub-module; this
     -- record bundles the producer-side signals so submodules can drive
     -- it cleanly.
+    --
+    -- Width: 32-bit bits / 6-bit length (range 0..32). Wide enough for
+    -- the longest single CAVLC field (28-bit escape level: 15 zeros +
+    -- '1' + 12-bit suffix per spec 9.2.2). One handshake = one logical
+    -- field; sub-modules don't have to split escape levels into multiple
+    -- packer beats.
     --------------------------------------------------------------------
     type bp_in_t is record
-        bits   : unsigned(15 downto 0);
-        length : unsigned(4 downto 0);
+        bits   : unsigned(31 downto 0);
+        length : unsigned(5 downto 0);
         valid  : std_logic;
     end record;
 
