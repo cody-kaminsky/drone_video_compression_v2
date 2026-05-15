@@ -1,8 +1,7 @@
 --------------------------------------------------------------------------------
 -- transform_engine.vhd
 --
--- H.264 4x4 integer transform engine.  Implements all six transforms from
--- transform.c as a single combinational core with registered I/O:
+-- H.264 4x4 integer transform engine (single-cycle, area-optimized).
 --
 --   Mode 0: dct4x4          (forward DCT,  spec 8.5.6)
 --   Mode 1: idct4x4         (inverse DCT,  spec 8.5.6)
@@ -11,11 +10,12 @@
 --   Mode 4: hadamard2x2     (forward Hadamard, DC chroma)
 --   Mode 5: ihadamard2x2    (inverse Hadamard, DC chroma)
 --
--- Interface: valid/ready handshake.  One block in, one block out, single-
--- cycle throughput with one-cycle latency.  Pure shift-and-add; no DSPs.
+-- Architecture: 8 instances of one shared mode-muxed butterfly (4 row +
+-- 4 column).  Single-cycle combinational core with registered output.
+-- One block per cycle throughput, one cycle latency.
+-- Pure shift-and-add — no DSPs.
 --
 -- Data layout: 16-element row-major array, matching the C reference.
---   index = row*4 + col.
 --------------------------------------------------------------------------------
 
 library ieee;
@@ -70,102 +70,66 @@ end entity;
 
 architecture rtl of transform_engine is
 
-    type block_t is array (0 to 15) of signed(31 downto 0);
+    -- Internal width: 21 bits covers worst-case intermediate
+    -- (forward DCT: 4 * 2 * max_i16 = 4*2*32767 = 262136, fits in 19 bits,
+    --  column pass doubles again: fits in 21 bits before i16 truncation).
+    -- Inverse transforms need full 32 bits at input but intermediates
+    -- still fit in 32. We use 32 throughout for correctness on inverse
+    -- paths; the synthesizer trims unused MSBs on forward-only paths.
+    subtype elem_t is signed(31 downto 0);
+    type block_t is array (0 to 15) of elem_t;
 
-    constant MODE_DCT4      : unsigned(2 downto 0) := "000";
-    constant MODE_IDCT4     : unsigned(2 downto 0) := "001";
-    constant MODE_HAD4      : unsigned(2 downto 0) := "010";
-    constant MODE_IHAD4     : unsigned(2 downto 0) := "011";
-    constant MODE_HAD2      : unsigned(2 downto 0) := "100";
-    constant MODE_IHAD2     : unsigned(2 downto 0) := "101";
+    constant MODE_DCT4  : unsigned(2 downto 0) := "000";
+    constant MODE_IDCT4 : unsigned(2 downto 0) := "001";
+    constant MODE_HAD2  : unsigned(2 downto 0) := "100";
 
-    signal din_block   : block_t;
     signal result_comb : block_t;
+    signal out_reg     : block_t := (others => (others => '0'));
+    signal out_valid   : std_logic := '0';
+    signal accept      : std_logic;
 
-    signal out_reg   : block_t := (others => (others => '0'));
-    signal out_valid : std_logic := '0';
-    signal mode_reg  : unsigned(2 downto 0) := (others => '0');
-
-    signal accept : std_logic;
-
-    -- Truncate a 32-bit signed value to 16 bits (matching C's (i16) cast)
-    function trunc16(x : signed(31 downto 0)) return signed is
+    -- Shared butterfly: one implementation, mode-selected
+    procedure butterfly(
+        mode                 : in  unsigned(2 downto 0);
+        r0, r1, r2, r3      : in  elem_t;
+        o0, o1, o2, o3      : out elem_t) is
+        variable a, b, c, d : elem_t;
     begin
-        return resize(x(15 downto 0), 32);
+        if mode = MODE_IDCT4 then
+            -- Inverse DCT butterfly
+            a := r0 + r2;
+            b := r0 - r2;
+            c := shift_right(r1, 1) - r3;
+            d := r1 + shift_right(r3, 1);
+            o0 := a + d;
+            o1 := b + c;
+            o2 := b - c;
+            o3 := a - d;
+        elsif mode = MODE_DCT4 then
+            -- Forward DCT butterfly
+            a := r0 + r3;  b := r1 + r2;
+            c := r1 - r2;  d := r0 - r3;
+            o0 := a + b;
+            o1 := shift_left(d, 1) + c;
+            o2 := a - b;
+            o3 := d - shift_left(c, 1);
+        else
+            -- Hadamard butterfly (forward = inverse)
+            a := r0 + r3;  b := r1 + r2;
+            c := r1 - r2;  d := r0 - r3;
+            o0 := a + b;
+            o1 := d + c;
+            o2 := a - b;
+            o3 := d - c;
+        end if;
+    end procedure;
+
+    function trunc16(x : elem_t) return elem_t is
+    begin
+        return resize(signed(x(15 downto 0)), 32);
     end function;
 
-    --------------------------------------------------------------------
-    -- 4-point butterfly for forward DCT (one row or column).
-    --   a = r0+r3,  b = r1+r2,  c = r1-r2,  d = r0-r3
-    --   out = [a+b,  2d+c,  a-b,  d-2c]
-    --------------------------------------------------------------------
-    procedure butterfly_dct(
-        r0, r1, r2, r3 : in  signed(31 downto 0);
-        o0, o1, o2, o3 : out signed(31 downto 0)) is
-        variable a, b, c, d : signed(31 downto 0);
-    begin
-        a := r0 + r3;
-        b := r1 + r2;
-        c := r1 - r2;
-        d := r0 - r3;
-        o0 := a + b;
-        o1 := shift_left(d, 1) + c;
-        o2 := a - b;
-        o3 := d - shift_left(c, 1);
-    end procedure;
-
-    --------------------------------------------------------------------
-    -- 4-point butterfly for inverse DCT.
-    --   a = r0+r2,  b = r0-r2
-    --   c = (r1>>1)-r3,  d = r1+(r3>>1)
-    --   out = [a+d,  b+c,  b-c,  a-d]
-    --------------------------------------------------------------------
-    procedure butterfly_idct(
-        r0, r1, r2, r3 : in  signed(31 downto 0);
-        o0, o1, o2, o3 : out signed(31 downto 0)) is
-        variable a, b, c, d : signed(31 downto 0);
-    begin
-        a := r0 + r2;
-        b := r0 - r2;
-        c := shift_right(r1, 1) - r3;
-        d := r1 + shift_right(r3, 1);
-        o0 := a + d;
-        o1 := b + c;
-        o2 := b - c;
-        o3 := a - d;
-    end procedure;
-
-    --------------------------------------------------------------------
-    -- 4-point butterfly for Hadamard (same for forward & inverse).
-    --   a = r0+r3,  b = r1+r2,  c = r1-r2,  d = r0-r3
-    --   out = [a+b,  d+c,  a-b,  d-c]
-    --------------------------------------------------------------------
-    procedure butterfly_had(
-        r0, r1, r2, r3 : in  signed(31 downto 0);
-        o0, o1, o2, o3 : out signed(31 downto 0)) is
-        variable a, b, c, d : signed(31 downto 0);
-    begin
-        a := r0 + r3;
-        b := r1 + r2;
-        c := r1 - r2;
-        d := r0 - r3;
-        o0 := a + b;
-        o1 := d + c;
-        o2 := a - b;
-        o3 := d - c;
-    end procedure;
-
 begin
-
-    -- Pack input ports into array
-    din_block(0)  <= din_0;   din_block(1)  <= din_1;
-    din_block(2)  <= din_2;   din_block(3)  <= din_3;
-    din_block(4)  <= din_4;   din_block(5)  <= din_5;
-    din_block(6)  <= din_6;   din_block(7)  <= din_7;
-    din_block(8)  <= din_8;   din_block(9)  <= din_9;
-    din_block(10) <= din_10;  din_block(11) <= din_11;
-    din_block(12) <= din_12;  din_block(13) <= din_13;
-    din_block(14) <= din_14;  din_block(15) <= din_15;
 
     accept  <= valid_i and (ready_i or not out_valid);
     ready_o <= ready_i or not out_valid;
@@ -177,51 +141,19 @@ begin
         variable d   : block_t;
         variable t   : block_t;
         variable res : block_t;
-        variable va, vb, vc, vd : signed(31 downto 0);
+        variable va, vb, vc, vd : elem_t;
     begin
-        d   := din_block;
+        -- Wire inputs
+        d(0)  := din_0;   d(1)  := din_1;   d(2)  := din_2;   d(3)  := din_3;
+        d(4)  := din_4;   d(5)  := din_5;   d(6)  := din_6;   d(7)  := din_7;
+        d(8)  := din_8;   d(9)  := din_9;   d(10) := din_10;  d(11) := din_11;
+        d(12) := din_12;  d(13) := din_13;  d(14) := din_14;  d(15) := din_15;
+
         t   := (others => (others => '0'));
         res := (others => (others => '0'));
 
-        case mode_i is
-
-        when MODE_DCT4 =>
-            -- Row pass
-            for i in 0 to 3 loop
-                butterfly_dct(d(i*4+0), d(i*4+1), d(i*4+2), d(i*4+3),
-                              t(i*4+0), t(i*4+1), t(i*4+2), t(i*4+3));
-            end loop;
-            -- Column pass
-            for j in 0 to 3 loop
-                butterfly_dct(t(0*4+j), t(1*4+j), t(2*4+j), t(3*4+j),
-                              res(0*4+j), res(1*4+j), res(2*4+j), res(3*4+j));
-            end loop;
-
-        when MODE_IDCT4 =>
-            -- Row pass
-            for i in 0 to 3 loop
-                butterfly_idct(d(i*4+0), d(i*4+1), d(i*4+2), d(i*4+3),
-                               t(i*4+0), t(i*4+1), t(i*4+2), t(i*4+3));
-            end loop;
-            -- Column pass
-            for j in 0 to 3 loop
-                butterfly_idct(t(0*4+j), t(1*4+j), t(2*4+j), t(3*4+j),
-                               res(0*4+j), res(1*4+j), res(2*4+j), res(3*4+j));
-            end loop;
-
-        when MODE_HAD4 | MODE_IHAD4 =>
-            -- Row pass
-            for i in 0 to 3 loop
-                butterfly_had(d(i*4+0), d(i*4+1), d(i*4+2), d(i*4+3),
-                              t(i*4+0), t(i*4+1), t(i*4+2), t(i*4+3));
-            end loop;
-            -- Column pass
-            for j in 0 to 3 loop
-                butterfly_had(t(0*4+j), t(1*4+j), t(2*4+j), t(3*4+j),
-                              res(0*4+j), res(1*4+j), res(2*4+j), res(3*4+j));
-            end loop;
-
-        when MODE_HAD2 | MODE_IHAD2 =>
+        if mode_i = MODE_HAD2 or mode_i = "101" then
+            -- 2x2 Hadamard (self-inverse): direct computation
             va := d(0) + d(1);
             vb := d(0) - d(1);
             vc := d(2) + d(3);
@@ -230,11 +162,35 @@ begin
             res(1) := vb + vd;
             res(2) := va - vc;
             res(3) := vb - vd;
+            -- Truncate for forward 2x2 (mode 4)
+            if mode_i = MODE_HAD2 then
+                res(0) := trunc16(res(0));
+                res(1) := trunc16(res(1));
+                res(2) := trunc16(res(2));
+                res(3) := trunc16(res(3));
+            end if;
+        else
+            -- 4x4 transforms: row pass (4 butterflies)
+            for i in 0 to 3 loop
+                butterfly(mode_i,
+                          d(i*4+0), d(i*4+1), d(i*4+2), d(i*4+3),
+                          t(i*4+0), t(i*4+1), t(i*4+2), t(i*4+3));
+            end loop;
 
-        when others =>
-            null;
+            -- 4x4 transforms: column pass (4 butterflies)
+            for j in 0 to 3 loop
+                butterfly(mode_i,
+                          t(0*4+j), t(1*4+j), t(2*4+j), t(3*4+j),
+                          res(0*4+j), res(1*4+j), res(2*4+j), res(3*4+j));
+            end loop;
 
-        end case;
+            -- Truncate for forward DCT (mode 0)
+            if mode_i = MODE_DCT4 then
+                for i in 0 to 15 loop
+                    res(i) := trunc16(res(i));
+                end loop;
+            end if;
+        end if;
 
         result_comb <= res;
     end process;
@@ -243,27 +199,16 @@ begin
     -- Output register with handshake
     --------------------------------------------------------------------
     reg_p : process(clk, rst_n)
-        variable captured : block_t;
     begin
         if rst_n = '0' then
             out_valid <= '0';
             out_reg   <= (others => (others => '0'));
-            mode_reg  <= (others => '0');
         elsif rising_edge(clk) then
             if ready_i = '1' then
                 out_valid <= '0';
             end if;
             if accept = '1' then
-                captured := result_comb;
-                mode_reg <= mode_i;
-                -- dct4x4 (mode 0) and hadamard2x2 (mode 4) output i16 in C;
-                -- truncate to 16 bits to match the (i16) cast.
-                if mode_i = MODE_DCT4 or mode_i = MODE_HAD2 then
-                    for i in 0 to 15 loop
-                        captured(i) := trunc16(captured(i));
-                    end loop;
-                end if;
-                out_reg   <= captured;
+                out_reg   <= result_comb;
                 out_valid <= '1';
             end if;
         end if;
