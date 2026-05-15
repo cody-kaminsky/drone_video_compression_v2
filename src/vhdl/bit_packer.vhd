@@ -133,7 +133,7 @@ begin
                         accum_v := shift_left(accum_v, 8);
                         n_v     := n_v - 8;
                         did_emit := true;
-                        if state = S_FLUSHING and n_v = 0 then
+                        if (state = S_FLUSHING or flush_i = '1') and n_v = 0 then
                             last_byte := true;
                         end if;
                     elsif state = S_FLUSHING and n_v > 0 then

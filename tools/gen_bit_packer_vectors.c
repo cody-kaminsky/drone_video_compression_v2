@@ -90,7 +90,7 @@ static void emit_group(FILE *fin, FILE *fout, const group_t *g)
 {
     /* Drive lines */
     for (int i = 0; i < g->n_beats; i++) {
-        fprintf(fin, "B %d %u\n", g->beats[i].length, g->beats[i].bits);
+        fprintf(fin, "B %d %08X\n", g->beats[i].length, g->beats[i].bits);
     }
     fprintf(fin, "F\n");
 

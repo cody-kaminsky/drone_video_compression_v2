@@ -103,7 +103,7 @@ begin
         variable L     : line;
         variable tag   : character;
         variable len   : integer;
-        variable val   : integer;
+        variable bits_v : unsigned(31 downto 0);
         variable open_status : file_open_status;
     begin
         valid_i  <= '0';
@@ -128,8 +128,8 @@ begin
 
             if tag = 'B' then
                 read(L, len);
-                read(L, val);
-                bits_i   <= to_unsigned(val, 32);
+                hread(L, bits_v);
+                bits_i   <= bits_v;
                 length_i <= to_unsigned(len, 6);
                 valid_i  <= '1';
                 flush_i  <= '0';
