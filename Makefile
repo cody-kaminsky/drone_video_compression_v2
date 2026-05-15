@@ -43,13 +43,14 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: all ref hls clean test vectors bit_packer_vectors
+.PHONY: all ref hls clean test vectors bit_packer_vectors transform_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
 hls: $(BIN_HLS)
 vectors: $(BUILD)/gen_cavlc_vectors
 bit_packer_vectors: $(BUILD)/bit_packer_vectors_in.txt
+transform_vectors: $(BUILD)/transform_vectors.txt
 
 # CAVLC vector generator for the VHDL CAVLC engine testbench. Links against
 # the shared kernel (just needs cavlc.c + bitstream.c).
@@ -61,6 +62,14 @@ $(BUILD)/gen_cavlc_vectors: tools/gen_cavlc_vectors.c \
 $(BUILD)/gen_bit_packer_vectors: tools/gen_bit_packer_vectors.c \
                                   $(BUILD)/bitstream.o | $(BUILD)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+# Transform vector generator. Links against transform.c only.
+$(BUILD)/gen_transform_vectors: tools/gen_transform_vectors.c \
+                                 $(BUILD)/transform.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/transform_vectors.txt: $(BUILD)/gen_transform_vectors
+	./$<
 
 # Generate vectors. The C tool writes both files; we touch one to mark
 # completion (the tool runs in $(BUILD)/.. since paths in the tool are
