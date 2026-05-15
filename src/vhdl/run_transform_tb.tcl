@@ -13,4 +13,4 @@
 xvhdl --2008 src/vhdl/transform_engine.vhd
 xvhdl --2008 src/vhdl/transform_engine_tb.vhd
 exec xelab transform_engine_tb -snapshot transform_test -debug typical
-xsim transform_test -runall
+exec xsim transform_test -runall

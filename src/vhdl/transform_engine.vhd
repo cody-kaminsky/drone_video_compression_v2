@@ -84,8 +84,15 @@ architecture rtl of transform_engine is
 
     signal out_reg   : block_t := (others => (others => '0'));
     signal out_valid : std_logic := '0';
+    signal mode_reg  : unsigned(2 downto 0) := (others => '0');
 
     signal accept : std_logic;
+
+    -- Truncate a 32-bit signed value to 16 bits (matching C's (i16) cast)
+    function trunc16(x : signed(31 downto 0)) return signed is
+    begin
+        return resize(x(15 downto 0), 32);
+    end function;
 
     --------------------------------------------------------------------
     -- 4-point butterfly for forward DCT (one row or column).
@@ -236,16 +243,27 @@ begin
     -- Output register with handshake
     --------------------------------------------------------------------
     reg_p : process(clk, rst_n)
+        variable captured : block_t;
     begin
         if rst_n = '0' then
             out_valid <= '0';
             out_reg   <= (others => (others => '0'));
+            mode_reg  <= (others => '0');
         elsif rising_edge(clk) then
             if ready_i = '1' then
                 out_valid <= '0';
             end if;
             if accept = '1' then
-                out_reg   <= result_comb;
+                captured := result_comb;
+                mode_reg <= mode_i;
+                -- dct4x4 (mode 0) and hadamard2x2 (mode 4) output i16 in C;
+                -- truncate to 16 bits to match the (i16) cast.
+                if mode_i = MODE_DCT4 or mode_i = MODE_HAD2 then
+                    for i in 0 to 15 loop
+                        captured(i) := trunc16(captured(i));
+                    end loop;
+                end if;
+                out_reg   <= captured;
                 out_valid <= '1';
             end if;
         end if;

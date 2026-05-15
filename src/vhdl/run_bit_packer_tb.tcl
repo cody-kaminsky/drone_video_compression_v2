@@ -18,12 +18,12 @@ xvhdl --2008 src/vhdl/bit_packer_tb.vhd
 puts "===== Pass 1: STALL_EVERY_N = 0 (always ready) ====="
 exec xelab bit_packer_tb -snapshot bp_test_p1 -debug typical \
     -generic_top STALL_EVERY_N=0
-xsim bp_test_p1 -runall
+exec xsim bp_test_p1 -runall
 
 # Pass 2: backpressure every 5 cycles (exercises stall paths)
 puts "===== Pass 2: STALL_EVERY_N = 5 (periodic backpressure) ====="
 exec xelab bit_packer_tb -snapshot bp_test_p2 -debug typical \
     -generic_top STALL_EVERY_N=5
-xsim bp_test_p2 -runall
+exec xsim bp_test_p2 -runall
 
 puts "All bit_packer simulation passes completed."
