@@ -216,6 +216,9 @@ begin
                         pkt_q    <= in_data;
                         pkt_last <= in_last;
                         state    <= S_COUNT;
+                        -- synthesis translate_off
+                        report "ENGINE: S_IDLE->S_COUNT at " & time'image(now) severity note;
+                        -- synthesis translate_on
                     end if;
 
                 --------------------------------------------------------
@@ -302,6 +305,12 @@ begin
                     idx <= 0;
 
                     state <= S_COEFF_TOKEN;
+                    -- synthesis translate_off
+                    report "ENGINE: S_COUNT->S_COEFF_TOKEN TC=" &
+                           integer'image(v_total_coef) &
+                           " T1=" & integer'image(v_trailing_ones) &
+                           " TZ=" & integer'image(v_total_zeros) severity note;
+                    -- synthesis translate_on
 
                 --------------------------------------------------------
                 -- S_COEFF_TOKEN: trigger coeff_token_encoder lookup
@@ -318,10 +327,19 @@ begin
                         bp_bits   <= resize(ct_code, 32);
                         bp_length <= resize(ct_length, 6);
                         bp_valid  <= '1';
+                        -- synthesis translate_off
+                        report "ENGINE: S_EMIT_CT pushed ct len=" &
+                               integer'image(to_integer(ct_length)) &
+                               " code=" & integer'image(to_integer(ct_code)) &
+                               " bp_ready=" & std_logic'image(bp_ready) severity note;
+                        -- synthesis translate_on
                         if total_coef = 0 then
                             -- Empty block: done
                             if pkt_last = '1' then
                                 state <= S_DRAIN;
+                                -- synthesis translate_off
+                                report "ENGINE: TC=0 pkt_last->S_DRAIN" severity note;
+                                -- synthesis translate_on
                             else
                                 state <= S_DONE;
                             end if;
@@ -329,6 +347,12 @@ begin
                             state <= S_ONES_SIGN;
                             idx   <= 0;
                         end if;
+                    -- synthesis translate_off
+                    else
+                        report "ENGINE: S_EMIT_CT waiting ct_valid_o=" &
+                               std_logic'image(ct_valid_o) &
+                               " bp_ready=" & std_logic'image(bp_ready) severity note;
+                    -- synthesis translate_on
                     end if;
 
                 --------------------------------------------------------
@@ -503,6 +527,10 @@ begin
                 when S_DRAIN =>
                     bp_flush <= '1';
                     if bp_flushed = '1' then
+                        -- synthesis translate_off
+                        report "ENGINE: S_DRAIN->S_DONE (flushed) at " &
+                               time'image(now) severity note;
+                        -- synthesis translate_on
                         state <= S_DONE;
                     end if;
 
@@ -510,6 +538,9 @@ begin
                 -- S_DONE: single tick, return to idle
                 --------------------------------------------------------
                 when S_DONE =>
+                    -- synthesis translate_off
+                    report "ENGINE: S_DONE->S_IDLE" severity note;
+                    -- synthesis translate_on
                     state <= S_IDLE;
 
                 end case;

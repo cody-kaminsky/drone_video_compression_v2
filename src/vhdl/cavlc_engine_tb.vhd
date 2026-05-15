@@ -160,6 +160,13 @@ begin
                 exp_bytes(b) := v_byte_v;
             end loop;
 
+            report "Vec " & integer'image(vc) &
+                   ": bt=" & integer'image(v_bt) &
+                   " nc=" & integer'image(v_ncoefs) &
+                   " nC=" & integer'image(v_nC) &
+                   " bits=" & integer'image(exp_bitcount) &
+                   " exp_bytes=" & integer'image(exp_count) severity note;
+
             -- Drive the packet with in_last='1' to flush after each block
             in_valid <= '1';
             in_last  <= '1';
@@ -169,6 +176,9 @@ begin
             end loop;
             in_valid <= '0';
             in_last  <= '0';
+
+            report "Vec " & integer'image(vc) & ": handshake done at " &
+                   time'image(now) severity note;
 
             -- Collect output bytes until out_last
             got_count := 0;
@@ -195,6 +205,10 @@ begin
                     exit when out_last = '1' and out_valid = '1';
                 end loop;
             end if;
+
+            report "Vec " & integer'image(vc) & ": collected " &
+                   integer'image(got_count) & " bytes at " &
+                   time'image(now) severity note;
 
             -- Compare
             if got_count /= exp_count then
