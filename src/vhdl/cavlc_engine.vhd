@@ -469,7 +469,7 @@ begin
                 -- idx counts from (total_coef-1) down to 1
                 --------------------------------------------------------
                 when S_RUN_BEFORE =>
-                    if idx <= 1 or total_zeros = 0 then
+                    if idx < 1 or total_zeros = 0 then
                         -- Done with run_before
                         if pkt_last = '1' then
                             state <= S_DRAIN;
