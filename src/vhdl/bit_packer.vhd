@@ -181,6 +181,7 @@ begin
                     if n_v = 0 and not did_emit and out_valid_q = '0' then
                         state     <= S_NORMAL;
                         flushed_q <= '1';
+                        end if;
                     end if;
                 end if;
 

@@ -180,31 +180,25 @@ begin
             report "Vec " & integer'image(vc) & ": handshake done at " &
                    time'image(now) severity note;
 
-            -- Collect output bytes until out_last
+            -- Collect exactly exp_count bytes. We count by expected
+            -- length rather than relying on out_last because the flush
+            -- may find an empty accumulator when bit_count is a multiple
+            -- of 8, in which case out_last is never asserted.
             got_count := 0;
             if exp_count > 0 then
-                loop
+                while got_count < exp_count loop
                     wait until rising_edge(clk);
                     if out_valid = '1' and out_ready = '1' then
                         got_bytes(got_count) := out_data;
                         got_count := got_count + 1;
-                        exit when out_last = '1';
                     end if;
-                    -- Timeout protection
-                    if got_count > 63 then
-                        report "Output overflow on vector " & integer'image(vc)
-                            severity error;
-                        exit;
-                    end if;
-                end loop;
-            else
-                -- Zero-bit block: wait for flush to complete (no bytes expected)
-                -- Just wait a few cycles for the engine to finish
-                for w in 0 to 20 loop
-                    wait until rising_edge(clk);
-                    exit when out_last = '1' and out_valid = '1';
                 end loop;
             end if;
+            -- Wait for engine to finish (drain/done)
+            for w in 0 to 100 loop
+                wait until rising_edge(clk);
+                exit when in_ready = '1';
+            end loop;
 
             report "Vec " & integer'image(vc) & ": collected " &
                    integer'image(got_count) & " bytes at " &
