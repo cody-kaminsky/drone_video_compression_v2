@@ -15,7 +15,27 @@
 --   - One coeff_token_encoder instance (1-cycle latency, shared).
 --   - Level encoding done inline in state machine (no separate entity).
 --   - Bit packer instance emits bytes from variable-length fields.
---   - Backpressure: stalls when bit_packer's ready_o deasserts.
+--   - Backpressure: stalls when bit_packer's ready_o deasserts. Every push
+--     is held until accepted (AXI-style), so a field is never dropped.
+--
+-- Area notes:
+--   - The nonzero levels are NOT compacted into a separate array. The
+--     engine walks the 16-bit nonzero mask from the highest position down
+--     with a position pointer and a leading-one detector, and reads each
+--     level straight out of the captured packet. That removes the 16x16
+--     one-hot compaction muxes and their 320 flops.
+--   - All variable-length fields have a VALUE that fits in 16 bits (the
+--     leading zeros of unary prefixes are implied by the length), so the
+--     bit packer is instantiated with a 16-bit data path.
+--   - Level arithmetic and the nonzero / ±1 detection are sized for the
+--     spec range |level| <= 2048: levels are treated as sign-extended
+--     13-bit values (bits 15..13 of level_t must equal bit 12).
+--   - level_code is formed without a negate: for L < 0, 2|L|-1 = 2*(~L)+1.
+--     The suffix_length threshold |L| > 3<<(sl-1) is tested as
+--     level_code >= 3<<sl on the unbiased code, so |L| is never computed.
+--   - coeff_token and total_zeros tables live in one block RAM
+--     (cavlc_vlc_rom) behind a state-muxed address. The total_zeros entry
+--     is fetched during the level states, so the lookup costs no cycles.
 --------------------------------------------------------------------------------
 
 library ieee;
@@ -51,7 +71,8 @@ architecture rtl of cavlc_engine is
     --------------------------------------------------------------------
     type state_t is (
         S_IDLE,
-        S_COUNT,
+        S_COUNT,        -- stage 1: per-position nonzero / ±1 flags
+        S_COUNT2,       -- stage 2: TotalCoeff, TrailingOnes, total_zeros
         S_COEFF_TOKEN,
         S_EMIT_CT,
         S_ONES_SIGN,
@@ -71,27 +92,32 @@ architecture rtl of cavlc_engine is
     signal pkt_last  : std_logic;
 
     --------------------------------------------------------------------
-    -- Per-block working registers (populated in S_COUNT)
+    -- Per-block working registers (populated in S_COUNT / S_COUNT2)
     --------------------------------------------------------------------
     signal total_coef    : integer range 0 to 16;
     signal trailing_ones : integer range 0 to 3;
     signal total_zeros   : integer range 0 to 15;
-    signal last_nz       : integer range -1 to 15;
+    signal last_nz       : integer range 0 to 15;
 
-    -- Nonzero positions for run_before computation
-    type nz_pos_array_t is array (0 to 15) of integer range 0 to 15;
-    signal nz_pos : nz_pos_array_t;
+    subtype mask_t is std_logic_vector(15 downto 0);
+    signal nz_mask  : mask_t;   -- level(i) /= 0 and i < n_coefs
+    signal one_mask : mask_t;   -- level(i) = ±1
 
-    -- Levels stored in reverse order (from last_nz toward DC) for encoding
-    type level_val_array_t is array (0 to 15) of signed(15 downto 0);
-    signal level_vals : level_val_array_t;
+    -- Walk pointer: position of the nonzero currently being processed.
+    -- Levels and run_before are both emitted from the highest-frequency
+    -- nonzero downward, so one pointer serves both loops.
+    signal pos : integer range 0 to 15;
 
-    -- Loop counters
+    -- Loop counter (nonzeros processed so far / remaining)
     signal idx : integer range 0 to 15;
 
     -- Suffix length for level encoding (spec 9.2.2)
     signal suffix_length : integer range 0 to 6;
     signal first_non_t1  : std_logic;
+
+    -- coeff_token result seen (code/length registers hold after the
+    -- one-cycle valid_o pulse, so we only need to remember the pulse).
+    signal ct_seen : std_logic;
 
     --------------------------------------------------------------------
     -- Coeff_token encoder ports
@@ -101,9 +127,19 @@ architecture rtl of cavlc_engine is
     signal ct_length : unsigned(4 downto 0);
 
     --------------------------------------------------------------------
-    -- Bit packer ports
+    -- VLC ROM. One read port, address muxed by state: the coeff_token
+    -- address while that code is being looked up / waited for, the
+    -- total_zeros address (from the per-block registers) otherwise.
     --------------------------------------------------------------------
-    signal bp_bits    : unsigned(31 downto 0);
+    signal rom_addr_ct, rom_addr_tz, rom_addr : unsigned(8 downto 0);
+    signal rom_data  : vlc_entry_t;
+    signal tz_chroma : std_logic;
+
+    --------------------------------------------------------------------
+    -- Bit packer ports (16-bit data path, see header)
+    --------------------------------------------------------------------
+    constant BP_W : positive := 16;
+    signal bp_bits    : unsigned(BP_W - 1 downto 0);
     signal bp_length  : unsigned(5 downto 0);
     signal bp_valid   : std_logic;
     signal bp_ready   : std_logic;
@@ -113,6 +149,65 @@ architecture rtl of cavlc_engine is
     signal bp_out_data  : unsigned(7 downto 0);
     signal bp_out_valid : std_logic;
     signal bp_out_last  : std_logic;
+
+    --------------------------------------------------------------------
+    -- Mask helpers
+    --------------------------------------------------------------------
+    -- Index of the highest set bit (0 if none; callers check m /= 0).
+    function highest_set(m : mask_t) return integer is
+        variable r : integer range 0 to 15 := 0;
+    begin
+        for i in 0 to 15 loop
+            if m(i) = '1' then
+                r := i;
+            end if;
+        end loop;
+        return r;
+    end function;
+
+    -- Bits strictly below position p.
+    function below_mask(p : integer range 0 to 15) return mask_t is
+        variable r : mask_t;
+    begin
+        for i in 0 to 15 loop
+            if i < p then
+                r(i) := '1';
+            else
+                r(i) := '0';
+            end if;
+        end loop;
+        return r;
+    end function;
+
+    -- Bits strictly above position p.
+    function above_mask(p : integer range 0 to 15) return mask_t is
+        variable r : mask_t;
+    begin
+        for i in 0 to 15 loop
+            if i > p then
+                r(i) := '1';
+            else
+                r(i) := '0';
+            end if;
+        end loop;
+        return r;
+    end function;
+
+    function popcount(m : mask_t) return integer is
+        variable c : integer range 0 to 16 := 0;
+    begin
+        for i in 0 to 15 loop
+            if m(i) = '1' then
+                c := c + 1;
+            end if;
+        end loop;
+        return c;
+    end function;
+
+    function is_zero(m : mask_t) return boolean is
+    begin
+        return m = (m'range => '0');
+    end function;
 
 begin
 
@@ -127,15 +222,49 @@ begin
             nC_i         => pkt_q.nC,
             total_coef_i => to_unsigned(total_coef, 5),
             t1_i         => to_unsigned(trailing_ones, 2),
+            rom_addr_o   => rom_addr_ct,
+            rom_data_i   => rom_data,
             valid_o      => ct_valid_o,
             code_o       => ct_code,
             length_o     => ct_length
         );
 
     ------------------------------------------------------------------
+    -- Sub-module: VLC ROM (block RAM)
+    ------------------------------------------------------------------
+    vlc_rom_inst : entity work.cavlc_vlc_rom
+        port map (
+            clk  => clk,
+            addr => rom_addr,
+            data => rom_data
+        );
+
+    -- The coeff_token result is consumed in S_EMIT_CT; S_TOTAL_ZEROS is
+    -- reached at least three cycles later (S_ONES_SIGN exit, one level,
+    -- S_LEVELS exit), so the total_zeros entry is ready when needed.
+    rom_addr <= rom_addr_ct when (state = S_COEFF_TOKEN or state = S_EMIT_CT)
+                else rom_addr_tz;
+
+    -- total_zeros address: valid from S_COUNT2 onward (total_coef >= 1
+    -- whenever S_TOTAL_ZEROS is reached; total_zeros is only decremented
+    -- later, in S_RUN_BEFORE).
+    -- Address map: see cavlc_vlc_rom. Luma: 256 + (TC-1)*16 + tz.
+    -- Chroma DC: 496 + (TC-1)*4 + tz (TC <= 3, tz <= 3).
+    tz_chroma   <= '1' when pkt_q.nC = to_unsigned(31, 5) else '0';
+    rom_addr_tz <= (others => '0') when total_coef = 0 else
+                  "11111" & to_unsigned(total_coef - 1, 5)(1 downto 0) &
+                            to_unsigned(total_zeros, 4)(1 downto 0)
+                      when tz_chroma = '1' else
+                  '1' & to_unsigned(total_coef - 1, 5)(3 downto 0) &
+                        to_unsigned(total_zeros, 4);
+
+    ------------------------------------------------------------------
     -- Sub-module: bit_packer
     ------------------------------------------------------------------
     bit_packer_inst : entity work.bit_packer
+        generic map (
+            DATA_W => BP_W
+        )
         port map (
             clk       => clk,
             rst_n     => rst_n,
@@ -166,23 +295,29 @@ begin
     process(clk)
         variable v_total_coef    : integer range 0 to 16;
         variable v_trailing_ones : integer range 0 to 3;
-        variable v_last_nz       : integer range -1 to 15;
-        variable v_total_zeros   : integer range 0 to 15;
-        variable v_nz_count      : integer range 0 to 16;
-        variable v_t1_counting   : boolean;
-        variable v_level         : signed(15 downto 0);
-        variable v_abs_level     : integer range 0 to 2048;
-        variable v_level_code    : integer range 0 to 65535;
-        variable v_level_prefix  : integer range 0 to 65535;
-        variable v_suffix_bits   : integer range 0 to 12;
-        variable v_suffix_val    : integer range 0 to 4095;
+        variable v_last_nz       : integer range 0 to 15;
+        variable v_big           : mask_t;
+        variable v_above         : mask_t;
+        variable v_next_mask     : mask_t;
+        variable v_next_pos      : integer range 0 to 15;
+        variable v_level         : signed(12 downto 0);
+        variable v_lc_raw        : integer range 0 to 4095;  -- unbiased level_code
+        variable v_level_code    : integer range 0 to 4095;
+        variable v_level_prefix  : integer range 0 to 4095;
+        variable v_suffix_val    : integer range 0 to 63;
+        variable v_esc_off       : integer range 0 to 960;
         variable v_emit_len      : integer range 0 to 28;
-        variable v_emit_bits     : unsigned(31 downto 0);
+        variable v_emit_bits     : unsigned(BP_W - 1 downto 0);
         variable v_new_sl        : integer range 0 to 6;
-        variable v_zeros_left    : integer range 0 to 15;
         variable v_run           : integer range 0 to 15;
         variable v_zl_idx        : integer range 0 to 6;
         variable v_vlc           : vlc_entry_t;
+        -- True when a new field may be presented to the bit packer this
+        -- cycle: either nothing is pending, or the pending field is being
+        -- accepted on this edge. bp_valid/bp_bits/bp_length are held
+        -- until bp_ready is seen (AXI-style), so a push is never dropped
+        -- when the packer's ready falls after a long (up to 28-bit) field.
+        variable v_can_push      : boolean;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
@@ -191,10 +326,14 @@ begin
                 total_coef   <= 0;
                 trailing_ones <= 0;
                 total_zeros  <= 0;
-                last_nz      <= -1;
+                last_nz      <= 0;
+                nz_mask      <= (others => '0');
+                one_mask     <= (others => '0');
+                pos          <= 0;
                 idx          <= 0;
                 suffix_length <= 0;
                 first_non_t1 <= '0';
+                ct_seen      <= '0';
                 ct_valid_i   <= '0';
                 bp_bits      <= (others => '0');
                 bp_length    <= (others => '0');
@@ -203,8 +342,18 @@ begin
             else
                 -- Defaults: deassert one-shot signals
                 ct_valid_i <= '0';
-                bp_valid   <= '0';
                 bp_flush   <= '0';
+
+                -- bp_valid is held until the packer accepts the field.
+                v_can_push := (bp_valid = '0') or (bp_ready = '1');
+                if bp_ready = '1' then
+                    bp_valid <= '0';
+                end if;
+
+                -- Walk: next nonzero position below the current one.
+                -- (Shared by S_ONES_SIGN, S_LEVELS and S_RUN_BEFORE.)
+                v_next_mask := nz_mask and below_mask(pos);
+                v_next_pos  := highest_set(v_next_mask);
 
                 case state is
 
@@ -222,78 +371,61 @@ begin
                     end if;
 
                 --------------------------------------------------------
-                -- S_COUNT: scan levels to find TotalCoeff, TrailingOnes,
-                -- total_zeros, nonzero positions, and level values in
-                -- reverse order.
+                -- S_COUNT: per-position flags. Only 16-bit compares,
+                -- no cross-position dependency.
                 --------------------------------------------------------
                 when S_COUNT =>
-                    v_total_coef    := 0;
-                    v_trailing_ones := 0;
-                    v_last_nz       := -1;
-                    v_nz_count      := 0;
-                    v_t1_counting   := true;
-
-                    -- Find last nonzero and count total
                     for i in 0 to 15 loop
-                        if i < to_integer(pkt_q.n_coefs) then
-                            if pkt_q.levels(i) /= to_signed(0, 16) then
-                                v_last_nz    := i;
-                                v_total_coef := v_total_coef + 1;
-                            end if;
+                        -- Levels are sign-extended 13-bit values (see header).
+                        if i < to_integer(pkt_q.n_coefs) and
+                           pkt_q.levels(i)(12 downto 0) /= to_signed(0, 13) then
+                            nz_mask(i) <= '1';
+                        else
+                            nz_mask(i) <= '0';
+                        end if;
+                        -- ±1  <=>  bit 0 set and bits 12..1 all equal
+                        -- (all-zero => +1, all-one => -1).
+                        if pkt_q.levels(i)(0) = '1' and
+                           (pkt_q.levels(i)(12 downto 1) xor
+                            (12 downto 1 => pkt_q.levels(i)(1))) = 0 then
+                            one_mask(i) <= '1';
+                        else
+                            one_mask(i) <= '0';
                         end if;
                     end loop;
+                    state <= S_COUNT2;
 
-                    -- Find trailing ones (from last_nz backward, contiguous ±1)
-                    v_trailing_ones := 0;
-                    if v_last_nz >= 0 then
-                        v_t1_counting := true;
-                        for i in 15 downto 0 loop
-                            if i <= v_last_nz and v_t1_counting then
-                                if pkt_q.levels(i) /= to_signed(0, 16) then
-                                    if v_trailing_ones < 3 and
-                                       (pkt_q.levels(i) = to_signed(1, 16) or
-                                        pkt_q.levels(i) = to_signed(-1, 16)) then
-                                        v_trailing_ones := v_trailing_ones + 1;
-                                    else
-                                        v_t1_counting := false;
-                                    end if;
-                                end if;
-                            end if;
-                        end loop;
+                --------------------------------------------------------
+                -- S_COUNT2: TotalCoeff, last nonzero, TrailingOnes,
+                -- total_zeros; initialise the walk.
+                --------------------------------------------------------
+                when S_COUNT2 =>
+                    v_total_coef := popcount(nz_mask);
+                    v_last_nz    := highest_set(nz_mask);
+
+                    -- TrailingOnes = number of nonzeros above the highest
+                    -- level that is not ±1, capped at 3. If every nonzero
+                    -- is ±1, all of them count (still capped at 3).
+                    v_big := nz_mask and not one_mask;
+                    if is_zero(v_big) then
+                        v_above := nz_mask;
+                    else
+                        v_above := nz_mask and above_mask(highest_set(v_big));
                     end if;
-
-                    -- Build nonzero position array and level values in
-                    -- reverse order (highest freq first for encoding)
-                    v_nz_count := 0;
-                    for i in 0 to 15 loop
-                        if i <= v_last_nz then
-                            if pkt_q.levels(i) /= to_signed(0, 16) then
-                                nz_pos(v_nz_count) <= i;
-                                v_nz_count := v_nz_count + 1;
-                            end if;
-                        end if;
-                    end loop;
-
-                    -- Store levels in reverse order (last_nz down to 0, nonzero only)
-                    v_nz_count := 0;
-                    for i in 15 downto 0 loop
-                        if i <= v_last_nz then
-                            if pkt_q.levels(i) /= to_signed(0, 16) then
-                                level_vals(v_nz_count) <= pkt_q.levels(i);
-                                v_nz_count := v_nz_count + 1;
-                            end if;
-                        end if;
-                    end loop;
+                    if popcount(v_above) >= 3 then
+                        v_trailing_ones := 3;
+                    else
+                        v_trailing_ones := popcount(v_above);
+                    end if;
 
                     total_coef    <= v_total_coef;
                     trailing_ones <= v_trailing_ones;
                     last_nz       <= v_last_nz;
-                    if v_last_nz >= 0 then
-                        v_total_zeros := (v_last_nz + 1) - v_total_coef;
+                    if v_total_coef > 0 then
+                        total_zeros <= (v_last_nz + 1) - v_total_coef;
                     else
-                        v_total_zeros := 0;
+                        total_zeros <= 0;
                     end if;
-                    total_zeros <= v_total_zeros;
 
                     -- Initialize suffix_length per spec
                     if v_total_coef > 10 and v_trailing_ones < 3 then
@@ -302,6 +434,7 @@ begin
                         suffix_length <= 0;
                     end if;
                     first_non_t1 <= '1';
+                    pos <= v_last_nz;
                     idx <= 0;
 
                     state <= S_COEFF_TOKEN;
@@ -309,7 +442,8 @@ begin
                     report "ENGINE: S_COUNT->S_COEFF_TOKEN TC=" &
                            integer'image(v_total_coef) &
                            " T1=" & integer'image(v_trailing_ones) &
-                           " TZ=" & integer'image(v_total_zeros) severity note;
+                           " TZ=" & integer'image((v_last_nz + 1) - v_total_coef)
+                           severity note;
                     -- synthesis translate_on
 
                 --------------------------------------------------------
@@ -317,14 +451,19 @@ begin
                 --------------------------------------------------------
                 when S_COEFF_TOKEN =>
                     ct_valid_i <= '1';
+                    ct_seen    <= '0';
                     state <= S_EMIT_CT;
 
                 --------------------------------------------------------
                 -- S_EMIT_CT: wait for result, push to bit packer
                 --------------------------------------------------------
                 when S_EMIT_CT =>
-                    if ct_valid_o = '1' and bp_ready = '1' then
-                        bp_bits   <= resize(ct_code, 32);
+                    if ct_valid_o = '1' then
+                        ct_seen <= '1';
+                    end if;
+                    if (ct_valid_o = '1' or ct_seen = '1') and v_can_push then
+                        ct_seen   <= '0';
+                        bp_bits   <= resize(ct_code, BP_W);
                         bp_length <= resize(ct_length, 6);
                         bp_valid  <= '1';
                         -- synthesis translate_off
@@ -345,109 +484,93 @@ begin
                             end if;
                         else
                             state <= S_ONES_SIGN;
-                            idx   <= 0;
                         end if;
-                    -- synthesis translate_off
-                    else
-                        report "ENGINE: S_EMIT_CT waiting ct_valid_o=" &
-                               std_logic'image(ct_valid_o) &
-                               " bp_ready=" & std_logic'image(bp_ready) severity note;
-                    -- synthesis translate_on
                     end if;
 
                 --------------------------------------------------------
-                -- S_ONES_SIGN: emit trailing_ones sign bits (1 per cycle)
+                -- S_ONES_SIGN: emit trailing_ones sign bits (1 per cycle),
+                -- walking down from the highest nonzero.
                 --------------------------------------------------------
                 when S_ONES_SIGN =>
                     if idx >= trailing_ones then
-                        -- Done with signs, move to levels
-                        idx   <= trailing_ones;
+                        -- Done with signs; pos already points at the
+                        -- first non-T1 level.
                         state <= S_LEVELS;
-                    elsif bp_ready = '1' then
-                        -- level_vals(idx) is from reverse order (highest freq first)
+                    elsif v_can_push then
                         -- Sign bit: 1 = negative, 0 = positive
-                        if level_vals(idx) < 0 then
-                            bp_bits <= to_unsigned(1, 32);
-                        else
-                            bp_bits <= to_unsigned(0, 32);
-                        end if;
-                        bp_length <= to_unsigned(1, 6);
-                        bp_valid  <= '1';
+                        bp_bits    <= (others => '0');
+                        bp_bits(0) <= pkt_q.levels(pos)(15);
+                        bp_length  <= to_unsigned(1, 6);
+                        bp_valid   <= '1';
                         idx <= idx + 1;
+                        pos <= v_next_pos;
                     end if;
 
                 --------------------------------------------------------
                 -- S_LEVELS: emit level codes with suffix_length tracking
-                -- idx starts at trailing_ones (skip T1s already emitted as signs)
                 --------------------------------------------------------
                 when S_LEVELS =>
                     if idx >= total_coef then
-                        -- All levels emitted
+                        -- All levels emitted; restart the walk for
+                        -- run_before (idx counts down from TC-1 to 1).
+                        pos <= last_nz;
+                        idx <= total_coef - 1;
                         if total_coef < to_integer(pkt_q.n_coefs) then
                             state <= S_TOTAL_ZEROS;
                         else
-                            -- No total_zeros needed (TC == n_coefs)
-                            idx   <= total_coef - 1;
                             state <= S_RUN_BEFORE;
                         end if;
-                    elsif bp_ready = '1' then
-                        v_level := level_vals(idx);
-                        if v_level < 0 then
-                            v_abs_level := to_integer(-v_level);
-                        else
-                            v_abs_level := to_integer(v_level);
-                        end if;
+                    elsif v_can_push then
+                        v_level := pkt_q.levels(pos)(12 downto 0);
 
-                        -- level_code = 2*(abs-1) + (sign==neg)
-                        v_level_code := (v_abs_level - 1) * 2;
-                        if v_level < 0 then
-                            v_level_code := v_level_code + 1;
+                        -- level_code = 2*(|L|-1) + (L<0), without a negate:
+                        --   L > 0 : 2L - 2
+                        --   L < 0 : 2|L| - 1 = 2*(~L) + 1   (~L = -L-1 >= 0)
+                        if v_level(12) = '1' then
+                            v_lc_raw := to_integer(
+                                unsigned(not v_level(11 downto 0)) & '1');
+                        else
+                            v_lc_raw := to_integer(
+                                unsigned(v_level(11 downto 0)) & '0') - 2;
                         end if;
 
                         -- Bias first non-T1 level if T1 < 3
                         if first_non_t1 = '1' and trailing_ones < 3 then
-                            v_level_code := v_level_code - 2;
+                            v_level_code := v_lc_raw - 2;
+                        else
+                            v_level_code := v_lc_raw;
                         end if;
                         first_non_t1 <= '0';
 
-                        -- Encode based on suffix_length
+                        -- Encode per spec 9.2.2.1. Only the code VALUE is
+                        -- stored; leading zeros come from the length.
+                        --   prefix < 15 (sl > 0)   : prefix zeros, '1', sl suffix bits
+                        --   prefix < 14 (sl = 0)   : prefix zeros, '1'
+                        --   prefix = 14, sl = 0    : 14 zeros, '1', 4-bit suffix
+                        --   otherwise (escape)     : 15 zeros, '1', 12-bit suffix
+                        v_level_prefix := v_level_code / (2**suffix_length);
+                        v_suffix_val   := v_level_code mod (2**suffix_length);
                         if suffix_length = 0 then
-                            if v_level_code < 14 then
-                                -- Prefix-only: level_code zeros + '1'
-                                v_emit_len := v_level_code + 1;
-                                v_emit_bits := to_unsigned(1, 32);
-                            elsif v_level_code < 30 then
-                                -- prefix=14 + 4-bit suffix
-                                v_emit_len := 19;  -- 14 zeros + 1 + 4 suffix
-                                v_emit_bits := resize(
-                                    to_unsigned(1, 5) & to_unsigned(v_level_code - 14, 4),
-                                    32);
-                            else
-                                -- Escape: prefix=15 + 12-bit suffix
-                                v_emit_len := 28;  -- 15 zeros + 1 + 12 suffix
-                                v_emit_bits := resize(
-                                    to_unsigned(1, 13) & to_unsigned(v_level_code - 30, 12),
-                                    32);
-                            end if;
+                            v_esc_off := 30;
                         else
-                            v_level_prefix := v_level_code / (2**suffix_length);
-                            v_suffix_val   := v_level_code mod (2**suffix_length);
-                            if v_level_prefix < 15 then
-                                -- prefix zeros + '1' + suffix bits
-                                v_emit_len := v_level_prefix + 1 + suffix_length;
-                                v_emit_bits := resize(
-                                    shift_left(to_unsigned(1, 28),
-                                               suffix_length) or
-                                    to_unsigned(v_suffix_val, 28),
-                                    32);
-                            else
-                                -- Escape: 15 zeros + 1 + 12-bit suffix
-                                v_emit_len := 28;
-                                v_emit_bits := resize(
-                                    to_unsigned(1, 13) &
-                                    to_unsigned(v_level_code - 15 * (2**suffix_length), 12),
-                                    32);
-                            end if;
+                            v_esc_off := 15 * (2**suffix_length);
+                        end if;
+
+                        if (suffix_length = 0 and v_level_code < 14) or
+                           (suffix_length > 0 and v_level_prefix < 15) then
+                            v_emit_len  := v_level_prefix + 1 + suffix_length;
+                            v_emit_bits := resize(
+                                shift_left(to_unsigned(1, 7), suffix_length) or
+                                to_unsigned(v_suffix_val, 7), BP_W);
+                        elsif suffix_length = 0 and v_level_code < 30 then
+                            v_emit_len  := 19;
+                            v_emit_bits := resize(
+                                "1" & to_unsigned(v_level_code - 14, 4), BP_W);
+                        else
+                            v_emit_len  := 28;
+                            v_emit_bits := resize(
+                                "1" & to_unsigned(v_level_code - v_esc_off, 12),
+                                BP_W);
                         end if;
 
                         bp_bits   <= v_emit_bits;
@@ -457,40 +580,37 @@ begin
                         -- Update suffix_length per spec 9.2.2.1 step 6:
                         -- First promote 0→1, then check threshold against
                         -- the NEW value. Both must apply in one cycle.
+                        -- |L| > 3<<(sl-1)  <=>  unbiased level_code >= 3<<sl.
                         v_new_sl := suffix_length;
                         if v_new_sl = 0 then
                             v_new_sl := 1;
                         end if;
-                        if v_abs_level > 3 * (2**(v_new_sl - 1)) and v_new_sl < 6 then
+                        if v_lc_raw >= 3 * (2**v_new_sl) and v_new_sl < 6 then
                             v_new_sl := v_new_sl + 1;
                         end if;
                         suffix_length <= v_new_sl;
 
                         idx <= idx + 1;
+                        pos <= v_next_pos;
                     end if;
 
                 --------------------------------------------------------
                 -- S_TOTAL_ZEROS: ROM lookup and emit
                 --------------------------------------------------------
                 when S_TOTAL_ZEROS =>
-                    if bp_ready = '1' then
-                        if pkt_q.nC = to_unsigned(31, 5) then
-                            -- Chroma DC table
-                            v_vlc := TOTAL_ZEROS_CHROMA_DC(total_coef - 1, total_zeros);
-                        else
-                            -- 4x4 luma table
-                            v_vlc := TOTAL_ZEROS_4x4(total_coef - 1, total_zeros);
-                        end if;
-                        bp_bits   <= resize(v_vlc.code, 32);
-                        bp_length <= resize(v_vlc.length, 6);
+                    if v_can_push then
+                        -- Entry was fetched from the ROM during the
+                        -- level states; luma/chroma selected by address.
+                        bp_bits   <= resize(rom_data.code, BP_W);
+                        bp_length <= resize(rom_data.length, 6);
                         bp_valid  <= '1';
-                        idx       <= total_coef - 1;
                         state     <= S_RUN_BEFORE;
                     end if;
 
                 --------------------------------------------------------
-                -- S_RUN_BEFORE: emit run codes from highest-freq down
-                -- idx counts from (total_coef-1) down to 1
+                -- S_RUN_BEFORE: emit run codes from highest-freq down.
+                -- idx counts from (total_coef-1) down to 1; pos walks the
+                -- nonzero positions in step with it.
                 --------------------------------------------------------
                 when S_RUN_BEFORE =>
                     if idx < 1 or total_zeros = 0 then
@@ -500,13 +620,11 @@ begin
                         else
                             state <= S_DONE;
                         end if;
-                    elsif bp_ready = '1' then
-                        -- Compute zeros_left (remaining zeros to distribute)
-                        -- and run for this position
-                        v_run := nz_pos(idx) - nz_pos(idx - 1) - 1;
-                        -- zeros_left = total_zeros minus runs already emitted
-                        -- We track this via total_zeros signal (decremented each iter)
-                        v_zeros_left := total_zeros;
+                    elsif v_can_push then
+                        -- run = zeros between this nonzero and the next
+                        -- lower one. zeros_left is tracked in total_zeros
+                        -- (decremented each iteration).
+                        v_run := pos - v_next_pos - 1;
                         v_zl_idx := total_zeros;
                         if v_zl_idx > 6 then
                             v_zl_idx := 6;
@@ -514,18 +632,23 @@ begin
                             v_zl_idx := v_zl_idx - 1;
                         end if;
                         v_vlc := RUN_BEFORE_TAB(v_zl_idx, v_run);
-                        bp_bits   <= resize(v_vlc.code, 32);
+                        bp_bits   <= resize(v_vlc.code, BP_W);
                         bp_length <= resize(v_vlc.length, 6);
                         bp_valid  <= '1';
                         total_zeros <= total_zeros - v_run;
                         idx <= idx - 1;
+                        pos <= v_next_pos;
                     end if;
 
                 --------------------------------------------------------
                 -- S_DRAIN: flush bit packer (end of slice)
                 --------------------------------------------------------
                 when S_DRAIN =>
-                    bp_flush <= '1';
+                    -- Flush only once no field is pending (packer requires
+                    -- flush_i with valid_i = '0').
+                    if bp_valid = '0' then
+                        bp_flush <= '1';
+                    end if;
                     if bp_flushed = '1' then
                         -- synthesis translate_off
                         report "ENGINE: S_DRAIN->S_DONE (flushed) at " &

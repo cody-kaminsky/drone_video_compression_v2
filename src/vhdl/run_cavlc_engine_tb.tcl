@@ -8,6 +8,7 @@
 # Or standalone xsim commands:
 #   xvhdl --2008 src/vhdl/cavlc_pkg.vhd
 #   xvhdl --2008 src/vhdl/cavlc_tables.vhd
+#   xvhdl --2008 src/vhdl/cavlc_vlc_rom.vhd
 #   xvhdl --2008 src/vhdl/coeff_token_encoder.vhd
 #   xvhdl --2008 src/vhdl/bit_packer.vhd
 #   xvhdl --2008 src/vhdl/cavlc_engine.vhd

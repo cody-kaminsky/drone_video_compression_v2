@@ -11,8 +11,9 @@
 --   n_in_accum  : number of valid bits currently held (0..64).
 --
 -- Producer rules:
---   - bits_i is right-aligned in 32 bits; only the low length_i bits matter.
---     CALLER MUST ENSURE upper (32 - length_i) bits are zero.
+--   - bits_i is right-aligned in DATA_W bits; only the low length_i bits
+--     matter. CALLER MUST ENSURE bits above length_i are zero. length_i
+--     may exceed DATA_W (the extra high bits are implied zeros).
 --   - length_i in 0..32. length_i = 0 with valid_i = '1' is a no-op handshake.
 --   - ready_o = '1' iff state = NORMAL and n_in_accum <= 32. With max input
 --     of 32 bits, that guarantees room (n_in_accum + 32 <= 64).
@@ -38,12 +39,18 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity bit_packer is
+    generic (
+        -- Width of the producer data path. The field VALUE must fit in
+        -- DATA_W bits; length_i may still be up to 32 (leading zeros are
+        -- implied). CAVLC fields never exceed 16 significant bits.
+        DATA_W : positive := 32
+    );
     port (
         clk       : in  std_logic;
         rst_n     : in  std_logic;
 
         -- Producer side: variable-length bit field
-        bits_i    : in  unsigned(31 downto 0);
+        bits_i    : in  unsigned(DATA_W - 1 downto 0);
         length_i  : in  unsigned(5 downto 0);
         valid_i   : in  std_logic;
         ready_o   : out std_logic;
@@ -181,7 +188,6 @@ begin
                     if n_v = 0 and not did_emit and out_valid_q = '0' then
                         state     <= S_NORMAL;
                         flushed_q <= '1';
-                        end if;
                     end if;
                 end if;
 
