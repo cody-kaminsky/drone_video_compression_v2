@@ -63,7 +63,12 @@ entity bit_packer is
         out_data  : out unsigned(7 downto 0);
         out_valid : out std_logic;
         out_ready : in  std_logic;
-        out_last  : out std_logic
+        out_last  : out std_logic;
+        -- Bits accepted since the last flush completed. Final (no pushes
+        -- are accepted while flushing) from the moment flush_i is seen
+        -- until flushed_o, so a merger can trim the zero-padded last byte
+        -- of a flush group: valid bits in it = block_bits_o mod 8 (8 if 0).
+        block_bits_o : out unsigned(15 downto 0)
     );
 end entity;
 
@@ -81,6 +86,7 @@ architecture rtl of bit_packer is
     signal flushed_q   : std_logic;
 
     signal ready_int : std_logic;
+    signal blk_bits  : unsigned(15 downto 0);
 
 begin
 
@@ -90,6 +96,7 @@ begin
     out_valid <= out_valid_q;
     out_last  <= out_last_q;
     flushed_o <= flushed_q;
+    block_bits_o <= blk_bits;
 
     process(clk)
         variable n_v       : integer range 0 to 64;
@@ -101,6 +108,7 @@ begin
         variable len_int   : integer range 0 to 32;
         variable shift_amt : integer range 0 to 64;
         variable do_accept : boolean;
+        variable blk_base  : unsigned(15 downto 0);
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
@@ -111,8 +119,17 @@ begin
                 out_valid_q <= '0';
                 out_last_q  <= '0';
                 flushed_q   <= '0';
+                blk_bits    <= (others => '0');
             else
                 flushed_q <= '0';
+                -- Per-flush-group bit count: restart the cycle after the
+                -- flush completes (a push may be accepted that same cycle).
+                if flushed_q = '1' then blk_base := (others => '0'); else blk_base := blk_bits; end if;
+                if valid_i = '1' and ready_int = '1' then
+                    blk_bits <= blk_base + resize(length_i, 16);
+                else
+                    blk_bits <= blk_base;
+                end if;
 
                 accum_v := accum;
                 n_v     := n_in_accum;

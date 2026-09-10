@@ -60,7 +60,13 @@ entity cavlc_engine is
         out_valid : out std_logic;
         out_ready : in  std_logic;
         out_data  : out unsigned(7 downto 0);
-        out_last  : out std_logic
+        out_last  : out std_logic;
+        -- Bits in the current flush group (see bit_packer.block_bits_o) and
+        -- the packer's flush-complete pulse (one cycle after the group's
+        -- last byte was taken). Together they let a merger find a block's
+        -- boundary and trim its zero-padded last byte.
+        block_bits_o : out unsigned(15 downto 0);
+        flushed_o    : out std_logic
     );
 end entity;
 
@@ -107,6 +113,9 @@ architecture rtl of cavlc_engine is
     -- Levels and run_before are both emitted from the highest-frequency
     -- nonzero downward, so one pointer serves both loops.
     signal pos : integer range 0 to 15;
+    -- level at pos, captured when pos is set so the 16:1 level mux is off
+    -- the level-code path
+    signal cur_level : signed(12 downto 0);
 
     -- Loop counter (nonzeros processed so far / remaining)
     signal idx : integer range 0 to 15;
@@ -144,6 +153,7 @@ architecture rtl of cavlc_engine is
     signal bp_valid   : std_logic;
     signal bp_ready   : std_logic;
     signal bp_flush   : std_logic;
+    signal flush_sent : std_logic;
     signal bp_flushed : std_logic;
 
     signal bp_out_data  : unsigned(7 downto 0);
@@ -277,12 +287,14 @@ begin
             out_data  => bp_out_data,
             out_valid => bp_out_valid,
             out_ready => out_ready,
-            out_last  => bp_out_last
+            out_last  => bp_out_last,
+            block_bits_o => block_bits_o
         );
 
     out_data  <= bp_out_data;
     out_valid <= bp_out_valid;
     out_last  <= bp_out_last;
+    flushed_o <= bp_flushed;
 
     ------------------------------------------------------------------
     -- Handshake
@@ -318,6 +330,8 @@ begin
         -- until bp_ready is seen (AXI-style), so a push is never dropped
         -- when the packer's ready falls after a long (up to 28-bit) field.
         variable v_can_push      : boolean;
+        variable v_pos_new  : integer range 0 to 15;
+        variable v_pos_upd  : boolean;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
@@ -339,12 +353,15 @@ begin
                 bp_length    <= (others => '0');
                 bp_valid     <= '0';
                 bp_flush     <= '0';
+                flush_sent   <= '0';
             else
                 -- Defaults: deassert one-shot signals
                 ct_valid_i <= '0';
                 bp_flush   <= '0';
 
                 -- bp_valid is held until the packer accepts the field.
+                v_pos_upd  := false;
+                v_pos_new  := 0;
                 v_can_push := (bp_valid = '0') or (bp_ready = '1');
                 if bp_ready = '1' then
                     bp_valid <= '0';
@@ -435,6 +452,7 @@ begin
                     end if;
                     first_non_t1 <= '1';
                     pos <= v_last_nz;
+                    v_pos_new := v_last_nz; v_pos_upd := true;
                     idx <= 0;
 
                     state <= S_COEFF_TOKEN;
@@ -499,11 +517,12 @@ begin
                     elsif v_can_push then
                         -- Sign bit: 1 = negative, 0 = positive
                         bp_bits    <= (others => '0');
-                        bp_bits(0) <= pkt_q.levels(pos)(15);
+                        bp_bits(0) <= cur_level(12);
                         bp_length  <= to_unsigned(1, 6);
                         bp_valid   <= '1';
                         idx <= idx + 1;
                         pos <= v_next_pos;
+                        v_pos_new := v_next_pos; v_pos_upd := true;
                     end if;
 
                 --------------------------------------------------------
@@ -514,6 +533,7 @@ begin
                         -- All levels emitted; restart the walk for
                         -- run_before (idx counts down from TC-1 to 1).
                         pos <= last_nz;
+                        v_pos_new := last_nz; v_pos_upd := true;
                         idx <= total_coef - 1;
                         if total_coef < to_integer(pkt_q.n_coefs) then
                             state <= S_TOTAL_ZEROS;
@@ -521,7 +541,7 @@ begin
                             state <= S_RUN_BEFORE;
                         end if;
                     elsif v_can_push then
-                        v_level := pkt_q.levels(pos)(12 downto 0);
+                        v_level := cur_level;
 
                         -- level_code = 2*(|L|-1) + (L<0), without a negate:
                         --   L > 0 : 2L - 2
@@ -592,6 +612,7 @@ begin
 
                         idx <= idx + 1;
                         pos <= v_next_pos;
+                        v_pos_new := v_next_pos; v_pos_upd := true;
                     end if;
 
                 --------------------------------------------------------
@@ -638,6 +659,7 @@ begin
                         total_zeros <= total_zeros - v_run;
                         idx <= idx - 1;
                         pos <= v_next_pos;
+                        v_pos_new := v_next_pos; v_pos_upd := true;
                     end if;
 
                 --------------------------------------------------------
@@ -645,11 +667,15 @@ begin
                 --------------------------------------------------------
                 when S_DRAIN =>
                     -- Flush only once no field is pending (packer requires
-                    -- flush_i with valid_i = '0').
-                    if bp_valid = '0' then
-                        bp_flush <= '1';
+                    -- flush_i with valid_i = '0'), and only once: a second
+                    -- pulse after flushed_o would start a spurious empty
+                    -- flush group (and a second flushed_o pulse).
+                    if bp_valid = '0' and flush_sent = '0' then
+                        bp_flush   <= '1';
+                        flush_sent <= '1';
                     end if;
                     if bp_flushed = '1' then
+                        flush_sent <= '0';
                         -- synthesis translate_off
                         report "ENGINE: S_DRAIN->S_DONE (flushed) at " &
                                time'image(now) severity note;
@@ -667,6 +693,13 @@ begin
                     state <= S_IDLE;
 
                 end case;
+
+                -- One shared level mux: capture the level of the position
+                -- just selected, so the level-code path starts from a
+                -- register instead of a 16:1 mux.
+                if v_pos_upd then
+                    cur_level <= pkt_q.levels(v_pos_new)(12 downto 0);
+                end if;
             end if;
         end if;
     end process;

@@ -43,7 +43,7 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: all ref hls clean test vectors bit_packer_vectors transform_vectors
+.PHONY: all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
@@ -51,6 +51,13 @@ hls: $(BIN_HLS)
 vectors: $(BUILD)/gen_cavlc_vectors
 bit_packer_vectors: $(BUILD)/bit_packer_vectors_in.txt
 transform_vectors: $(BUILD)/transform_vectors.txt
+quant_vectors: $(BUILD)/quant_vectors.txt
+predict_vectors: $(BUILD)/predict4x4_vectors.txt
+cavlc_cost_vectors: $(BUILD)/cavlc_cost_vectors.txt
+recon_vectors: $(BUILD)/recon_vectors.txt
+line_buffer_vectors: $(BUILD)/line_buffer_vectors.txt
+mb_header_vectors: $(BUILD)/mb_header_vectors.txt
+dispatch_vectors: $(BUILD)/dispatch_vectors_in.txt
 
 # CAVLC vector generator for the VHDL CAVLC engine testbench. Links against
 # the shared kernel (just needs cavlc.c + bitstream.c).
@@ -69,6 +76,55 @@ $(BUILD)/gen_transform_vectors: tools/gen_transform_vectors.c \
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
 
 $(BUILD)/transform_vectors.txt: $(BUILD)/gen_transform_vectors
+	./$<
+
+# Quant vector generator. Links against quant.c only.
+$(BUILD)/gen_quant_vectors: tools/gen_quant_vectors.c $(BUILD)/quant.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/quant_vectors.txt: $(BUILD)/gen_quant_vectors
+	./$<
+
+# Intra prediction vector generator (4x4, 16x16, chroma). Links intra.c.
+$(BUILD)/gen_predict_vectors: tools/gen_predict_vectors.c $(BUILD)/intra.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/predict4x4_vectors.txt: $(BUILD)/gen_predict_vectors
+	./$<
+
+# CAVLC cost (mode-decision bit estimate) vector generator.
+$(BUILD)/gen_cavlc_cost_vectors: tools/gen_cavlc_cost_vectors.c                                  $(BUILD)/cavlc.o $(BUILD)/bitstream.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/cavlc_cost_vectors.txt: $(BUILD)/gen_cavlc_cost_vectors
+	./$<
+
+# Reconstruction (+SSD) vector generator.
+$(BUILD)/gen_recon_vectors: tools/gen_recon_vectors.c | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $<
+
+$(BUILD)/recon_vectors.txt: $(BUILD)/gen_recon_vectors
+	./$<
+
+# Line buffer vectors: drives the HLS line_buffer_t directly.
+$(BUILD)/gen_line_buffer_vectors: tools/gen_line_buffer_vectors.c $(HLS_DIR)/line_buffer.c | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -I$(HLS_DIR) -o $@ $^
+
+$(BUILD)/line_buffer_vectors.txt: $(BUILD)/gen_line_buffer_vectors
+	./$<
+
+# MB header vectors.
+$(BUILD)/gen_mb_header_vectors: tools/gen_mb_header_vectors.c $(BUILD)/bitstream.o | $(BUILD)
+	$(CC) $(CFLAGS) -Wno-unused-const-variable -Wno-unused-variable -I$(SRC_DIR) -o $@ $^
+
+$(BUILD)/mb_header_vectors.txt: $(BUILD)/gen_mb_header_vectors
+	./$<
+
+# CAVLC dispatch / merge vectors.
+$(BUILD)/gen_dispatch_vectors: tools/gen_dispatch_vectors.c $(BUILD)/cavlc.o $(BUILD)/bitstream.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/dispatch_vectors_in.txt: $(BUILD)/gen_dispatch_vectors
 	./$<
 
 # Generate vectors. The C tool writes both files; we touch one to mark
