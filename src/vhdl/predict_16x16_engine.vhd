@@ -12,7 +12,7 @@
 -- Sample buses: sample k at bits (8k+7 downto 8k).
 --   top_i : 16 samples   left_i : 16 samples   tl_i : 1   pred_o : 16
 --
--- Pipeline: 7 cycles latency, II=1, single global stall. The plane
+-- Pipeline: 8 cycles latency (input register + 7 stages), II=1, single global stall. The plane
 -- parameters are a long dependent chain (8-term weighted sums, x5, the
 -- block offset, then per-sample sums), so they are spread over shallow
 -- stages with explicit adder trees:
@@ -109,6 +109,17 @@ architecture rtl of predict_16x16_engine is
 
     signal advance : std_logic;
 
+    -- input register stage: the DC / plane sums start from registers, not
+    -- from whatever drives the ports (keeps the s1 adder trees off any
+    -- upstream mux path). Adds one cycle of latency (8 total).
+    signal top_r, left_r : std_logic_vector(127 downto 0) := (others => '0');
+    signal tl_r          : std_logic_vector(7 downto 0) := (others => '0');
+    signal mode_r        : unsigned(1 downto 0) := (others => '0');
+    signal blk_r         : unsigned(3 downto 0) := (others => '0');
+    signal at_r, al_r, atl_r, v_r : std_logic := '0';
+    signal st1, sl1 : unsigned(12 downto 0) := (others => '0');
+    signal at1, al1 : std_logic := '0';
+
 begin
 
     advance <= ready_i or not ctl(NST).valid;
@@ -130,46 +141,45 @@ begin
     begin
         if rst_n = '0' then
             for k in 1 to NST loop ctl(k).valid <= '0'; end loop;
+            v_r <= '0';
         elsif rising_edge(clk) then
             if advance = '1' then
+                top_r <= top_i; left_r <= left_i; tl_r <= tl_i;
+                mode_r <= mode_i; blk_r <= blk_i;
+                at_r <= avail_top_i; al_r <= avail_left_i; atl_r <= avail_tl_i;
+                v_r <= valid_i;
                 ----------------------------------------------------------
                 -- s1
                 ----------------------------------------------------------
-                top := get16(top_i);
-                lft := get16(left_i);
-                tl  := unsigned(tl_i);
-                bx  := to_integer(blk_i(1 downto 0));
-                by  := to_integer(blk_i(3 downto 2));
+                top := get16(top_r);
+                lft := get16(left_r);
+                tl  := unsigned(tl_r);
+                bx  := to_integer(blk_r(1 downto 0));
+                by  := to_integer(blk_r(3 downto 2));
 
+                -- DC: the two 16-sample sums here, the combine in s2
                 st := (others => '0'); sl := (others => '0');
                 for k in 0 to 15 loop
                     st := st + resize(top(k), 13);
                     sl := sl + resize(lft(k), 13);
                 end loop;
-                if avail_top_i = '1' and avail_left_i = '1' then
-                    st := st + sl + 16;  c1.dc := st(12 downto 5);
-                elsif avail_top_i = '1' then
-                    st := st + 8;        c1.dc := st(11 downto 4);
-                elsif avail_left_i = '1' then
-                    sl := sl + 8;        c1.dc := sl(11 downto 4);
-                else
-                    c1.dc := x"80";
-                end if;
+                st1 <= st; sl1 <= sl; at1 <= at_r; al1 <= al_r;
+                c1.dc := x"80";
 
-                c1.mode := mode_i;
-                if (mode_i = 0 and avail_top_i = '0') or
-                   (mode_i = 1 and avail_left_i = '0') or
-                   (mode_i = 3 and not (avail_top_i = '1' and avail_left_i = '1'
-                                        and avail_tl_i = '1')) then
+                c1.mode := mode_r;
+                if (mode_r = 0 and at_r = '0') or
+                   (mode_r = 1 and al_r = '0') or
+                   (mode_r = 3 and not (at_r = '1' and al_r = '1'
+                                        and atl_r = '1')) then
                     c1.mode := "10";
                 end if;
-                c1.bx := blk_i(1 downto 0);
-                c1.by := blk_i(3 downto 2);
+                c1.bx := blk_r(1 downto 0);
+                c1.by := blk_r(3 downto 2);
                 for k in 0 to 3 loop
                     c1.vcol(k) := top(4 * bx + k);
                     c1.hrow(k) := lft(4 * by + k);
                 end loop;
-                c1.valid := valid_i;
+                c1.valid := v_r;
                 ctl(1) <= c1;
 
                 for i in 0 to 6 loop
@@ -203,6 +213,15 @@ begin
                 V2 <= (n1 + n2) + (n3 + n4);
                 a16_2 <= a16_1;
                 ctl(2) <= ctl(1);
+                if at1 = '1' and al1 = '1' then
+                    st := st1 + sl1 + 16;  ctl(2).dc <= st(12 downto 5);
+                elsif at1 = '1' then
+                    st := st1 + 8;         ctl(2).dc <= st(11 downto 4);
+                elsif al1 = '1' then
+                    sl := sl1 + 8;         ctl(2).dc <= sl(11 downto 4);
+                else
+                    ctl(2).dc <= x"80";
+                end if;
 
                 ----------------------------------------------------------
                 -- s3: b = (5H + 32) >> 6, c likewise

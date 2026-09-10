@@ -43,7 +43,7 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors
+.PHONY: all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
@@ -58,6 +58,8 @@ recon_vectors: $(BUILD)/recon_vectors.txt
 line_buffer_vectors: $(BUILD)/line_buffer_vectors.txt
 mb_header_vectors: $(BUILD)/mb_header_vectors.txt
 dispatch_vectors: $(BUILD)/dispatch_vectors_in.txt
+mode_decide_vectors: $(BUILD)/mode_decide_vectors.txt
+pipeline_vectors: $(BUILD)/slice_payload.txt
 
 # CAVLC vector generator for the VHDL CAVLC engine testbench. Links against
 # the shared kernel (just needs cavlc.c + bitstream.c).
@@ -126,6 +128,20 @@ $(BUILD)/gen_dispatch_vectors: tools/gen_dispatch_vectors.c $(BUILD)/cavlc.o $(B
 
 $(BUILD)/dispatch_vectors_in.txt: $(BUILD)/gen_dispatch_vectors
 	./$<
+
+# Mode-decision vectors: per-MB records dumped by the reference encoder on a
+# natural test frame (needs ffmpeg for the PNG -> NV12 conversion).
+$(BUILD)/mode_decide_vectors.txt: $(BIN_REF) tools/frames/old_town_cross_480x272.png
+	ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png -pix_fmt nv12 -f rawvideo $(BUILD)/md_frame.yuv
+	rm -f $@
+	for qp in 26 20 34; do DCC_DUMP_MB=$@ DCC_DUMP_N=510 $(BIN_REF) $(BUILD)/md_frame.yuv 480 272 $$qp > /dev/null; done
+
+# Frame-level vectors for mb_pipeline_controller_tb / encoder_top_tb: the
+# source blocks, the pixel stream and the slice payload the reference emits.
+$(BUILD)/slice_payload.txt: $(BIN_REF) tools/frames/old_town_cross_480x272.png tools/gen_frame_stream.py
+	ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png -pix_fmt nv12 -f rawvideo $(BUILD)/md_frame.yuv
+	DCC_DUMP_SRC=$(BUILD)/frame_src_words.txt DCC_DUMP_SLICE=$@ $(BIN_REF) $(BUILD)/md_frame.yuv 480 272 26 > /dev/null
+	python tools/gen_frame_stream.py $(BUILD)/md_frame.yuv 480 272 $(BUILD)/frame_stream.txt
 
 # Generate vectors. The C tool writes both files; we touch one to mark
 # completion (the tool runs in $(BUILD)/.. since paths in the tool are

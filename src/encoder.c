@@ -22,8 +22,11 @@
 #include "bitstream.h"
 #include "nal.h"
 #include "mb_state.h"
+#include "rd_tables.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 /* ===== static arena =====
  * Bounded per-frame buffers, sized for the architecture max (MAX_W x MAX_H).
@@ -476,63 +479,97 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
                              stride_recon_y, recon_mb_out,
                              top, left, &tl, &at, &al, &atl);
 
-        /* Pick best mode by SATD. */
-        int best_mode = I4_DC, best_cost = INT32_MAX;
-        u8 best_pred[16], pred[16];
+        /* ---- I_4x4 mode decision: SATD screen -> shortlist -> RD ----
+         * See rd_tables.h for the policy and constants. Everything is
+         * integer so the VHDL mode decider can match it exactly. */
+        int cand_mode[9], cand_cost[9], ncand = 0;
+        u8  cand_pred[9][16];
+
+        /* predIntra4x4PredMode (spec 8.3.1.1) for the mode-bit penalty. */
+        int pred_mode;
+        {
+            int top_ok = 0, left_ok = 0, mode_top = I4_DC, mode_left = I4_DC;
+            if (br > 0)        { mode_top = modes4_out[(br-1)*4 + bc]; top_ok = 1; }
+            else if (mb_r > 0) { mode_top = arena_luma_mode4[(mb_r*4 - 1) * (mbs_w * 4) + (mb_c*4 + bc)]; top_ok = 1; }
+            if (bc > 0)        { mode_left = modes4_out[br*4 + bc - 1]; left_ok = 1; }
+            else if (mb_c > 0) { mode_left = arena_luma_mode4[(mb_r*4 + br) * (mbs_w * 4) + (mb_c*4 - 1)]; left_ok = 1; }
+            pred_mode = (!top_ok || !left_ok) ? I4_DC : (mode_top < mode_left ? mode_top : mode_left);
+        }
+
         for (int m = 0; m < 9; m++) {
             if ((m == I4_VERTICAL || m == I4_DIAG_DOWN_LEFT ||
                  m == I4_VERTICAL_LEFT) && !at)  continue;
             if ((m == I4_HORIZONTAL || m == I4_HORIZONTAL_UP) && !al) continue;
             if ((m == I4_DIAG_DOWN_RIGHT || m == I4_VERTICAL_RIGHT ||
                  m == I4_HORIZONTAL_DOWN) && !(at && al && atl)) continue;
+            u8 *pred = cand_pred[ncand];
             predict_4x4(m, top, left, tl, at, al, atl, pred);
-
-            /* SATD on residual via 4x4 Hadamard. */
-            i16 r[16];
+            i32 ri32[16], satd_out[16];
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++) {
                     int idx = (br*4 + i) * 16 + (bc*4 + j);
-                    r[i*4 + j] = (i16)((int)src_mb[idx] - (int)pred[i*4 + j]);
+                    ri32[i*4 + j] = (int)src_mb[idx] - (int)pred[i*4 + j];
                 }
-            i32 ri32[16], satd_out[16];
-            for (int k = 0; k < 16; k++) ri32[k] = r[k];
             ihadamard4x4(ri32, satd_out);
             int cost = 0;
             for (int k = 0; k < 16; k++) cost += abs_i(satd_out[k]);
-            cost += 4 << (qp / 6);   /* lambda penalty for mode bits */
+            cost += (RD_SLAM16[qp] * ((m == pred_mode) ? 1 : 4) + 8) >> 4;
+            cand_mode[ncand] = m; cand_cost[ncand] = cost; ncand++;
+        }
+        /* Stable insertion sort by screen cost (ties keep mode order). */
+        int order[9];
+        for (int k = 0; k < ncand; k++) {
+            int p = k;
+            while (p > 0 && cand_cost[order[p-1]] > cand_cost[k]) { order[p] = order[p-1]; p--; }
+            order[p] = k;
+        }
+        int nfull = (RD_I4_SHORTLIST < ncand) ? RD_I4_SHORTLIST : ncand;
 
-            if (cost < best_cost) {
-                best_cost = cost;
-                best_mode = m;
-                memcpy(best_pred, pred, 16);
+        int best_mode = I4_DC, best_bits = 0;
+        long best_j = 0x7fffffffL;
+        i16 best_levels[16];
+        u8  best_recon[16];
+        for (int k = 0; k < nfull; k++) {
+            int ci = order[k];
+            int m = cand_mode[ci];
+            const u8 *pred = cand_pred[ci];
+            i16 res[16], dct[16], levels[16], zz[16];
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) {
+                    int idx = (br*4 + i) * 16 + (bc*4 + j);
+                    res[i*4 + j] = (i16)((int)src_mb[idx] - (int)pred[i*4 + j]);
+                }
+            dct4x4(res, dct);
+            quant_4x4(dct, levels, qp, 1);
+            zigzag_4x4(levels, zz);
+            int rbits = cavlc_estimate_block_bits(zz, 16, BLK_LUMA_FULL, 0);
+            int mbits = (m == pred_mode) ? 1 : 4;
+            i32 dq[16], rr[16];
+            iquant_4x4(levels, dq, qp);
+            idct4x4(dq, rr);
+            u8 rec[16];
+            long ssd = 0;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) {
+                    int idx = (br*4 + i) * 16 + (bc*4 + j);
+                    int v = clip_u8(pred[i*4 + j] + ((rr[i*4 + j] + 32) >> 6));
+                    rec[i*4 + j] = (u8)v;
+                    int d = v - (int)src_mb[idx];
+                    ssd += (long)d * d;
+                }
+            long j = 16L * ssd + (long)RD_LAM16[qp] * (rbits + mbits);
+            if (j < best_j) {
+                best_j = j; best_mode = m; best_bits = rbits;
+                memcpy(best_levels, levels, sizeof levels);
+                memcpy(best_recon, rec, sizeof rec);
             }
         }
-        /* Store in raster order (br*4+bc) to match mb_state_t::modes4 convention. */
         modes4_out[br*4 + bc] = best_mode;
-
-        /* Forward path */
-        i16 res[16], dct[16], levels[16];
+        memcpy(ac_levels_out[br*4 + bc], best_levels, sizeof best_levels);
         for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) {
-                int idx = (br*4 + i) * 16 + (bc*4 + j);
-                res[i*4 + j] = (i16)((int)src_mb[idx] - (int)best_pred[i*4 + j]);
-            }
-        dct4x4(res, dct);
-        quant_4x4(dct, levels, qp, 1);
-        memcpy(ac_levels_out[br*4 + bc], levels, sizeof levels);
-
-        /* Inverse path → recon_mb_out (must complete before the next
-         * block's neighbor gather). */
-        i32 dq[16], res_recon[16];
-        iquant_4x4(levels, dq, qp);
-        idct4x4(dq, res_recon);
-        recon_4x4_local(recon_mb_out, best_pred, br, bc, res_recon);
-
-
-        /* Bit estimate (CAVLC zigzag, full 16 coefs). */
-        i16 zz[16];
-        zigzag_4x4(levels, zz);
-        bits += cavlc_estimate_block_bits(zz, 16, BLK_LUMA_FULL, 0);
+            for (int j = 0; j < 4; j++)
+                recon_mb_out[(br*4 + i) * 16 + (bc*4 + j)] = best_recon[i*4 + j];
+        bits += best_bits;
     }
 
     return bits;
@@ -631,6 +668,8 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
                                recon_y_frame, stride_recon_y,
                                modes4_b, ac_lev_b, recon_b);
 
+    st->dbg_bits_a = bits_a;
+    st->dbg_bits_b = bits_b;
     /* Pick winner. Tie favors I_16x16 (simpler MB header, faster decode). */
     if (bits_a <= bits_b) {
         st->mb_type_is_i4x4 = 0;
@@ -861,6 +900,115 @@ static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
     }
 }
 
+/* DCC_DUMP_SRC=<path>: per MB, 24 lines of 16 samples: the source blocks in
+ * the order the mb_pipeline_controller takes them (Y 0..15 raster, U 0..3,
+ * V 0..3; sample (r,c) of a block at position 4r+c). */
+static void dump_mb_src(const mb_state_t *st)
+{
+    static FILE *f = NULL; static int checked = 0;
+    if (!checked) { checked = 1; const char *p = getenv("DCC_DUMP_SRC"); if (p) f = fopen(p, "w"); }
+    if (!f) return;
+    for (int b = 0; b < 16; b++) {
+        for (int k = 0; k < 16; k++)
+            fprintf(f, "%d ", st->src_y[((b / 4) * 4 + k / 4) * 16 + (b % 4) * 4 + (k % 4)]);
+        fprintf(f, "\n");
+    }
+    for (int pl = 0; pl < 2; pl++) {
+        const u8 *src = pl ? st->src_v : st->src_u;
+        for (int b = 0; b < 4; b++) {
+            for (int k = 0; k < 16; k++)
+                fprintf(f, "%d ", src[((b / 2) * 4 + k / 4) * 8 + (b % 2) * 4 + (k % 4)]);
+            fprintf(f, "\n");
+        }
+    }
+    fflush(f);
+}
+
+/* ===== Per-MB vector dump for the VHDL mode_decide_engine testbench =====
+ * Enabled by DCC_DUMP_MB=<path> (append), at most DCC_DUMP_N MBs (default
+ * 200). One record per MB, all values decimal:
+ *   MB r c qp_y qp_c
+ *   SY 256 | SU 64 | SV 64                        source samples (row-major)
+ *   NY at al atl atr top16 left16 tl tr4          luma neighbours
+ *   NC at al atl cu_top8 cu_left8 cu_tl cv_top8 cv_left8 cv_tl
+ *   NM m4top4 m4left4                             (2 = DC where unavailable)
+ *   O is4 mode16 mode_chroma cbp_luma cbp_chroma modes4x16(raster)
+ *   LY 16x16 (raster blocks, raster coefs; I_4x4 full, I_16x16 AC with [0]=0)
+ *   LD 16 (I_16x16 DC levels, raster; zeros for I_4x4)
+ *   LU 4x16 | LV 4x16 | DU 4 | DV 4
+ *   RY 256 | RU 64 | RV 64                        reconstruction */
+#include <stdio.h>
+#include <stdlib.h>
+static void dump_arr_u8(FILE *f, const char *tag, const u8 *a, int n)
+{
+    fprintf(f, "%s", tag);
+    for (int i = 0; i < n; i++) fprintf(f, " %d", a[i]);
+    fprintf(f, "\n");
+}
+static void dump_mb_vector(const mb_state_t *st, const u8 *recon_y, int stride,
+                           int mbs_w, const nc_state_t *ncs)
+{
+    static FILE *f = NULL;
+    static int  checked = 0, limit = 200, count = 0;
+    if (!checked) {
+        checked = 1;
+        const char *p = getenv("DCC_DUMP_MB");
+        if (p) f = fopen(p, "a");
+        const char *n = getenv("DCC_DUMP_N");
+        if (n) limit = atoi(n);
+    }
+    if (!f || count >= limit) return;
+    count++;
+    fprintf(f, "MB %d %d %d %d\n", st->mb_r, st->mb_c, st->qp_y, st->qp_c);
+    dump_arr_u8(f, "SY", st->src_y, 256);
+    dump_arr_u8(f, "SU", st->src_u, 64);
+    dump_arr_u8(f, "SV", st->src_v, 64);
+    int atr = (st->mb_r > 0 && st->mb_c < mbs_w - 1);
+    fprintf(f, "NY %d %d %d %d", st->luma_avail_top, st->luma_avail_left, st->luma_avail_tl, atr);
+    for (int i = 0; i < 16; i++) fprintf(f, " %d", st->luma_avail_top ? st->luma_top[i] : 0);
+    for (int i = 0; i < 16; i++) fprintf(f, " %d", st->luma_avail_left ? st->luma_left[i] : 0);
+    fprintf(f, " %d", st->luma_tl);
+    for (int j = 0; j < 4; j++)
+        fprintf(f, " %d", atr ? recon_y[(st->mb_r*16 - 1) * stride + st->mb_c*16 + 16 + j] : 0);
+    fprintf(f, "\n");
+    fprintf(f, "NC %d %d %d", st->chroma_avail_top, st->chroma_avail_left, st->chroma_avail_tl);
+    for (int i = 0; i < 8; i++) fprintf(f, " %d", st->chroma_avail_top ? st->cu_top[i] : 0);
+    for (int i = 0; i < 8; i++) fprintf(f, " %d", st->chroma_avail_left ? st->cu_left[i] : 0);
+    fprintf(f, " %d", st->cu_tl);
+    for (int i = 0; i < 8; i++) fprintf(f, " %d", st->chroma_avail_top ? st->cv_top[i] : 0);
+    for (int i = 0; i < 8; i++) fprintf(f, " %d", st->chroma_avail_left ? st->cv_left[i] : 0);
+    fprintf(f, " %d\n", st->cv_tl);
+    fprintf(f, "NM");
+    for (int bc = 0; bc < 4; bc++)
+        fprintf(f, " %d", st->mb_r > 0 ? ncs->luma_mode4[(st->mb_r*4 - 1) * ncs->luma_w4 + st->mb_c*4 + bc] : 2);
+    for (int br = 0; br < 4; br++)
+        fprintf(f, " %d", st->mb_c > 0 ? ncs->luma_mode4[(st->mb_r*4 + br) * ncs->luma_w4 + st->mb_c*4 - 1] : 2);
+    fprintf(f, "\n");
+    fprintf(f, "B %d %d\n", st->dbg_bits_a, st->dbg_bits_b);
+    fprintf(f, "O %d %d %d %d %d", st->mb_type_is_i4x4, st->mode16, st->mode_chroma, st->cbp_luma, st->cbp_chroma);
+    for (int i = 0; i < 16; i++) fprintf(f, " %d", st->mb_type_is_i4x4 ? st->modes4[i] : 0);
+    fprintf(f, "\n");
+    fprintf(f, "LY");
+    for (int b = 0; b < 16; b++)
+        for (int k = 0; k < 16; k++)
+            fprintf(f, " %d", st->mb_type_is_i4x4 ? st->ac_levels_y_full[b][k] : st->ac_levels_y[b][k]);
+    fprintf(f, "\nLD");
+    for (int k = 0; k < 16; k++) fprintf(f, " %d", st->mb_type_is_i4x4 ? 0 : st->dc_levels_y[k]);
+    fprintf(f, "\nLU");
+    for (int b = 0; b < 4; b++) for (int k = 0; k < 16; k++) fprintf(f, " %d", st->ac_levels_u[b][k]);
+    fprintf(f, "\nLV");
+    for (int b = 0; b < 4; b++) for (int k = 0; k < 16; k++) fprintf(f, " %d", st->ac_levels_v[b][k]);
+    fprintf(f, "\nDU");
+    for (int k = 0; k < 4; k++) fprintf(f, " %d", st->dc_levels_u[k]);
+    fprintf(f, "\nDV");
+    for (int k = 0; k < 4; k++) fprintf(f, " %d", st->dc_levels_v[k]);
+    fprintf(f, "\n");
+    dump_arr_u8(f, "RY", st->recon_y, 256);
+    dump_arr_u8(f, "RU", st->recon_u, 64);
+    dump_arr_u8(f, "RV", st->recon_v, 64);
+    fflush(f);
+}
+
 /* === stage 7: mb_cavlc_emit ===
  * Emit the macroblock layer to the slice bitstream. Order matches H.264
  * spec 7.3.5.1. Two distinct paths depending on st->mb_type_is_i4x4:
@@ -877,6 +1025,22 @@ static void emit_intra4x4_mode(bitstream_t *bs, int blk_scan_idx,
  *
  * Always updates ncs->luma_nc / luma_mode4 / chroma_*_nc so subsequent MBs
  * see correct neighbor state. Architecture.txt §8 "CAVLC + bit pack". */
+/* DCC_DUMP_ITEMS=<path>: every residual block handed to the CAVLC encoder,
+ * in emission order: "B <bt> <n> <nC> <levels...>" (DCC_DUMP_ITEMS_N blocks). */
+static int dbg_encode_block(bitstream_t *bs, const i16 *c, int n, block_type_t bt, int nC)
+{
+    static FILE *f = NULL; static int checked = 0, limit = 200, cnt = 0;
+    if (!checked) { checked = 1; const char *p = getenv("DCC_DUMP_ITEMS"); if (p) f = fopen(p, "w");
+                    const char *l = getenv("DCC_DUMP_ITEMS_N"); if (l) limit = atoi(l); }
+    if (f && cnt < limit) {
+        cnt++;
+        fprintf(f, "B %d %d %d", (int)bt, n, nC);
+        for (int i = 0; i < n; i++) fprintf(f, " %d", c[i]);
+        fprintf(f, "\n"); fflush(f);
+    }
+    return cavlc_encode_block(bs, c, n, bt, nC);
+}
+
 static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 {
     int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
@@ -933,7 +1097,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
                 int quad_bit = (st->cbp_luma >> (s / 4)) & 1;
                 if (quad_bit)
-                    cavlc_encode_block(bs, zz, 16, BLK_LUMA_FULL, nC);
+                    dbg_encode_block(bs, zz, 16, BLK_LUMA_FULL, nC);
                 /* nC count: full 16-coef when emitted, 0 when skipped (the
                  * spec reads totalCoeff of 0 from blocks not emitted). */
                 ncs->luma_nc[gy * luma_w4 + gx] = quad_bit ? count_nonzero(zz, 16) : 0;
@@ -942,8 +1106,8 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
             /* Chroma DC */
             if (st->cbp_chroma >= 1) {
-                cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
-                cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+                dbg_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+                dbg_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
             }
 
             /* Chroma AC */
@@ -962,7 +1126,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
                         int left_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
                         int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
                         if (st->cbp_chroma == 2)
-                            cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                            dbg_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
                         cnc[gy * chroma_w4 + gx] =
                             (st->cbp_chroma == 2) ? count_nonzero(&zz[1], 15) : 0;
                     }
@@ -1007,7 +1171,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
         i16 zz[16];
         for (int k = 0; k < 16; k++) zz[k] = st->dc_levels_y[zz_scan_4x4[k]];
-        cavlc_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
+        dbg_encode_block(bs, zz, 16, BLK_LUMA_DC_16x16, nC);
     }
 
     /* Luma AC blocks in I_4x4 sub-block scan order. */
@@ -1027,7 +1191,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
         int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
 
         if (st->cbp_luma)
-            cavlc_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
+            dbg_encode_block(bs, &zz[1], 15, BLK_LUMA_AC, nC);
         ncs->luma_nc[gy * luma_w4 + gx] = count_nonzero(&zz[1], 15);
         /* I_16x16 blocks store I4_DC: spec 8.3.1.1 says an I_16x16 neighbor
          * contributes effective intraMxMPredMode = 2 (DC) to the Min(). */
@@ -1036,8 +1200,8 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
 
     /* Chroma DC: emitted in U,V order whenever cbp_chroma >= 1. */
     if (st->cbp_chroma >= 1) {
-        cavlc_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
-        cavlc_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+        dbg_encode_block(bs, st->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+        dbg_encode_block(bs, st->dc_levels_v, 4, BLK_CHROMA_DC, -1);
     }
 
     /* Chroma AC */
@@ -1058,7 +1222,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
                 int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
 
                 if (st->cbp_chroma == 2)
-                    cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                    dbg_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
                 cnc[gy * chroma_w4 + gx] = count_nonzero(&zz[1], 15);
             }
     }
@@ -1471,6 +1635,7 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
     mb_fetch(src_y, stride_y, src_uv, stride_uv,
              recon_y, recon_stride_y, recon_uv, recon_stride_uv,
              width, height, &st);
+    dump_mb_src(&st);
     /* mb_mode_decide does the full luma encode internally (it has to —
      * I_4x4's per-block dependency chain forces forward+inverse to run
      * inline with mode picking). It needs the recon plane for I_4x4's
@@ -1488,6 +1653,8 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                                st.recon_u, st.recon_v);
 
     mb_compute_cbp(&st);
+
+    dump_mb_vector(&st, recon_y, recon_stride_y, mbs_w, ncs);
 
 #ifdef MB_SELFDECODE
     int mb_start_bit = bs->byte_pos * 8 + bs->n_in_cur;
@@ -1581,12 +1748,38 @@ int encode_frame_h264(int width, int height, int qp,
 #endif
 
     /* Per-MB encoding into the slice RBSP */
+    int payload_start_bit = bs.byte_pos * 8 + bs.n_in_cur;
     for (int r = 0; r < mbs_h; r++) {
         for (int c = 0; c < mbs_w; c++) {
             encode_mb_emit(src_y, stride_y, src_uv, stride_uv,
                            recon_y_int, width, recon_uv_int, width,
                            r, c, width, height, mbs_w,
                            qp, qp_c, &ncs, &bs);
+        }
+    }
+
+    /* DCC_DUMP_SLICE=<path>: the MB-layer bits of this slice, re-aligned to
+     * start at bit 0, with the rbsp stop bit and zero padding -- exactly
+     * the byte stream mb_pipeline_controller produces. One decimal byte
+     * per line. */
+    {
+        const char *dp = getenv("DCC_DUMP_SLICE");
+        if (dp) {
+            FILE *df = fopen(dp, "w");
+            int end_bit = bs.byte_pos * 8 + bs.n_in_cur;
+            /* flush the accumulator into the buffer without disturbing it */
+            bitstream_t tmp = bs;
+            bs_put_bits(&tmp, 0, 32);
+            u8 acc = 0; int nacc = 0;
+            for (int b = payload_start_bit; b < end_bit; b++) {
+                int bit = (arena_rbsp[b >> 3] >> (7 - (b & 7))) & 1;
+                acc = (u8)((acc << 1) | bit); nacc++;
+                if (nacc == 8) { fprintf(df, "%d\n", acc); acc = 0; nacc = 0; }
+            }
+            acc = (u8)((acc << 1) | 1); nacc++;                     /* stop bit */
+            while (nacc < 8) { acc = (u8)(acc << 1); nacc++; }
+            fprintf(df, "%d\n", acc);
+            fclose(df);
         }
     }
 

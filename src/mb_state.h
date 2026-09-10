@@ -109,6 +109,9 @@ typedef struct {
     int mb_type_is_i4x4;
     int modes4[16];                    /* per-block I_4x4 mode, raster br*4+bc */
     i16 ac_levels_y_full[16][16];      /* I_4x4 quantized levels: 16 coefs each */
+
+    /* estimated bits of both luma paths (debug / vector dump) */
+    int dbg_bits_a, dbg_bits_b;
 } mb_state_t;
 
 #endif

@@ -26,6 +26,7 @@
 #include "bitstream.h"
 #include "nal.h"
 #include "mb_state.h"
+#include "rd_tables.h"
 #include "line_buffer.h"
 #include "hls_pragmas.h"
 
@@ -382,63 +383,97 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
         lb_gather_4x4(lb, blk, mb_c, mbs_w, recon_mb_out,
                       top, left, &tl, &at, &al, &atl);
 
-        /* Pick best mode by SATD. */
-        int best_mode = I4_DC, best_cost = INT32_MAX;
-        u8 best_pred[16], pred[16];
+        /* ---- I_4x4 mode decision: SATD screen -> shortlist -> RD ----
+         * See rd_tables.h for the policy and constants. Everything is
+         * integer so the VHDL mode decider can match it exactly. */
+        int cand_mode[9], cand_cost[9], ncand = 0;
+        u8  cand_pred[9][16];
+
+        /* predIntra4x4PredMode (spec 8.3.1.1) for the mode-bit penalty. */
+        int pred_mode;
+        {
+            int top_ok = 0, left_ok = 0, mode_top = I4_DC, mode_left = I4_DC;
+            if (br > 0)        { mode_top = modes4_out[(br-1)*4 + bc]; top_ok = 1; }
+            else if (lb->top_valid) { mode_top = lb_mode4_y_top(lb, mb_c*4 + bc); top_ok = 1; }
+            if (bc > 0)        { mode_left = modes4_out[br*4 + bc - 1]; left_ok = 1; }
+            else if (mb_c > 0 && lb->left_valid) { mode_left = lb->mode4_y_left[br]; left_ok = 1; }
+            pred_mode = (!top_ok || !left_ok) ? I4_DC : (mode_top < mode_left ? mode_top : mode_left);
+        }
+
         for (int m = 0; m < 9; m++) {
             if ((m == I4_VERTICAL || m == I4_DIAG_DOWN_LEFT ||
                  m == I4_VERTICAL_LEFT) && !at)  continue;
             if ((m == I4_HORIZONTAL || m == I4_HORIZONTAL_UP) && !al) continue;
             if ((m == I4_DIAG_DOWN_RIGHT || m == I4_VERTICAL_RIGHT ||
                  m == I4_HORIZONTAL_DOWN) && !(at && al && atl)) continue;
+            u8 *pred = cand_pred[ncand];
             predict_4x4(m, top, left, tl, at, al, atl, pred);
-
-            /* SATD on residual via 4x4 Hadamard. */
-            i16 r[16];
+            i32 ri32[16], satd_out[16];
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++) {
                     int idx = (br*4 + i) * 16 + (bc*4 + j);
-                    r[i*4 + j] = (i16)((int)src_mb[idx] - (int)pred[i*4 + j]);
+                    ri32[i*4 + j] = (int)src_mb[idx] - (int)pred[i*4 + j];
                 }
-            i32 ri32[16], satd_out[16];
-            for (int k = 0; k < 16; k++) ri32[k] = r[k];
             ihadamard4x4(ri32, satd_out);
             int cost = 0;
             for (int k = 0; k < 16; k++) cost += abs_i(satd_out[k]);
-            cost += 4 << (qp / 6);   /* lambda penalty for mode bits */
+            cost += (RD_SLAM16[qp] * ((m == pred_mode) ? 1 : 4) + 8) >> 4;
+            cand_mode[ncand] = m; cand_cost[ncand] = cost; ncand++;
+        }
+        /* Stable insertion sort by screen cost (ties keep mode order). */
+        int order[9];
+        for (int k = 0; k < ncand; k++) {
+            int p = k;
+            while (p > 0 && cand_cost[order[p-1]] > cand_cost[k]) { order[p] = order[p-1]; p--; }
+            order[p] = k;
+        }
+        int nfull = (RD_I4_SHORTLIST < ncand) ? RD_I4_SHORTLIST : ncand;
 
-            if (cost < best_cost) {
-                best_cost = cost;
-                best_mode = m;
-                memcpy(best_pred, pred, 16);
+        int best_mode = I4_DC, best_bits = 0;
+        long best_j = 0x7fffffffL;
+        i16 best_levels[16];
+        u8  best_recon[16];
+        for (int k = 0; k < nfull; k++) {
+            int ci = order[k];
+            int m = cand_mode[ci];
+            const u8 *pred = cand_pred[ci];
+            i16 res[16], dct[16], levels[16], zz[16];
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) {
+                    int idx = (br*4 + i) * 16 + (bc*4 + j);
+                    res[i*4 + j] = (i16)((int)src_mb[idx] - (int)pred[i*4 + j]);
+                }
+            dct4x4(res, dct);
+            quant_4x4(dct, levels, qp, 1);
+            zigzag_4x4(levels, zz);
+            int rbits = cavlc_estimate_block_bits(zz, 16, BLK_LUMA_FULL, 0);
+            int mbits = (m == pred_mode) ? 1 : 4;
+            i32 dq[16], rr[16];
+            iquant_4x4(levels, dq, qp);
+            idct4x4(dq, rr);
+            u8 rec[16];
+            long ssd = 0;
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++) {
+                    int idx = (br*4 + i) * 16 + (bc*4 + j);
+                    int v = clip_u8(pred[i*4 + j] + ((rr[i*4 + j] + 32) >> 6));
+                    rec[i*4 + j] = (u8)v;
+                    int d = v - (int)src_mb[idx];
+                    ssd += (long)d * d;
+                }
+            long j = 16L * ssd + (long)RD_LAM16[qp] * (rbits + mbits);
+            if (j < best_j) {
+                best_j = j; best_mode = m; best_bits = rbits;
+                memcpy(best_levels, levels, sizeof levels);
+                memcpy(best_recon, rec, sizeof rec);
             }
         }
-        /* Store in raster order (br*4+bc) to match mb_state_t::modes4 convention. */
         modes4_out[br*4 + bc] = best_mode;
-
-        /* Forward path */
-        i16 res[16], dct[16], levels[16];
+        memcpy(ac_levels_out[br*4 + bc], best_levels, sizeof best_levels);
         for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) {
-                int idx = (br*4 + i) * 16 + (bc*4 + j);
-                res[i*4 + j] = (i16)((int)src_mb[idx] - (int)best_pred[i*4 + j]);
-            }
-        dct4x4(res, dct);
-        quant_4x4(dct, levels, qp, 1);
-        memcpy(ac_levels_out[br*4 + bc], levels, sizeof levels);
-
-        /* Inverse path → recon_mb_out (must complete before the next
-         * block's neighbor gather). */
-        i32 dq[16], res_recon[16];
-        iquant_4x4(levels, dq, qp);
-        idct4x4(dq, res_recon);
-        recon_4x4_local(recon_mb_out, best_pred, br, bc, res_recon);
-
-
-        /* Bit estimate (CAVLC zigzag, full 16 coefs). */
-        i16 zz[16];
-        zigzag_4x4(levels, zz);
-        bits += BITS_ESTIMATE(zz, 16, BLK_LUMA_FULL, 0);
+            for (int j = 0; j < 4; j++)
+                recon_mb_out[(br*4 + i) * 16 + (bc*4 + j)] = best_recon[i*4 + j];
+        bits += best_bits;
     }
 
     return bits;
