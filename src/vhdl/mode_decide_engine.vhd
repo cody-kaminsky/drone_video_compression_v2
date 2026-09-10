@@ -139,8 +139,8 @@ architecture rtl of mode_decide_engine is
     constant W_FWD16 : integer := 12;
     constant W_HAD16 : integer := 14;
     constant W_INV16 : integer := 4;
-    constant W_SCR4  : integer := 8;
-    constant W_FULL4 : integer := 21;
+    constant W_SCR4  : integer := 9;
+    constant W_FULL4 : integer := 22;
     constant W_SCRC  : integer := 10;
     constant W_FWDC  : integer := 9;
     constant W_HADC  : integer := 14;
@@ -323,6 +323,12 @@ architecture rtl of mode_decide_engine is
     signal p4_left : std_logic_vector(31 downto 0);
     signal p4_tl : std_logic_vector(7 downto 0);
     signal p4_at, p4_al : std_logic;
+    -- registered predictor inputs (the sub-block mux is off the predictor's path)
+    signal p4_top_q : std_logic_vector(63 downto 0) := (others => '0');
+    signal p4_left_q : std_logic_vector(31 downto 0) := (others => '0');
+    signal p4_tl_q : std_logic_vector(7 downto 0) := (others => '0');
+    signal p4_at_q, p4_al_q, p4_valid_q : std_logic := '0';
+    signal p4_mode_q : unsigned(3 downto 0) := (others => '0');
     type rk_cost_t is array (0 to 5) of unsigned(23 downto 0);
     type rk_mode_t is array (0 to 5) of integer range 0 to 8;
     type rk_n_t is array (0 to 1) of integer range 0 to 3;
@@ -350,6 +356,7 @@ architecture rtl of mode_decide_engine is
     signal best_j : bj_t := (others => (others => '1'));
     signal best_slot : bs_t := (others => 0);
     signal j_prod : unsigned(27 downto 0) := (others => '0');
+    signal jb_q : unsigned(11 downto 0) := (others => '0');   -- bits + mode bits of the candidate about to finish recon
     signal j_ssd16 : unsigned(27 downto 0) := (others => '0');
     signal j_pend : std_logic := '0';
     signal j_pend_idx : integer range 0 to 5 := 0;
@@ -413,7 +420,7 @@ architecture rtl of mode_decide_engine is
     signal pc_top, pc_left : std_logic_vector(63 downto 0);
     signal pc_tl : std_logic_vector(7 downto 0);
     signal p4_pred, p16_pred, pc_pred : px128;
-    signal tp4 : tag_arr(1 to 1) := (others => TAG_NONE);
+    signal tp4 : tag_arr(1 to 2) := (others => TAG_NONE);
     signal tp16 : tag_arr(1 to 8) := (others => TAG_NONE);
     signal tpc : tag_arr(1 to 6) := (others => TAG_NONE);
 
@@ -496,10 +503,18 @@ begin
     p4_at   <= nb_at(head_tag.sub);
     p4_al   <= nb_al(head_tag.sub);
 
+    p4_in_reg : process(clk)
+    begin
+        if rising_edge(clk) then
+            p4_top_q <= p4_top; p4_left_q <= p4_left; p4_tl_q <= p4_tl;
+            p4_at_q <= p4_at; p4_al_q <= p4_al; p4_mode_q <= p4_mode; p4_valid_q <= p4_valid_i;
+        end if;
+    end process;
+
     p4 : entity work.predict_4x4_engine
-        port map (clk => clk, rst_n => rst_n, mode_i => p4_mode, top_i => p4_top, left_i => p4_left,
-                  tl_i => p4_tl, avail_top_i => p4_at, avail_left_i => p4_al, avail_tl_i => p4_at and p4_al,
-                  valid_i => p4_valid_i, ready_o => open, pred_o => p4_pred, valid_o => p4_valid_o,
+        port map (clk => clk, rst_n => rst_n, mode_i => p4_mode_q, top_i => p4_top_q, left_i => p4_left_q,
+                  tl_i => p4_tl_q, avail_top_i => p4_at_q, avail_left_i => p4_al_q, avail_tl_i => p4_at_q and p4_al_q,
+                  valid_i => p4_valid_q, ready_o => open, pred_o => p4_pred, valid_o => p4_valid_o,
                   ready_i => '1');
 
     p16 : entity work.predict_16x16_engine
@@ -582,6 +597,7 @@ begin
     begin
         if rising_edge(clk) then
             if p4_valid_i = '1' then tp4(1) <= head_tag; else tp4(1) <= TAG_NONE; end if;
+            tp4(2) <= tp4(1);
             if p16_valid_i = '1' then tp16(1) <= head_tag; else tp16(1) <= TAG_NONE; end if;
             tp16(2 to 8) <= tp16(1 to 7);
             if pc_valid_i = '1' then tpc(1) <= head_tag; else tpc(1) <= TAG_NONE; end if;
@@ -605,7 +621,7 @@ begin
         variable tg : tag_t;
     begin
         tg := TAG_NONE;
-        if p4_valid_o = '1' then tg := tp4(1);
+        if p4_valid_o = '1' then tg := tp4(2);
         elsif p16_valid_o = '1' then tg := tp16(8);
         elsif pc_valid_o = '1' then tg := tpc(6);
         end if;
@@ -628,7 +644,7 @@ begin
     begin
         if rising_edge(clk) then
             tg := TAG_NONE; pr := (others => '0');
-            if p4_valid_o = '1' then tg := tp4(1); pr := p4_pred;
+            if p4_valid_o = '1' then tg := tp4(2); pr := p4_pred;
             elsif p16_valid_o = '1' then tg := tp16(8); pr := p16_pred;
             elsif pc_valid_o = '1' then tg := tpc(6); pr := pc_pred;
             end if;
@@ -1039,12 +1055,16 @@ begin
             ----------------------------------------------------------
             rt := trc(3);
             j_pend <= '0';
+            -- one cycle ahead of the recon result: the candidate's rate term
+            if trc(2).valid = '1' and trc(2).op = OP_FULL4 then
+                jb_q <= to_unsigned(to_integer(cand_bits(trc(2).sub * 3 + trc(2).slot)) + cand_mbits(trc(2).sub * 3 + trc(2).slot), 12);
+            end if;
             if r_valid_o = '1' and rt.op = OP_FULL4 then
                 j_ssd16 <= resize(r_ssd & "0000", 28);
                 j_pend  <= '1';
                 j_pend_idx <= rt.sub * 3 + rt.slot;
                 j_pend_sub <= rt.sub;
-                j_prod <= resize(lam * to_unsigned(to_integer(cand_bits(rt.sub * 3 + rt.slot)) + cand_mbits(rt.sub * 3 + rt.slot), 12), 28);
+                j_prod <= resize(lam * jb_q, 28);
             end if;
             if j_pend = '1' then
                 jv := j_ssd16 + j_prod;
