@@ -17,6 +17,10 @@
 --   stage 2  one signed multiply-add per lane, a*b + c  -> DSP48E1.
 --   stage 3  arithmetic right shift (two-level mux for the forward path,
 --            0..2 for inverse), output register.
+--   stage 4  fused AC dequantisation of the forward level (mode 0 only):
+--            deq = level * (V << qdiv), exactly what mode 1 would return
+--            for that level, one cycle after dout (deq_valid_o). Lets a
+--            closed-loop evaluation skip the inverse pass.
 --
 -- Sign handling without |c| and without a final negate: the C reference
 -- computes sign(c) * ((|c|*MF + f) >> q). For c < 0 that equals
@@ -77,7 +81,25 @@ entity quant_engine is
         dout_14 : out signed(31 downto 0);
         dout_15 : out signed(31 downto 0);
         valid_o : out std_logic;
-        ready_i : in  std_logic
+        ready_i : in  std_logic;
+        -- fused dequantised block (forward AC mode), latency 5
+        deq_0   : out signed(31 downto 0);
+        deq_1   : out signed(31 downto 0);
+        deq_2   : out signed(31 downto 0);
+        deq_3   : out signed(31 downto 0);
+        deq_4   : out signed(31 downto 0);
+        deq_5   : out signed(31 downto 0);
+        deq_6   : out signed(31 downto 0);
+        deq_7   : out signed(31 downto 0);
+        deq_8   : out signed(31 downto 0);
+        deq_9   : out signed(31 downto 0);
+        deq_10  : out signed(31 downto 0);
+        deq_11  : out signed(31 downto 0);
+        deq_12  : out signed(31 downto 0);
+        deq_13  : out signed(31 downto 0);
+        deq_14  : out signed(31 downto 0);
+        deq_15  : out signed(31 downto 0);
+        deq_valid_o : out std_logic
     );
 end entity;
 
@@ -169,9 +191,17 @@ architecture rtl of quant_engine is
     -- Stage 3 registers
     signal out_q   : o_arr;
     signal v3_q    : std_logic;
+    signal qmod1_q, qmod2_q, qmod3_q : integer range 0 to 5;
+    signal qdiv1_q, qdiv2_q, qdiv3_q : integer range 0 to 10;
+    signal ac0_q, ac1_q, ac2_q, ac3_q : std_logic;   -- forward AC mode flag, aligned with v0..v3
+    -- Stage 4 registers (fused dequant)
+    type d_arr is array (0 to 15) of signed(31 downto 0);
+    signal deq_q   : d_arr;
+    signal v4_q    : std_logic;
 
     attribute use_dsp : string;
     attribute use_dsp of p_q : signal is "yes";
+    attribute use_dsp of deq_q : signal is "yes";
 
     signal advance : std_logic;
 
@@ -227,6 +257,7 @@ begin
                 ls0_q <= ls; rs0_q <= rs; rnd0_q <= rnd;
                 fwd0_q  <= not mode_i(0);
                 four0_q <= mode_i(2);
+                if mode_i = "000" then ac0_q <= valid_i; else ac0_q <= '0'; end if;
                 for i in 0 to 15 loop
                     if mode_i(0) = '0' then
                         a0_q(i) <= din(i)(AW - 1 downto 0);
@@ -253,6 +284,7 @@ begin
                     end if;
                 end loop;
                 a1_q   <= a0_q;
+                qmod1_q <= qmod0_q; qdiv1_q <= qdiv0_q; ac1_q <= ac0_q;
                 sh1_q  <= to_unsigned(qdiv0_q + dcadd0_q, 4);
                 rs1_q  <= to_unsigned(rs0_q, 2);
                 fwd1_q <= fwd0_q; four1_q <= four0_q;
@@ -265,6 +297,7 @@ begin
                     p_q(i) <= resize(a1_q(i) * b1_q(i) + resize(c1_q(i), PW - 1), PW);
                 end loop;
                 sh2_q <= sh1_q; rs2_q <= rs1_q; fwd2_q <= fwd1_q; four2_q <= four1_q;
+                qmod2_q <= qmod1_q; qdiv2_q <= qdiv1_q; ac2_q <= ac1_q;
                 v2_q <= v1_q;
 
                 ----------------------------------------------------------
@@ -295,9 +328,25 @@ begin
                     end if;
                 end loop;
                 v3_q <= v2_q;
+                qmod3_q <= qmod2_q; qdiv3_q <= qdiv2_q; ac3_q <= ac2_q;
+
+                ----------------------------------------------------------
+                -- Stage 4: fused dequantisation of the forward AC level
+                ----------------------------------------------------------
+                for i in 0 to 15 loop
+                    vb := shift_left(to_unsigned(V_TAB(qmod3_q, pos_class(i)), BW), qdiv3_q);
+                    deq_q(i) <= resize(out_q(i)(15 downto 0) * signed(vb), 32);
+                end loop;
+                v4_q <= ac3_q;
             end if;
         end if;
     end process;
+
+    deq_0  <= deq_q(0);   deq_1  <= deq_q(1);   deq_2  <= deq_q(2);   deq_3  <= deq_q(3);
+    deq_4  <= deq_q(4);   deq_5  <= deq_q(5);   deq_6  <= deq_q(6);   deq_7  <= deq_q(7);
+    deq_8  <= deq_q(8);   deq_9  <= deq_q(9);   deq_10 <= deq_q(10);  deq_11 <= deq_q(11);
+    deq_12 <= deq_q(12);  deq_13 <= deq_q(13);  deq_14 <= deq_q(14);  deq_15 <= deq_q(15);
+    deq_valid_o <= v4_q;
 
     dout_0  <= out_q(0);   dout_1  <= out_q(1);   dout_2  <= out_q(2);   dout_3  <= out_q(3);
     dout_4  <= out_q(4);   dout_5  <= out_q(5);   dout_6  <= out_q(6);   dout_7  <= out_q(7);

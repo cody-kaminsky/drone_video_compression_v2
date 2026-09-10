@@ -385,7 +385,16 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
 
         /* ---- I_4x4 mode decision: SATD screen -> shortlist -> RD ----
          * See rd_tables.h for the policy and constants. Everything is
-         * integer so the VHDL mode decider can match it exactly. */
+         * integer so the VHDL mode decider can match it exactly.
+         * The screen is "open-loop": it predicts from reconstructed samples
+         * where the neighbour is another MB and from SOURCE samples where it
+         * is a block of this MB, so the ranking does not depend on this MB's
+         * reconstruction; the shortlist is then evaluated closed-loop. */
+        u8 stop[8] = {0}, sleft[4] = {0}, stl = 128;
+        int sat, sal, satl;
+        lb_gather_4x4(lb, blk, mb_c, mbs_w, src_mb,
+                      stop, sleft, &stl, &sat, &sal, &satl);
+        (void)sat; (void)sal; (void)satl;
         int cand_mode[9], cand_cost[9], ncand = 0;
         u8  cand_pred[9][16];
 
@@ -407,12 +416,14 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
             if ((m == I4_DIAG_DOWN_RIGHT || m == I4_VERTICAL_RIGHT ||
                  m == I4_HORIZONTAL_DOWN) && !(at && al && atl)) continue;
             u8 *pred = cand_pred[ncand];
-            predict_4x4(m, top, left, tl, at, al, atl, pred);
+            predict_4x4(m, top, left, tl, at, al, atl, pred);       /* closed-loop, for the RD pass */
+            u8 spred[16];
+            predict_4x4(m, stop, sleft, stl, at, al, atl, spred);   /* open-loop, for the screen */
             i32 ri32[16], satd_out[16];
             for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++) {
                     int idx = (br*4 + i) * 16 + (bc*4 + j);
-                    ri32[i*4 + j] = (int)src_mb[idx] - (int)pred[i*4 + j];
+                    ri32[i*4 + j] = (int)src_mb[idx] - (int)spred[i*4 + j];
                 }
             ihadamard4x4(ri32, satd_out);
             int cost = 0;

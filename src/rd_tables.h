@@ -2,11 +2,16 @@
  * and the VHDL mode decider (mode_decide_engine). Both must use these
  * exact tables so hardware decisions match the reference bit for bit.
  *
- * I_4x4 mode decision policy (chosen from the 2026-09 shortlist study):
+ * I_4x4 mode decision policy (chosen from the 2026-09 shortlist study,
+ * open-loop screen from the 2026-09-10 sweep):
  *   1. screen all available modes by SATD plus a mode-signalling penalty
  *        cost = SATD + ((RD_SLAM16[qp] * mode_bits + 8) >> 4)
  *      where mode_bits = 1 if the mode equals predIntra4x4PredMode, else 4
- *      (RD_SLAM16 = 16 * 2 * 2^((qp-12)/6), rounded);
+ *      (RD_SLAM16 = 16 * 2 * 2^((qp-12)/6), rounded). The screen predicts
+ *      from "open-loop" neighbours: reconstructed samples where the
+ *      neighbour belongs to another MB, SOURCE samples where it is a block
+ *      of this MB, so the ranking never waits for this MB's reconstruction
+ *      (0.6% BD-rate against a closed-loop screen, measured);
  *   2. keep the RD_I4_SHORTLIST best (ties: lower mode index first);
  *   3. evaluate those fully: transform, quantize, CAVLC bit estimate,
  *      reconstruct, and pick the smallest

@@ -10,14 +10,22 @@
 --   mb_header_engine    CBP + Exp-Golomb MB header fields
 --   cavlc_dispatch      packets to N CAVLC engines, in-order byte merge
 --
--- Per MB: fetch the neighbour bundle (needs the previous MB committed),
--- start the decider and stream it the 24 source blocks, take the decision
--- at done_o, run the header engine (fields go to the dispatcher first),
--- collect the reconstruction stream into the line-buffer commit (bottom
--- rows, right columns), then turn the level stream into CAVLC packets:
--- zigzag, n_coefs, nC from the neighbour counts (spec 9.2.1), emitted or
--- not per the coded_block_pattern, TotalCoeff kept for the neighbours.
--- After the last MB the rbsp stop bit is pushed and the dispatcher is
+-- Two sequencers:
+--
+--   front  per MB: fetch the neighbour bundle (needs the previous MB
+--          committed), start the decider and stream it the 24 source
+--          blocks, take the decision at done_o (together with the
+--          neighbour context the emission needs), collect the
+--          reconstruction stream into the line-buffer commit (bottom rows,
+--          right columns) and commit with the decider's TotalCoeff counts
+--          and modes; then straight on to the next MB.
+--   back   per decision: run the header engine (fields go to the
+--          dispatcher first), then turn the level stream into CAVLC
+--          packets: zigzag, n_coefs, nC from the neighbour counts (spec
+--          9.2.1), emitted or not per the coded_block_pattern.
+--
+-- The back sequencer of MB n therefore runs while the decider works on MB
+-- n+1. After the last MB the rbsp stop bit is pushed and the dispatcher is
 -- flushed; frame_done_o pulses when the last byte has been taken.
 --
 -- Source blocks come from a 24-word stream per MB (Y 0..15 raster, U 0..3,
@@ -133,18 +141,27 @@ architecture rtl of mb_pipeline_controller is
     signal md_modes4 : std_logic_vector(63 downto 0);
     signal md_lnz : std_logic_vector(15 downto 0);
     signal md_bits_a, md_bits_b : unsigned(15 downto 0);
+    signal md_tcy : std_logic_vector(79 downto 0);
+    signal md_tcu, md_tcv : std_logic_vector(19 downto 0);
     signal md_blk_valid, md_blk_ready, md_rec_valid, md_rec_ready : std_logic;
     signal md_blk_plane, md_rec_plane : unsigned(1 downto 0);
     signal md_blk_kind : std_logic;
     signal md_blk_idx, md_rec_idx : unsigned(3 downto 0);
     signal md_blk_levels : level_array_t;
     signal md_rec_data : px128;
-    -- latched decision
+    signal md_done_f : std_logic := '0';       -- decision presented, not yet taken
+    -- latched decision + the neighbour context the emission needs
     signal d_is4 : std_logic := '0';
     signal d_mode16, d_modec : unsigned(1 downto 0) := (others => '0');
     signal d_modes4 : std_logic_vector(63 downto 0) := (others => '0');
     signal d_lnz : std_logic_vector(15 downto 0) := (others => '0');
     signal d_cdc, d_cac : std_logic := '0';
+    signal d_tcy : std_logic_vector(79 downto 0) := (others => '0');
+    signal d_tcu, d_tcv : std_logic_vector(19 downto 0) := (others => '0');
+    signal d_m4_top, d_m4_left : std_logic_vector(15 downto 0) := (others => '0');
+    signal d_at, d_al : std_logic := '0';
+    signal d_ncy_top, d_ncy_left : std_logic_vector(19 downto 0) := (others => '0');
+    signal d_ncu_top, d_ncu_left, d_ncv_top, d_ncv_left : std_logic_vector(9 downto 0) := (others => '0');
 
     ------------------------------------------------------------------
     -- header engine
@@ -167,7 +184,7 @@ architecture rtl of mb_pipeline_controller is
     signal dp_pkt : level_packet_t;
 
     ------------------------------------------------------------------
-    -- per-MB CAVLC context
+    -- per-MB CAVLC context (emission side)
     ------------------------------------------------------------------
     type nc16_t is array (0 to 15) of integer range 0 to 16;
     type nc4_t  is array (0 to 3)  of integer range 0 to 16;
@@ -175,18 +192,24 @@ architecture rtl of mb_pipeline_controller is
     signal ncu_loc, ncv_loc : nc4_t := (others => 0);
 
     type st_t is (S_IDLE, S_WAIT_BANK, S_ROW, S_FETCH, S_FETCH_WAIT, S_START, S_SRC_PRE, S_SRC, S_WAIT_MD,
-                  S_HDR, S_HDR_WAIT, S_LEVELS, S_LEVEL_PUSH, S_NEXT, S_STOP, S_FLUSH, S_FLUSH_WAIT);
+                  S_WAIT_REC, S_STOP, S_FLUSH, S_FLUSH_WAIT);
     signal st : st_t := S_IDLE;
+    type est_t is (E_IDLE, E_HDR, E_HDR_WAIT, E_LEVELS, E_LEVEL_PUSH);
+    signal est : est_t := E_IDLE;
+    signal em_start : std_logic := '0';
     signal frame_done_q : std_logic := '0';
     signal rec_cnt : integer range 0 to 24 := 0;
     signal lvl_cnt : integer range 0 to 31 := 0;
     signal rec_done : std_logic := '0';
-    signal lvl_done : std_logic := '0';
-    signal commit_pending : std_logic := '0';
 
-    -- packet under construction
+    -- packet under construction; its TotalCoeff is counted from the
+    -- registered packet (keeps the level-store read off the count path)
     signal pk_pkt : level_packet_t;
     signal pk_emit : std_logic := '0';
+    signal pk_pl : integer range 0 to 2 := 0;
+    signal pk_ix : integer range 0 to 15 := 0;
+    signal pk_kind : std_logic := '0';
+    signal pk_cnt_pend : std_logic := '0';
 
 begin
 
@@ -223,7 +246,8 @@ begin
                   is_i4x4_o => md_is4, mode16_o => md_mode16, modes4_o => md_modes4,
                   mode_chroma_o => md_modec, luma_nz_o => md_lnz,
                   chroma_dc_nz_o => md_cdc_nz, chroma_ac_nz_o => md_cac_nz,
-                  bits_a_o => md_bits_a, bits_b_o => md_bits_b, dbg_j_o => open,
+                  bits_a_o => md_bits_a, bits_b_o => md_bits_b,
+                  tc_y_o => md_tcy, tc_u_o => md_tcu, tc_v_o => md_tcv, dbg_j_o => open,
                   blk_valid_o => md_blk_valid, blk_ready_i => md_blk_ready, blk_plane_o => md_blk_plane,
                   blk_kind_o => md_blk_kind, blk_idx_o => md_blk_idx, blk_levels_o => md_blk_levels,
                   rec_valid_o => md_rec_valid, rec_ready_i => md_rec_ready, rec_plane_o => md_rec_plane,
@@ -233,8 +257,8 @@ begin
         port map (clk => clk, rst_n => rst_n, start_i => hd_start, ready_o => hd_ready,
                   is_i4x4_i => d_is4, mode16_i => d_mode16, modes4_i => d_modes4, mode_chroma_i => d_modec,
                   luma_nz_i => d_lnz, chroma_dc_nz_i => d_cdc, chroma_ac_nz_i => d_cac,
-                  mode4_top_i => nb_m4_top, mode4_left_i => nb_m4_left,
-                  avail_top_i => nb_at, avail_left_i => nb_al,
+                  mode4_top_i => d_m4_top, mode4_left_i => d_m4_left,
+                  avail_top_i => d_at, avail_left_i => d_al,
                   fbits_o => hd_fbits, flen_o => hd_flen, fvalid_o => hd_fvalid, fready_i => hd_fready,
                   done_o => hd_done, hdr_bits_o => open, cbp_luma_o => hd_cbpl, cbp_chroma_o => hd_cbpc,
                   has_residual_o => hd_hasres);
@@ -273,16 +297,6 @@ begin
             if st = S_IDLE and frame_start_i = '1' then
                 fill_bank <= '0'; fill_cnt <= 0; bank_full <= "00";
             else
-                -- synthesis translate_off
-                if DEBUG and src_fire = '1' and fill_cnt < 3 and mb_r = 0 and mb_c = 0 then
-                    report "FILL bank=" & std_logic'image(fill_bank) & " cnt=" & integer'image(fill_cnt) & " data0=" &
-                           integer'image(to_integer(unsigned(src_data_i(7 downto 0)))) & " st=" & st_t'image(st) severity note;
-                end if;
-                if DEBUG and st = S_START and md_busy = '0' and md_sbusy = '0' then
-                    report "START use_bank=" & std_logic'image(use_bank) & " full=" & std_logic'image(bank_full(1)) & std_logic'image(bank_full(0)) &
-                           " buf0=" & integer'image(to_integer(unsigned(src_buf(0)(7 downto 0)))) severity note;
-                end if;
-                -- synthesis translate_on
                 if src_fire = '1' then
                     if fill_cnt = 23 then
                         bank_full(to_integer(unsigned'("" & fill_bank))) <= '1';
@@ -346,56 +360,47 @@ begin
     ------------------------------------------------------------------
     -- Dispatcher input mux: header fields, then packets, then stop/flush
     ------------------------------------------------------------------
-    hd_fready <= dp_ready when st = S_HDR_WAIT else '0';
+    hd_fready <= dp_ready when est = E_HDR_WAIT else '0';
 
     dp_mux_p : process(all)
     begin
         dp_valid <= '0'; dp_kind <= "00"; dp_fbits <= (others => '0'); dp_flen <= (others => '0');
         dp_pkt <= pk_pkt;
-        case st is
-            when S_HDR_WAIT =>
-                dp_valid <= hd_fvalid;
-                dp_fbits <= hd_fbits(7 downto 0);
-                dp_flen  <= hd_flen;
-            when S_LEVEL_PUSH =>
-                dp_valid <= pk_emit;
-                dp_kind  <= "01";
-            when S_STOP =>
-                dp_valid <= '1';
-                dp_fbits <= x"01";
-                dp_flen  <= to_unsigned(1, 6);
-            when S_FLUSH =>
-                dp_valid <= '1';
-                dp_kind  <= "10";
-            when others => null;
-        end case;
+        if est = E_HDR_WAIT then
+            dp_valid <= hd_fvalid;
+            dp_fbits <= hd_fbits(7 downto 0);
+            dp_flen  <= hd_flen;
+        elsif est = E_LEVEL_PUSH then
+            dp_valid <= pk_emit;
+            dp_kind  <= "01";
+        elsif st = S_STOP and est = E_IDLE and em_start = '0' then
+            dp_valid <= '1';
+            dp_fbits <= x"01";
+            dp_flen  <= to_unsigned(1, 6);
+        elsif st = S_FLUSH then
+            dp_valid <= '1';
+            dp_kind  <= "10";
+        end if;
     end process;
 
-    md_blk_ready <= '1' when st = S_LEVELS else '0';
+    md_blk_ready <= '1' when est = E_LEVELS else '0';
 
     ------------------------------------------------------------------
-    -- Main sequencer
+    -- Front sequencer: fetch, decide, commit
     ------------------------------------------------------------------
-    main_p : process(clk, rst_n)
-        variable pl, ix, br, bc : integer range 0 to 15;
-        variable nt, nl, ncv : integer range 0 to 16;
-        variable tok, lok : boolean;
-        variable zz : level_array_t;
-        variable cnt : integer range 0 to 16;
-        variable emit : boolean;
-        variable p : level_packet_t;
-        variable m4 : std_logic_vector(63 downto 0);
+    front_p : process(clk, rst_n)
     begin
         if rst_n = '0' then
             st <= S_IDLE; frame_done_q <= '0';
             lb_frame_start <= '0'; lb_row_start <= '0'; lb_fetch_valid <= '0'; lb_commit_valid <= '0';
-            md_start <= '0'; hd_start <= '0'; md_word <= 24; use_bank <= '0';
-            pk_emit <= '0'; commit_pending <= '0'; rec_done <= '0';
+            md_start <= '0'; md_word <= 24; use_bank <= '0'; md_done_f <= '0'; em_start <= '0';
+            rec_done <= '0'; rec_cnt <= 0;
         elsif rising_edge(clk) then
             frame_done_q <= '0';
             lb_frame_start <= '0'; lb_row_start <= '0';
             lb_commit_valid <= '0';
-            md_start <= '0'; hd_start <= '0';
+            md_start <= '0'; em_start <= '0';
+            if md_done = '1' then md_done_f <= '1'; end if;
 
             -- reconstruction stream bookkeeping (independent of the state)
             if md_rec_valid = '1' then
@@ -408,7 +413,7 @@ begin
                         mbs_w <= mbs_w_i; mbs_h <= mbs_h_i;
                         qp_y <= qp_i; qp_c <= to_unsigned(QPC_TAB(to_integer(qp_i)), 6);
                         mb_r <= (others => '0'); mb_c <= (others => '0');
-                        use_bank <= '0'; rec_done <= '0'; rec_cnt <= 0;
+                        use_bank <= '0'; rec_done <= '0'; rec_cnt <= 0; md_done_f <= '0';
                         lb_frame_start <= '1';
                         st <= S_WAIT_BANK;
                     end if;
@@ -424,24 +429,11 @@ begin
                     lb_fetch_valid <= '0';
                     if lb_nb_valid = '1' then st <= S_START; end if;
                 when S_START =>
-                    -- synthesis translate_off
-                    if DEBUG and md_busy = '0' and md_sbusy = '0' and mb_r = 1 and mb_c < 2 then
-                        report "NB mb(" & integer'image(to_integer(mb_r)) & "," & integer'image(to_integer(mb_c)) & ") at=" & std_logic'image(nb_at) &
-                               " al=" & std_logic'image(nb_al) & " atl=" & std_logic'image(nb_atl) & " atr=" & std_logic'image(nb_atr) &
-                               " top=" & integer'image(to_integer(unsigned(nb_top_y(7 downto 0)))) & "," & integer'image(to_integer(unsigned(nb_top_y(15 downto 8)))) &
-                               ".." & integer'image(to_integer(unsigned(nb_top_y(127 downto 120)))) &
-                               " tr=" & integer'image(to_integer(unsigned(nb_tr_y(7 downto 0)))) & " tl=" & integer'image(to_integer(unsigned(nb_tl_y))) &
-                               " left0=" & integer'image(to_integer(unsigned(nb_left_y(7 downto 0)))) &
-                               " ncy_top=" & integer'image(to_integer(unsigned(nb_ncy_top(4 downto 0)))) & "," & integer'image(to_integer(unsigned(nb_ncy_top(9 downto 5)))) &
-                               " m4top=" & integer'image(to_integer(unsigned(nb_m4_top(3 downto 0)))) & "," & integer'image(to_integer(unsigned(nb_m4_top(7 downto 4)))) &
-                               " topu0=" & integer'image(to_integer(unsigned(nb_top_u(7 downto 0)))) & " topv0=" & integer'image(to_integer(unsigned(nb_top_v(7 downto 0)))) severity note;
-                    end if;
-                    -- synthesis translate_on
-                    -- the decider must be idle and its recon stream drained
-                    if md_busy = '0' and md_sbusy = '0' then
+                    -- the decider must be idle; its reconstruction stream is out
+                    -- (we committed it) though its level stream may still run
+                    if md_busy = '0' then
                         md_start <= '1'; md_word <= 0;
-                        ncy_loc <= (others => 0); ncu_loc <= (others => 0); ncv_loc <= (others => 0);
-                        rec_done <= '0'; rec_cnt <= 0;
+                        rec_done <= '0'; rec_cnt <= 0; md_done_f <= '0';
                         st <= S_SRC_PRE;
                     end if;
                 when S_SRC_PRE =>
@@ -456,27 +448,80 @@ begin
                         md_word <= md_word + 1;
                     end if;
                 when S_WAIT_MD =>
-                    if md_done = '1' then
+                    -- take the decision once the emission of the previous MB is
+                    -- done with the latched context
+                    if md_done_f = '1' and est = E_IDLE and em_start = '0' then
                         d_is4 <= md_is4; d_mode16 <= md_mode16; d_modes4 <= md_modes4; d_modec <= md_modec;
                         d_lnz <= md_lnz; d_cdc <= md_cdc_nz; d_cac <= md_cac_nz;
-                        st <= S_HDR;
+                        d_tcy <= md_tcy; d_tcu <= md_tcu; d_tcv <= md_tcv;
+                        d_m4_top <= nb_m4_top; d_m4_left <= nb_m4_left; d_at <= nb_at; d_al <= nb_al;
+                        d_ncy_top <= nb_ncy_top; d_ncy_left <= nb_ncy_left;
+                        d_ncu_top <= nb_ncu_top; d_ncu_left <= nb_ncu_left;
+                        d_ncv_top <= nb_ncv_top; d_ncv_left <= nb_ncv_left;
+                        em_start <= '1';
+                        md_done_f <= '0';
+                        st <= S_WAIT_REC;
                     end if;
-                when S_HDR =>
-                    if hd_ready = '1' then hd_start <= '1'; st <= S_HDR_WAIT; end if;
-                when S_HDR_WAIT =>
+                when S_WAIT_REC =>
+                    -- commit this MB to the line buffer once its reconstruction
+                    -- stream has been collected
+                    if rec_done = '1' and lb_commit_ready = '1' then
+                        cm_ncy <= d_tcy; cm_ncu <= d_tcu; cm_ncv <= d_tcv;
+                        if d_is4 = '1' then cm_m4 <= d_modes4; else cm_m4 <= x"2222222222222222"; end if;
+                        lb_commit_valid <= '1';
+                        cm_col <= mb_c;
+                        rec_done <= '0';
+                        if mb_c = mbs_w - 1 then
+                            mb_c <= (others => '0');
+                            if mb_r = mbs_h - 1 then st <= S_STOP; else mb_r <= mb_r + 1; st <= S_WAIT_BANK; end if;
+                        else
+                            mb_c <= mb_c + 1; st <= S_WAIT_BANK;
+                        end if;
+                    end if;
+                when S_STOP =>
+                    -- after the last MB's emission: stop bit, then flush
+                    if est = E_IDLE and em_start = '0' and dp_ready = '1' then st <= S_FLUSH; end if;
+                when S_FLUSH =>
+                    if dp_ready = '1' then st <= S_FLUSH_WAIT; end if;
+                when S_FLUSH_WAIT =>
+                    if dp_flushed = '1' then frame_done_q <= '1'; st <= S_IDLE; end if;
+            end case;
+        end if;
+    end process;
+
+    ------------------------------------------------------------------
+    -- Back sequencer: header fields, then the level stream as packets
+    ------------------------------------------------------------------
+    back_p : process(clk, rst_n)
+        variable pl, ix, br, bc : integer range 0 to 15;
+        variable nt, nl, ncv : integer range 0 to 16;
+        variable tok, lok : boolean;
+        variable zz : level_array_t;
+        variable cnt : integer range 0 to 16;
+        variable emit : boolean;
+        variable p : level_packet_t;
+    begin
+        if rst_n = '0' then
+            est <= E_IDLE; hd_start <= '0'; pk_emit <= '0'; pk_cnt_pend <= '0';
+        elsif rising_edge(clk) then
+            hd_start <= '0';
+            case est is
+                when E_IDLE =>
+                    if em_start = '1' then
+                        ncy_loc <= (others => 0); ncu_loc <= (others => 0); ncv_loc <= (others => 0);
+                        est <= E_HDR;
+                    end if;
+                when E_HDR =>
+                    if hd_ready = '1' then hd_start <= '1'; est <= E_HDR_WAIT; end if;
+                when E_HDR_WAIT =>
                     -- fields flow to the dispatcher; done when the engine is idle again
                     -- and its last field has been accepted
-                    -- synthesis translate_off
-                    if DEBUG and hd_fvalid = '1' and dp_ready = '1' then
-                        report "HWF " & integer'image(to_integer(hd_flen)) & " " & integer'image(to_integer(hd_fbits)) severity note;
-                    end if;
-                    -- synthesis translate_on
                     if hd_ready = '1' and hd_fvalid = '0' and hd_start = '0' then
                         cbpl_q <= hd_cbpl; cbpc_q <= hd_cbpc;
                         lvl_cnt <= 0;
-                        st <= S_LEVELS;
+                        est <= E_LEVELS;
                     end if;
-                when S_LEVELS =>
+                when E_LEVELS =>
                     if md_blk_valid = '1' then
                         pl := to_integer(md_blk_plane); ix := to_integer(md_blk_idx);
                         br := ix / 4; bc := ix mod 4;
@@ -484,21 +529,21 @@ begin
                         if pl = 0 then
                             if md_blk_kind = '1' then br := 0; bc := 0; end if;
                             if br > 0 then nt := ncy_loc((br - 1) * 4 + bc); tok := true;
-                            else nt := to_integer(unsigned(nb_ncy_top(5 * bc + 4 downto 5 * bc))); tok := (nb_at = '1'); end if;
+                            else nt := to_integer(unsigned(d_ncy_top(5 * bc + 4 downto 5 * bc))); tok := (d_at = '1'); end if;
                             if bc > 0 then nl := ncy_loc(br * 4 + bc - 1); lok := true;
-                            else nl := to_integer(unsigned(nb_ncy_left(5 * br + 4 downto 5 * br))); lok := (nb_al = '1'); end if;
+                            else nl := to_integer(unsigned(d_ncy_left(5 * br + 4 downto 5 * br))); lok := (d_al = '1'); end if;
                         else
                             br := ix / 2; bc := ix mod 2;
                             if pl = 1 then
                                 if br > 0 then nt := ncu_loc((br - 1) * 2 + bc); tok := true;
-                                else nt := to_integer(unsigned(nb_ncu_top(5 * bc + 4 downto 5 * bc))); tok := (nb_at = '1'); end if;
+                                else nt := to_integer(unsigned(d_ncu_top(5 * bc + 4 downto 5 * bc))); tok := (d_at = '1'); end if;
                                 if bc > 0 then nl := ncu_loc(br * 2 + bc - 1); lok := true;
-                                else nl := to_integer(unsigned(nb_ncu_left(5 * br + 4 downto 5 * br))); lok := (nb_al = '1'); end if;
+                                else nl := to_integer(unsigned(d_ncu_left(5 * br + 4 downto 5 * br))); lok := (d_al = '1'); end if;
                             else
                                 if br > 0 then nt := ncv_loc((br - 1) * 2 + bc); tok := true;
-                                else nt := to_integer(unsigned(nb_ncv_top(5 * bc + 4 downto 5 * bc))); tok := (nb_at = '1'); end if;
+                                else nt := to_integer(unsigned(d_ncv_top(5 * bc + 4 downto 5 * bc))); tok := (d_at = '1'); end if;
                                 if bc > 0 then nl := ncv_loc(br * 2 + bc - 1); lok := true;
-                                else nl := to_integer(unsigned(nb_ncv_left(5 * br + 4 downto 5 * br))); lok := (nb_al = '1'); end if;
+                                else nl := to_integer(unsigned(d_ncv_left(5 * br + 4 downto 5 * br))); lok := (d_al = '1'); end if;
                             end if;
                         end if;
                         if tok and lok then ncv := (nt + nl + 1) / 2;
@@ -535,67 +580,34 @@ begin
                             for k in 0 to 14 loop p.levels(k) := zz(k + 1); end loop;
                             emit := (cbpc_q = 2);
                         end if;
-                        -- TotalCoeff for the neighbours (0 when the block is not coded)
-                        cnt := 0;
-                        for k in 0 to 15 loop
-                            if k < to_integer(p.n_coefs) and p.levels(k) /= 0 then cnt := cnt + 1; end if;
-                        end loop;
-                        if not emit then cnt := 0; end if;
-                        if md_blk_kind = '0' then
-                            if pl = 0 then ncy_loc(ix) <= cnt;
-                            elsif pl = 1 then ncu_loc(ix) <= cnt;
-                            else ncv_loc(ix) <= cnt;
-                            end if;
-                        end if;
                         pk_pkt <= p;
+                        pk_pl <= pl; pk_ix <= ix; pk_kind <= md_blk_kind; pk_cnt_pend <= '1';
                         if emit then pk_emit <= '1'; else pk_emit <= '0'; end if;
                         lvl_cnt <= lvl_cnt + 1;
-                        st <= S_LEVEL_PUSH;
+                        est <= E_LEVEL_PUSH;
                     elsif md_sdone = '1' or (lvl_cnt > 0 and md_sbusy = '0') then
-                        st <= S_NEXT;
+                        est <= E_IDLE;
                     end if;
-                when S_LEVEL_PUSH =>
-                    -- synthesis translate_off
-                    if DEBUG and pk_emit = '1' and dp_ready = '1' then
-                        report "HWB " & integer'image(to_integer(pk_pkt.block_type)) & " " & integer'image(to_integer(pk_pkt.n_coefs)) &
-                               " " & integer'image(to_integer(pk_pkt.nC)) & " " & integer'image(to_integer(pk_pkt.levels(0))) & " " &
-                               integer'image(to_integer(pk_pkt.levels(1))) & " " & integer'image(to_integer(pk_pkt.levels(2))) & " " &
-                               integer'image(to_integer(pk_pkt.levels(3))) & " " & integer'image(to_integer(pk_pkt.levels(4))) & " " &
-                               integer'image(to_integer(pk_pkt.levels(5))) & " " & integer'image(to_integer(pk_pkt.levels(6))) & " " &
-                               integer'image(to_integer(pk_pkt.levels(7))) severity note;
+                when E_LEVEL_PUSH =>
+                    -- TotalCoeff for the neighbours (0 when the block is not coded)
+                    if pk_cnt_pend = '1' then
+                        cnt := 0;
+                        for k in 0 to 15 loop
+                            if k < to_integer(pk_pkt.n_coefs) and pk_pkt.levels(k) /= 0 then cnt := cnt + 1; end if;
+                        end loop;
+                        if pk_emit = '0' then cnt := 0; end if;
+                        if pk_kind = '0' then
+                            if pk_pl = 0 then ncy_loc(pk_ix) <= cnt;
+                            elsif pk_pl = 1 then ncu_loc(pk_ix) <= cnt;
+                            else ncv_loc(pk_ix) <= cnt;
+                            end if;
+                        end if;
+                        pk_cnt_pend <= '0';
                     end if;
-                    -- synthesis translate_on
                     if pk_emit = '0' or dp_ready = '1' then
                         pk_emit <= '0';
-                        if lvl_cnt = 27 or (d_is4 = '1' and lvl_cnt = 26) then st <= S_NEXT; else st <= S_LEVELS; end if;
+                        if lvl_cnt = 27 or (d_is4 = '1' and lvl_cnt = 26) then est <= E_IDLE; else est <= E_LEVELS; end if;
                     end if;
-                when S_NEXT =>
-                    -- commit this MB to the line buffer (recon stream came first)
-                    if rec_done = '1' and lb_commit_ready = '1' then
-                        cm_ncy <= (others => '0'); cm_ncu <= (others => '0'); cm_ncv <= (others => '0');
-                        for k in 0 to 15 loop cm_ncy(5 * k + 4 downto 5 * k) <= std_logic_vector(to_unsigned(ncy_loc(k), 5)); end loop;
-                        for k in 0 to 3 loop
-                            cm_ncu(5 * k + 4 downto 5 * k) <= std_logic_vector(to_unsigned(ncu_loc(k), 5));
-                            cm_ncv(5 * k + 4 downto 5 * k) <= std_logic_vector(to_unsigned(ncv_loc(k), 5));
-                        end loop;
-                        if d_is4 = '1' then m4 := d_modes4; else m4 := x"2222222222222222"; end if;
-                        cm_m4 <= m4;
-                        lb_commit_valid <= '1';
-                        cm_col <= mb_c;
-                        rec_done <= '0';
-                        if mb_c = mbs_w - 1 then
-                            mb_c <= (others => '0');
-                            if mb_r = mbs_h - 1 then st <= S_STOP; else mb_r <= mb_r + 1; st <= S_WAIT_BANK; end if;
-                        else
-                            mb_c <= mb_c + 1; st <= S_WAIT_BANK;
-                        end if;
-                    end if;
-                when S_STOP =>
-                    if dp_ready = '1' then st <= S_FLUSH; end if;
-                when S_FLUSH =>
-                    if dp_ready = '1' then st <= S_FLUSH_WAIT; end if;
-                when S_FLUSH_WAIT =>
-                    if dp_flushed = '1' then frame_done_q <= '1'; st <= S_IDLE; end if;
             end case;
         end if;
     end process;

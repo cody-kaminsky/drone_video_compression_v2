@@ -40,9 +40,10 @@ entity transform_engine is
     generic (
         W   : positive := 20;   -- internal datapath width (see header)
         -- "both": all six modes. "fwd": modes 0/2/4 only, "inv": modes
-        -- 1/3/5 only. A single-direction instance drops the unused
-        -- operand muxes; the pipeline has separate T and iT stages, so
-        -- each can be specialized. Unsupported modes give garbage.
+        -- 1/3/5 only, "had": mode 3 only (a 4x4 Hadamard lane; mode_i is
+        -- ignored). A single-direction instance drops the unused operand
+        -- muxes; the pipeline has separate T and iT stages, so each can be
+        -- specialized. Unsupported modes give garbage.
         DIR : string   := "both"
     );
     port (
@@ -149,7 +150,10 @@ architecture rtl of transform_engine is
         variable sub_d      : std_logic;
     begin
         -- Mode decode; constant-folded away in single-direction instances.
-        if DIR = "fwd" then
+        if DIR = "had" then
+            idct := false;
+            dct  := false;
+        elsif DIR = "fwd" then
             idct := false;
             dct  := (mode(2) = '0');            -- 0 = DCT, 2 = Hadamard
         elsif DIR = "inv" then
@@ -212,7 +216,7 @@ begin
                 d(12) := resize(din_12, W);  d(13) := resize(din_13, W);
                 d(14) := resize(din_14, W);  d(15) := resize(din_15, W);
 
-                is_2x2 := (mode_i = MODE_HAD2) or (mode_i = MODE_IHAD2);
+                is_2x2 := (DIR /= "had") and ((mode_i = MODE_HAD2) or (mode_i = MODE_IHAD2));
 
                 if is_2x2 then
                     -- 2x2 Hadamard == 4-point Hadamard of (d0, d2, d3, d1)
@@ -236,7 +240,7 @@ begin
                 -- Stage 2: column pass (bypassed for 2x2), truncation
                 -- for the forward modes 0 and 4.
                 ------------------------------------------------------
-                if row_mode = MODE_HAD2 or row_mode = MODE_IHAD2 then
+                if DIR /= "had" and (row_mode = MODE_HAD2 or row_mode = MODE_IHAD2) then
                     -- 2x2 result is already complete after the row pass;
                     -- elements 4..15 are zero as in the C reference.
                     -- (Leaving them undefined was tried and synthesized
@@ -254,7 +258,7 @@ begin
                     end loop;
                 end if;
 
-                if row_mode = MODE_DCT4 or row_mode = MODE_HAD2 then
+                if DIR /= "had" and (row_mode = MODE_DCT4 or row_mode = MODE_HAD2) then
                     for i in 0 to 15 loop
                         res(i) := trunc16(res(i));
                     end loop;

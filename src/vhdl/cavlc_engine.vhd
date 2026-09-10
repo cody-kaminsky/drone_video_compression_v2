@@ -46,6 +46,9 @@ use work.cavlc_pkg.all;
 use work.cavlc_tables.all;
 
 entity cavlc_engine is
+    generic (
+        DEBUG : boolean := false    -- state-transition reports in simulation
+    );
     port (
         clk     : in  std_logic;
         rst_n   : in  std_logic;
@@ -118,7 +121,7 @@ architecture rtl of cavlc_engine is
     signal cur_level : signed(12 downto 0);
 
     -- Loop counter (nonzeros processed so far / remaining)
-    signal idx : integer range 0 to 15;
+    signal idx : integer range 0 to 16;
 
     -- Suffix length for level encoding (spec 9.2.2)
     signal suffix_length : integer range 0 to 6;
@@ -322,7 +325,7 @@ begin
         variable v_emit_bits     : unsigned(BP_W - 1 downto 0);
         variable v_new_sl        : integer range 0 to 6;
         variable v_run           : integer range 0 to 15;
-        variable v_zl_idx        : integer range 0 to 6;
+        variable v_zl_idx        : integer range 0 to 15;
         variable v_vlc           : vlc_entry_t;
         -- True when a new field may be presented to the bit packer this
         -- cycle: either nothing is pending, or the pending field is being
@@ -383,7 +386,9 @@ begin
                         pkt_last <= in_last;
                         state    <= S_COUNT;
                         -- synthesis translate_off
+                        if DEBUG then
                         report "ENGINE: S_IDLE->S_COUNT at " & time'image(now) severity note;
+                        end if;
                         -- synthesis translate_on
                     end if;
 
@@ -457,11 +462,13 @@ begin
 
                     state <= S_COEFF_TOKEN;
                     -- synthesis translate_off
+                    if DEBUG then
                     report "ENGINE: S_COUNT->S_COEFF_TOKEN TC=" &
                            integer'image(v_total_coef) &
                            " T1=" & integer'image(v_trailing_ones) &
                            " TZ=" & integer'image((v_last_nz + 1) - v_total_coef)
                            severity note;
+                    end if;
                     -- synthesis translate_on
 
                 --------------------------------------------------------
@@ -485,17 +492,21 @@ begin
                         bp_length <= resize(ct_length, 6);
                         bp_valid  <= '1';
                         -- synthesis translate_off
+                        if DEBUG then
                         report "ENGINE: S_EMIT_CT pushed ct len=" &
                                integer'image(to_integer(ct_length)) &
                                " code=" & integer'image(to_integer(ct_code)) &
                                " bp_ready=" & std_logic'image(bp_ready) severity note;
+                        end if;
                         -- synthesis translate_on
                         if total_coef = 0 then
                             -- Empty block: done
                             if pkt_last = '1' then
                                 state <= S_DRAIN;
                                 -- synthesis translate_off
+                                if DEBUG then
                                 report "ENGINE: TC=0 pkt_last->S_DRAIN" severity note;
+                                end if;
                                 -- synthesis translate_on
                             else
                                 state <= S_DONE;
@@ -677,8 +688,10 @@ begin
                     if bp_flushed = '1' then
                         flush_sent <= '0';
                         -- synthesis translate_off
+                        if DEBUG then
                         report "ENGINE: S_DRAIN->S_DONE (flushed) at " &
                                time'image(now) severity note;
+                        end if;
                         -- synthesis translate_on
                         state <= S_DONE;
                     end if;
@@ -688,7 +701,9 @@ begin
                 --------------------------------------------------------
                 when S_DONE =>
                     -- synthesis translate_off
+                    if DEBUG then
                     report "ENGINE: S_DONE->S_IDLE" severity note;
+                    end if;
                     -- synthesis translate_on
                     state <= S_IDLE;
 
