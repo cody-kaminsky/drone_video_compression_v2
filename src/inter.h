@@ -72,6 +72,8 @@ int mvd_bits(int d);
 typedef struct {
     int range;         /* integer search range in samples (e.g. 16) */
     int lambda;        /* rate weight for the vector bits */
+    int clean_right;   /* > 0: every referenced sample (with the filter margin)
+                          must lie left of this luma x (strict intra refresh) */
 } me_params_t;
 
 int me_search_16x16(const ref_planes_t *rp, const u8 src[256],

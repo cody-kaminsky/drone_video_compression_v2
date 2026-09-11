@@ -82,6 +82,12 @@ typedef struct {
     int refresh_col;     /* first MB column of the intra refresh band (P frames) */
     int refresh_cols;    /* width of the band in MB columns (0 = no refresh) */
     int intra_budget;    /* extra intra MBs allowed per P frame outside the band */
+    int refresh_strict;  /* MBs left of the band only reference the refreshed part
+                            of the previous frame, and intra MBs next to the
+                            unrefreshed part avoid the modes that read it, so the
+                            refresh actually recovers from losses */
+    int deblock;         /* in-loop deblocking filter (spec 8.7) on the output and
+                            the reference; intra prediction stays unfiltered */
 } encode_cfg_t;
 
 typedef struct {

@@ -235,11 +235,13 @@ static int satd_16x16_pred(const u8 src[256], const u8 pred[256])
     return total;
 }
 
-/* keep the block (plus filter margin) inside the padded plane */
-static int mv_ok(const ref_planes_t *rp, int mb_r, int mb_c, int mvx, int mvy)
+/* keep the block (plus filter margin) inside the padded plane, and left of
+ * clean_right when the strict refresh constrains this MB */
+static int mv_ok(const ref_planes_t *rp, int mb_r, int mb_c, int mvx, int mvy, int clean_right)
 {
     int x0 = mb_c * 16 + (mvx >> 2), y0 = mb_r * 16 + (mvy >> 2);
     int m = REF_PAD - 4;
+    if (clean_right > 0 && x0 + 16 + 3 > clean_right) return 0;
     return x0 >= -m && x0 + 16 <= rp->width + m && y0 >= -m && y0 + 16 <= rp->height + m;
 }
 
@@ -250,12 +252,16 @@ int me_search_16x16(const ref_planes_t *rp, const u8 src[256],
     /* integer full search around the predictor (rounded to integer) */
     int cx = (pred_x + 2) >> 2, cy = (pred_y + 2) >> 2;   /* centre in integer samples */
     int bx = 0, by = 0, best = 0x7fffffff;
+    if (mp->clean_right > 0 && !mv_ok(rp, mb_r, mb_c, 0, 0, mp->clean_right)) {
+        /* the MB itself sits at the clean edge: only vectors pointing left are
+         * legal; the search below finds them */
+    }
     /* always evaluate the zero vector and the predictor first (ties keep them) */
     for (int dy = -mp->range; dy <= mp->range; dy++)
         for (int dx = -mp->range; dx <= mp->range; dx++) {
             int ix = cx + dx, iy = cy + dy;
             int mvx = ix * 4, mvy = iy * 4;
-            if (!mv_ok(rp, mb_r, mb_c, mvx, mvy)) continue;
+            if (!mv_ok(rp, mb_r, mb_c, mvx, mvy, mp->clean_right)) continue;
             int cost = sad_16x16_int(rp, src, mb_c * 16 + ix, mb_r * 16 + iy) +
                        mp->lambda * (mvd_bits(mvx - pred_x) + mvd_bits(mvy - pred_y));
             if (cost < best || (cost == best && abs_i(mvx) + abs_i(mvy) < abs_i(bx) + abs_i(by))) {
@@ -273,7 +279,7 @@ int me_search_16x16(const ref_planes_t *rp, const u8 src[256],
             for (int dx = -step; dx <= step; dx += step) {
                 if (dx == 0 && dy == 0) continue;
                 int mvx = ox + dx, mvy = oy + dy;
-                if (!mv_ok(rp, mb_r, mb_c, mvx, mvy)) continue;
+                if (!mv_ok(rp, mb_r, mb_c, mvx, mvy, mp->clean_right)) continue;
                 mc_luma_16x16(rp, mb_r, mb_c, mvx, mvy, pred);
                 int cost = satd_16x16_pred(src, pred) +
                            mp->lambda * (mvd_bits(mvx - pred_x) + mvd_bits(mvy - pred_y));

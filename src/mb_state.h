@@ -122,6 +122,9 @@ typedef struct {
     int is_skip;
     int mvx, mvy;
     int mvd_x, mvd_y;
+    /* strict refresh: the MB above-right is not yet refreshed, so the I_4x4
+     * modes of block 5 that read its samples are not allowed */
+    int no_topright_modes;
 } mb_state_t;
 
 #endif

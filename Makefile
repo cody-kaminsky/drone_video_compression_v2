@@ -28,7 +28,7 @@ BUILD   := build
 # regardless of which encoder front-end links them.
 SHARED_SRCS := $(SRC_DIR)/transform.c $(SRC_DIR)/quant.c $(SRC_DIR)/intra.c \
                $(SRC_DIR)/cavlc.c $(SRC_DIR)/bitstream.c $(SRC_DIR)/nal.c \
-               $(SRC_DIR)/psnr.c $(SRC_DIR)/inter.c
+               $(SRC_DIR)/psnr.c $(SRC_DIR)/inter.c $(SRC_DIR)/deblock.c
 SHARED_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SHARED_SRCS))
 
 # C-reference-only sources: top-level encoder loop + driver.

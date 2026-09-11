@@ -17,6 +17,8 @@
  *                     (default 1; 0 disables the refresh)
  *   --intra-budget B  extra intra MBs allowed per P frame (default 64)
  *   --me-range R      integer search range in samples (default 16)
+ *   --no-strict-refresh  let MBs left of the band reference unrefreshed area
+ *   --no-deblock      in-loop deblocking off (the I-only hardware kernel's mode)
  *
  * Stdout:
  *   STAT key: value lines per frame and totals, suitable for parsing.
@@ -39,7 +41,8 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr,
             "usage: %s <in.yuv> <width> <height> <qp> [recon.yuv [bitstream.264]] [options]\n"
-            "  --frames N  --intra-only  --gop G  --refresh-cols C  --intra-budget B  --me-range R\n",
+            "  --frames N  --intra-only  --gop G  --refresh-cols C  --intra-budget B  --me-range R\n"
+            "  --no-strict-refresh  --no-deblock\n",
             argv[0]);
         return 1;
     }
@@ -49,6 +52,7 @@ int main(int argc, char **argv)
     int qp     = atoi(argv[4]);
     const char *recon_path = NULL, *bs_path = NULL;
     int max_frames = -1, intra_only = 0, gop = 0, refresh_cols = 1, intra_budget = 64, me_range = 16;
+    int strict = 1, deblock = 1;
     int npos = 0;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc)            max_frames = atoi(argv[++i]);
@@ -57,6 +61,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--refresh-cols") && i + 1 < argc) refresh_cols = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--intra-budget") && i + 1 < argc) intra_budget = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--me-range") && i + 1 < argc)     me_range = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-strict-refresh"))            strict = 0;
+        else if (!strcmp(argv[i], "--no-deblock"))                   deblock = 0;
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); return 1; }
         else if (npos == 0) { recon_path = argv[i]; npos++; }
         else if (npos == 1) { bs_path = argv[i]; npos++; }
@@ -104,6 +110,8 @@ int main(int argc, char **argv)
         cfg.refresh_cols = refresh_cols;
         cfg.refresh_col = refresh_col;
         cfg.intra_budget = intra_budget;
+        cfg.refresh_strict = strict;
+        cfg.deblock = deblock;
 
         encode_stats_t stats;
         encode_pstats_t ps = {0, 0, 0};

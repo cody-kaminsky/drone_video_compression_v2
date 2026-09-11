@@ -24,6 +24,7 @@
 #include "mb_state.h"
 #include "rd_tables.h"
 #include "inter.h"
+#include "deblock.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -80,6 +81,7 @@ static i16 arena_mvy     [ARENA_MBS];
 static u8  arena_mb_intra[ARENA_MBS];
 static int ref_valid = 0;          /* a reference frame exists */
 static int ref_w = 0, ref_h = 0;
+static dbk_mb_t arena_dbk[ARENA_MBS];   /* per-MB deblocking info of the current picture */
 
 /* ===== local helpers ===== */
 
@@ -478,7 +480,7 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
                          const u8 *recon_y_frame, int stride_recon_y,
                          int modes4_out[16],
                          i16 ac_levels_out[16][16],
-                         u8 recon_mb_out[256])
+                         u8 recon_mb_out[256], int no_topright_modes)
 {
     /* Header estimate for I_4x4: mb_type=0 (1 bit), 16 mode flags (~2 bits
      * each on average), intra_chroma_pred_mode (~3 bits), me(cbp) (~6 bits),
@@ -528,6 +530,10 @@ static int try_path_i4x4(const u8 src_mb[256], int qp,
             if ((m == I4_HORIZONTAL || m == I4_HORIZONTAL_UP) && !al) continue;
             if ((m == I4_DIAG_DOWN_RIGHT || m == I4_VERTICAL_RIGHT ||
                  m == I4_HORIZONTAL_DOWN) && !(at && al && atl)) continue;
+            /* strict refresh: block 5's top-right samples come from the MB
+             * above-right, which is not yet refreshed */
+            if (no_topright_modes && blk == 5 &&
+                (m == I4_DIAG_DOWN_LEFT || m == I4_VERTICAL_LEFT)) continue;
             u8 *pred = cand_pred[ncand];
             predict_4x4(m, top, left, tl, at, al, atl, pred);       /* closed-loop, for the RD pass */
             u8 spred[16];
@@ -694,7 +700,7 @@ static void mb_mode_decide(int mbs_w, const u8 *recon_y_frame,
     int bits_b = try_path_i4x4(st->src_y, st->qp_y,
                                st->mb_r, st->mb_c, mbs_w,
                                recon_y_frame, stride_recon_y,
-                               modes4_b, ac_lev_b, recon_b);
+                               modes4_b, ac_lev_b, recon_b, st->no_topright_modes);
 
     st->dbg_bits_a = bits_a;
     st->dbg_bits_b = bits_b;
@@ -1682,6 +1688,10 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                                st.recon_u, st.recon_v);
 
     mb_compute_cbp(&st);
+    arena_dbk[mb_r * mbs_w + mb_c].intra = 1;
+    arena_dbk[mb_r * mbs_w + mb_c].nz = 0;
+    arena_dbk[mb_r * mbs_w + mb_c].mvx = 0;
+    arena_dbk[mb_r * mbs_w + mb_c].mvy = 0;
 
     dump_mb_vector(&st, recon_y, recon_stride_y, mbs_w, ncs);
 
@@ -1790,6 +1800,14 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
 
     int in_band = (cfg->refresh_cols > 0) &&
                   (mb_c >= cfg->refresh_col && mb_c < cfg->refresh_col + cfg->refresh_cols);
+    /* strict refresh: left of the band only the refreshed columns of the
+     * previous frame may be referenced; an intra MB whose above-right
+     * neighbour is unrefreshed must not read it */
+    int strict = cfg->refresh_strict && cfg->refresh_cols > 0;
+    int clean_right = (strict && mb_c < cfg->refresh_col) ? cfg->refresh_col * 16 : 0;
+    st.no_topright_modes = strict && (mb_c + 1 < mbs_w) &&
+                           (mb_c + 1 >= cfg->refresh_col + cfg->refresh_cols) &&
+                           (mb_c < cfg->refresh_col + cfg->refresh_cols);
 
     /* ---- inter candidate: predictor, search, code ---- */
     int pred_x = 0, pred_y = 0, skip_x = 0, skip_y = 0;
@@ -1800,7 +1818,7 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
     if (!in_band) {
         si = st;
         si.is_inter = 1;
-        me_params_t mp = { cfg->me_range, me_lambda(qp_y) };
+        me_params_t mp = { cfg->me_range, me_lambda(qp_y), clean_right };
         me_search_16x16(rp, si.src_y, mb_r, mb_c, pred_x, pred_y, &mp, &si.mvx, &si.mvy);
         si.mvd_x = si.mvx - pred_x; si.mvd_y = si.mvy - pred_y;
         int luma_bits = inter_luma_code(&si, rp);
@@ -1828,14 +1846,20 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
     }
 
     mb_state_t *w = use_intra ? &st : &si;
+    dbk_mb_t *dk = &arena_dbk[mb_r * mbs_w + mb_c];
     if (use_intra) {
         mb_compute_cbp(w);
         mf->is_intra[mb_r * mbs_w + mb_c] = 1;
         mf->mvx[mb_r * mbs_w + mb_c] = 0; mf->mvy[mb_r * mbs_w + mb_c] = 0;
+        dk->intra = 1; dk->nz = 0; dk->mvx = 0; dk->mvy = 0;
         if (ps) ps->mbs_intra++;
     } else {
         mf->is_intra[mb_r * mbs_w + mb_c] = 0;
         mf->mvx[mb_r * mbs_w + mb_c] = (i16)w->mvx; mf->mvy[mb_r * mbs_w + mb_c] = (i16)w->mvy;
+        dk->intra = 0; dk->mvx = (i16)w->mvx; dk->mvy = (i16)w->mvy; dk->nz = 0;
+        for (int idx = 0; idx < 16; idx++)
+            for (int k = 0; k < 16; k++)
+                if (w->ac_levels_y_full[idx][k]) { dk->nz |= (u16)(1u << idx); break; }
         if (ps) { if (w->is_skip) ps->mbs_skip++; else ps->mbs_inter++; }
     }
 
@@ -1927,7 +1951,7 @@ int encode_frame_h264(int width, int height, int qp,
                       u8 *bs_out, int bs_max_size, int frame_num,
                       encode_stats_t *stats)
 {
-    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0 };
+    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1 };
     return encode_frame_h264_ext(width, height, qp, src_y, stride_y, src_uv, stride_uv,
                                  recon_y_out, recon_stride_y, recon_uv_out, recon_stride_uv,
                                  bs_out, bs_max_size, &cfg, stats, NULL);
@@ -1990,12 +2014,15 @@ int encode_frame_h264_ext(int width, int height, int qp,
         bs_put_bits(&bs, 0, 1);              /* adaptive_ref_pic_marking_mode_flag (sliding window) */
     }
     bs_put_se(&bs, 0);                       /* slice_qp_delta */
-    /* disable_deblocking_filter_idc = 1: in-loop deblocking is OFF.
-     * Our internal recon doesn't deblock (deblock module deferred), so to
-     * stay bit-exact with the decoder we tell the decoder not to deblock
-     * either. Cost: some block-edge artifacts; deblocking is M3 work. */
-    bs_put_ue(&bs, 1);                       /* disable_deblocking_filter_idc */
-    /* When idc != 1, alpha/beta offsets are NOT signaled. */
+    if (cfg->deblock) {
+        bs_put_ue(&bs, 0);                   /* disable_deblocking_filter_idc = 0: filter on */
+        bs_put_se(&bs, 0);                   /* slice_alpha_c0_offset_div2 */
+        bs_put_se(&bs, 0);                   /* slice_beta_offset_div2 */
+    } else {
+        /* the decoder must not deblock either, so its output matches the
+         * unfiltered reconstruction (the I-only hardware kernel's mode) */
+        bs_put_ue(&bs, 1);                   /* disable_deblocking_filter_idc = 1 */
+    }
 
     /* Recon buffers from the static arena. */
     u8 *recon_y_int  = arena_recon_y;
@@ -2091,16 +2118,21 @@ int encode_frame_h264_ext(int width, int height, int qp,
     if (n < 0) return -6;
     dst_pos += n;
 
+    /* The reference (and the output) is the deblocked picture; intra
+     * prediction inside the frame used the unfiltered samples, as the spec
+     * defines. */
     keep_reference(recon_y_int, recon_uv_int, width, height);
+    if (cfg->deblock)
+        deblock_frame(arena_ref_y, width, arena_ref_uv, width, mbs_w, mbs_h, arena_dbk, qp, qp_c);
 
     /* Optional recon copy-out (test bench / measurement only — the FPGA IP
      * does not write recon to host memory). */
     if (recon_y_out)
         for (int i = 0; i < height; i++)
-            memcpy(&recon_y_out[i * recon_stride_y], &recon_y_int[i * width], width);
+            memcpy(&recon_y_out[i * recon_stride_y], &arena_ref_y[i * width], width);
     if (recon_uv_out)
         for (int i = 0; i < height/2; i++)
-            memcpy(&recon_uv_out[i * recon_stride_uv], &recon_uv_int[i * width], width);
+            memcpy(&recon_uv_out[i * recon_stride_uv], &arena_ref_uv[i * width], width);
 
     /* Kernel-level stats: integer-only quantities that map onto the FPGA
      * hardware register set (architecture.txt §10: BS_BYTES_OUT, PERF_MB_DONE).
