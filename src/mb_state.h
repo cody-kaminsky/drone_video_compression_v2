@@ -112,6 +112,16 @@ typedef struct {
 
     /* estimated bits of both luma paths (debug / vector dump) */
     int dbg_bits_a, dbg_bits_b;
+
+    /* ===== P-slice fields =====
+     * is_inter: coded as P_L0_16x16 (or P_Skip when is_skip). The luma
+     * levels live in ac_levels_y_full (16 coefficients per block, like
+     * I_4x4) and cbp_luma is the 4-bit quadrant field. Vectors are in
+     * quarter samples; mvd is what the bitstream carries. */
+    int is_inter;
+    int is_skip;
+    int mvx, mvy;
+    int mvd_x, mvd_y;
 } mb_state_t;
 
 #endif

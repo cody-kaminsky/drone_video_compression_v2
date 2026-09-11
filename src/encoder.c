@@ -23,6 +23,7 @@
 #include "nal.h"
 #include "mb_state.h"
 #include "rd_tables.h"
+#include "inter.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -64,6 +65,21 @@ static u8 arena_rbsp       [ARENA_RBSP_BYTES];
  * computation. Storing I4_DC directly avoids a sentinel + special-case
  * lookup path. */
 static u8  arena_luma_mode4 [ARENA_LUMA_W4   * ARENA_LUMA_H4];
+
+/* ===== P-frame state =====
+ * The previous frame's reconstruction (the reference), its padded copies
+ * for motion compensation, and the current picture's vector field. */
+#define ARENA_MBS ((MAX_W / 16) * (MAX_H / 16))
+static u8  arena_ref_y   [MAX_W * MAX_H];
+static u8  arena_ref_uv  [MAX_W * (MAX_H / 2)];
+static u8  arena_pad_y   [(MAX_W + 2 * REF_PAD) * (MAX_H + 2 * REF_PAD)];
+static u8  arena_pad_u   [(MAX_W / 2 + 2 * REF_PAD_C) * (MAX_H / 2 + 2 * REF_PAD_C)];
+static u8  arena_pad_v   [(MAX_W / 2 + 2 * REF_PAD_C) * (MAX_H / 2 + 2 * REF_PAD_C)];
+static i16 arena_mvx     [ARENA_MBS];
+static i16 arena_mvy     [ARENA_MBS];
+static u8  arena_mb_intra[ARENA_MBS];
+static int ref_valid = 0;          /* a reference frame exists */
+static int ref_w = 0, ref_h = 0;
 
 /* ===== local helpers ===== */
 
@@ -758,12 +774,13 @@ static void mb_transform(mb_state_t *st)
 /* === stage 4: mb_quantize (chroma only) === */
 static void mb_quantize(mb_state_t *st)
 {
+    int intra = !st->is_inter;
     for (int idx = 0; idx < 4; idx++) {
-        quant_4x4(st->dct_ac_u[idx], st->ac_levels_u[idx], st->qp_c, 1);
-        quant_4x4(st->dct_ac_v[idx], st->ac_levels_v[idx], st->qp_c, 1);
+        quant_4x4(st->dct_ac_u[idx], st->ac_levels_u[idx], st->qp_c, intra);
+        quant_4x4(st->dct_ac_v[idx], st->ac_levels_v[idx], st->qp_c, intra);
     }
-    quant_dc_2x2(st->dc_had_u, st->dc_levels_u, st->qp_c, 1);
-    quant_dc_2x2(st->dc_had_v, st->dc_levels_v, st->qp_c, 1);
+    quant_dc_2x2(st->dc_had_u, st->dc_levels_u, st->qp_c, intra);
+    quant_dc_2x2(st->dc_had_v, st->dc_levels_v, st->qp_c, intra);
 }
 
 /* === stages 5+6: mb_reconstruct (chroma only) === */
@@ -816,7 +833,7 @@ static void mb_reconstruct(mb_state_t *st)
  * cbp_chroma is path-independent: 0=none, 1=DC only, 2=DC+AC. */
 static void mb_compute_cbp(mb_state_t *st)
 {
-    if (st->mb_type_is_i4x4) {
+    if (st->mb_type_is_i4x4 || st->is_inter) {
         int cbp = 0;
         for (int s = 0; s < 16; s++) {
             int br = blk_scan_br[s];
@@ -1053,15 +1070,15 @@ static int dbg_encode_block(bitstream_t *bs, const i16 *c, int n, block_type_t b
     return cavlc_encode_block(bs, c, n, bt, nC);
 }
 
-static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
+static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs, int mb_type_off)
 {
     int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
     int luma_w4   = ncs->luma_w4;
     int chroma_w4 = ncs->chroma_w4;
 
     if (st->mb_type_is_i4x4) {
-        /* mb_type = 0 (I_NxN). ue(0) = '1' (1 bit). */
-        bs_put_ue(bs, 0);
+        /* mb_type = 0 (I_NxN); in a P slice the intra types start at 5. */
+        bs_put_ue(bs, 0 + mb_type_off);
 
         /* Per-block prev/rem mode flags, in scan order. */
         for (int s = 0; s < 16; s++) {
@@ -1169,7 +1186,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs)
     /* mb_type for I_16x16: spec Table 7-11
      * mb_type = 1 + PredMode + 4*CBPChroma + 12*CBPLuma. */
     int mb_type = 1 + st->mode16 + 4 * st->cbp_chroma + 12 * st->cbp_luma;
-    bs_put_ue(bs, mb_type);
+    bs_put_ue(bs, mb_type + mb_type_off);
     bs_put_ue(bs, st->mode_chroma);     /* intra_chroma_pred_mode */
     bs_put_se(bs, 0);                   /* mb_qp_delta = 0 (always for I_16x16) */
 
@@ -1671,7 +1688,7 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
 #ifdef MB_SELFDECODE
     int mb_start_bit = bs->byte_pos * 8 + bs->n_in_cur;
 #endif
-    int rc = mb_cavlc_emit(&st, ncs, bs);
+    int rc = mb_cavlc_emit(&st, ncs, bs, 0);
 #ifdef MB_SELFDECODE
     if (dec_state.initialized) {
         verify_mb_at(bs, mb_start_bit, &st, ncs);
@@ -1679,6 +1696,227 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
     }
 #endif
     return rc;
+}
+
+
+/* ============================================================================
+ * P frames: 16x16 motion compensation from the previous frame, P_Skip,
+ * intra MBs (refresh band + budget), and the P slice syntax.
+ * ============================================================================ */
+
+/* lambda for the motion search (SAD / SATD domain) */
+static int me_lambda(int qp)
+{
+    /* 0.92 * 2^((qp-12)/6), integer */
+    static const int tab[52] = {
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,2,2,2,3,3,4,4,5,5,6,7,8,9,10,12,13,15,
+        16,18,21,23,26,29,33,37,42,47,52,59,66,74,83,93 };
+    return tab[qp < 0 ? 0 : (qp > 51 ? 51 : qp)];
+}
+
+/* estimated CAVLC bits of the chroma residual of st (levels already quantized) */
+static int chroma_bits_estimate(const mb_state_t *st)
+{
+    int bits = 0;
+    i16 zz[16];
+    for (int k = 0; k < 4; k++) zz[k] = st->dc_levels_u[k];
+    bits += cavlc_estimate_block_bits(zz, 4, BLK_CHROMA_DC, -1);
+    for (int k = 0; k < 4; k++) zz[k] = st->dc_levels_v[k];
+    bits += cavlc_estimate_block_bits(zz, 4, BLK_CHROMA_DC, -1);
+    for (int idx = 0; idx < 4; idx++) {
+        for (int k = 0; k < 16; k++) zz[k] = st->ac_levels_u[idx][zz_scan_4x4[k]];
+        bits += cavlc_estimate_block_bits(&zz[1], 15, BLK_CHROMA_AC, 0);
+        for (int k = 0; k < 16; k++) zz[k] = st->ac_levels_v[idx][zz_scan_4x4[k]];
+        bits += cavlc_estimate_block_bits(&zz[1], 15, BLK_CHROMA_AC, 0);
+    }
+    return bits;
+}
+
+/* chroma stages 2..6 for the prediction already in st->pred_u / pred_v */
+static void chroma_code(mb_state_t *st)
+{
+    mb_residual(st);
+    mb_transform(st);
+    mb_quantize(st);
+    mb_reconstruct(st);
+}
+
+/* Inter luma coding for vector (st->mvx, st->mvy): motion-compensated
+ * prediction, 16 x (residual, DCT, inter quant, dequant, IDCT, recon).
+ * Returns the estimated CAVLC bits of the 16 luma blocks. */
+static int inter_luma_code(mb_state_t *st, const ref_planes_t *rp)
+{
+    mc_luma_16x16(rp, st->mb_r, st->mb_c, st->mvx, st->mvy, st->pred_y);
+    int bits = 0;
+    for (int br = 0; br < 4; br++)
+        for (int bc = 0; bc < 4; bc++) {
+            int idx = br * 4 + bc;
+            i16 res[16], dct[16], zz[16];
+            residual_4x4(st->src_y, st->pred_y, br, bc, res);
+            dct4x4(res, dct);
+            quant_4x4(dct, st->ac_levels_y_full[idx], st->qp_y, 0);
+            zigzag_4x4(st->ac_levels_y_full[idx], zz);
+            bits += cavlc_estimate_block_bits(zz, 16, BLK_LUMA_FULL, 0);
+            i32 dq[16], rr[16];
+            iquant_4x4(st->ac_levels_y_full[idx], dq, st->qp_y);
+            idct4x4(dq, rr);
+            recon_4x4(st->recon_y, st->pred_y, br, bc, rr);
+        }
+    return bits;
+}
+
+/* ue(v) length of a coded_block_pattern codeNum */
+static int ue_bits(int codenum)
+{
+    int n = 0; unsigned v = (unsigned)codenum + 1;
+    while (v > 1) { v >>= 1; n++; }
+    return 2 * n + 1;
+}
+
+/* One MB of a P slice. Returns 0 on success. */
+static int encode_mb_p(const u8 *src_y,  int stride_y,
+                       const u8 *src_uv, int stride_uv,
+                       u8 *recon_y, int recon_stride_y,
+                       u8 *recon_uv, int recon_stride_uv,
+                       int mb_r, int mb_c, int width, int height, int mbs_w,
+                       int qp_y, int qp_c, nc_state_t *ncs, const ref_planes_t *rp,
+                       mv_field_t *mf, const encode_cfg_t *cfg, int *intra_budget,
+                       bitstream_t *bs, int *skip_run, encode_pstats_t *ps)
+{
+    mb_state_t st = {0};
+    st.mb_r = mb_r; st.mb_c = mb_c; st.qp_y = qp_y; st.qp_c = qp_c;
+    mb_fetch(src_y, stride_y, src_uv, stride_uv, recon_y, recon_stride_y,
+             recon_uv, recon_stride_uv, width, height, &st);
+
+    int in_band = (cfg->refresh_cols > 0) &&
+                  (mb_c >= cfg->refresh_col && mb_c < cfg->refresh_col + cfg->refresh_cols);
+
+    /* ---- inter candidate: predictor, search, code ---- */
+    int pred_x = 0, pred_y = 0, skip_x = 0, skip_y = 0;
+    mv_predict_16x16(mf, mb_r, mb_c, &pred_x, &pred_y);
+    mv_skip_16x16(mf, mb_r, mb_c, &skip_x, &skip_y);
+    int bits_inter = 0x7fffffff;
+    mb_state_t si;              /* inter-coded copy */
+    if (!in_band) {
+        si = st;
+        si.is_inter = 1;
+        me_params_t mp = { cfg->me_range, me_lambda(qp_y) };
+        me_search_16x16(rp, si.src_y, mb_r, mb_c, pred_x, pred_y, &mp, &si.mvx, &si.mvy);
+        si.mvd_x = si.mvx - pred_x; si.mvd_y = si.mvy - pred_y;
+        int luma_bits = inter_luma_code(&si, rp);
+        mc_chroma_8x8(rp, mb_r, mb_c, si.mvx, si.mvy, si.pred_u, si.pred_v);
+        chroma_code(&si);
+        mb_compute_cbp(&si);
+        int cbp = (si.cbp_luma & 0xF) | ((si.cbp_chroma & 3) << 4);
+        bits_inter = 1 + mvd_bits(si.mvd_x) + mvd_bits(si.mvd_y) + ue_bits(cbp_inter_to_codenum[cbp]);
+        if (cbp) bits_inter += 1 + luma_bits + chroma_bits_estimate(&si);
+        /* P_Skip: the skip vector with nothing to code costs the skip run only */
+        if (si.mvx == skip_x && si.mvy == skip_y && cbp == 0) { si.is_skip = 1; bits_inter = 1; }
+    }
+
+    /* ---- intra candidate: forced in the band, otherwise within the budget ---- */
+    int use_intra = in_band;
+    if (!in_band && *intra_budget > 0) {
+        mb_mode_decide(mbs_w, recon_y, recon_stride_y, &st);
+        chroma_code(&st);
+        int bits_intra = (st.dbg_bits_a < st.dbg_bits_b ? st.dbg_bits_a : st.dbg_bits_b) +
+                         chroma_bits_estimate(&st);
+        if (bits_intra < bits_inter) { use_intra = 1; (*intra_budget)--; }
+    } else if (in_band) {
+        mb_mode_decide(mbs_w, recon_y, recon_stride_y, &st);
+        chroma_code(&st);
+    }
+
+    mb_state_t *w = use_intra ? &st : &si;
+    if (use_intra) {
+        mb_compute_cbp(w);
+        mf->is_intra[mb_r * mbs_w + mb_c] = 1;
+        mf->mvx[mb_r * mbs_w + mb_c] = 0; mf->mvy[mb_r * mbs_w + mb_c] = 0;
+        if (ps) ps->mbs_intra++;
+    } else {
+        mf->is_intra[mb_r * mbs_w + mb_c] = 0;
+        mf->mvx[mb_r * mbs_w + mb_c] = (i16)w->mvx; mf->mvy[mb_r * mbs_w + mb_c] = (i16)w->mvy;
+        if (ps) { if (w->is_skip) ps->mbs_skip++; else ps->mbs_inter++; }
+    }
+
+    copy_out_mb_luma(recon_y, recon_stride_y, mb_r, mb_c, w->recon_y);
+    copy_out_mb_chroma_combine(recon_uv, recon_stride_uv, mb_r, mb_c, w->recon_u, w->recon_v);
+
+    /* ---- emission ---- */
+    int luma_w4 = ncs->luma_w4, chroma_w4 = ncs->chroma_w4;
+    if (use_intra) {
+        bs_put_ue(bs, *skip_run); *skip_run = 0;
+        mb_cavlc_emit(w, ncs, bs, 5);
+        return 0;
+    }
+    if (w->is_skip) {
+        (*skip_run)++;
+        /* neighbour state: nothing coded, not intra 4x4 */
+        for (int br = 0; br < 4; br++)
+            for (int bc = 0; bc < 4; bc++) {
+                int gx = mb_c * 4 + bc, gy = mb_r * 4 + br;
+                ncs->luma_nc[gy * luma_w4 + gx] = 0;
+                ncs->luma_mode4[gy * luma_w4 + gx] = I4_DC;
+            }
+        for (int br = 0; br < 2; br++)
+            for (int bc = 0; bc < 2; bc++) {
+                int gx = mb_c * 2 + bc, gy = mb_r * 2 + br;
+                ncs->chroma_u_nc[gy * chroma_w4 + gx] = 0;
+                ncs->chroma_v_nc[gy * chroma_w4 + gx] = 0;
+            }
+        return 0;
+    }
+    /* P_L0_16x16 */
+    bs_put_ue(bs, *skip_run); *skip_run = 0;
+    bs_put_ue(bs, 0);                         /* mb_type P_L0_16x16 */
+    bs_put_se(bs, w->mvd_x);                  /* mvd_l0 (ref_idx omitted: one reference) */
+    bs_put_se(bs, w->mvd_y);
+    int cbp = (w->cbp_luma & 0xF) | ((w->cbp_chroma & 3) << 4);
+    bs_put_ue(bs, cbp_inter_to_codenum[cbp]);
+    if (cbp) bs_put_se(bs, 0);                /* mb_qp_delta */
+    /* luma 4x4 blocks in scan order, per coded 8x8 quadrant */
+    for (int s = 0; s < 16; s++) {
+        int br = blk_scan_br[s], bc = blk_scan_bc[s], idx = br * 4 + bc;
+        i16 zz[16];
+        for (int k = 0; k < 16; k++) zz[k] = w->ac_levels_y_full[idx][zz_scan_4x4[k]];
+        int gx = mb_c * 4 + bc, gy = mb_r * 4 + br;
+        int top_nc  = (gy > 0) ? ncs->luma_nc[(gy - 1) * luma_w4 + gx] : 0;
+        int left_nc = (gx > 0) ? ncs->luma_nc[gy * luma_w4 + (gx - 1)] : 0;
+        int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
+        int quad_bit = (w->cbp_luma >> (s / 4)) & 1;
+        if (quad_bit) cavlc_encode_block(bs, zz, 16, BLK_LUMA_FULL, nC);
+        ncs->luma_nc[gy * luma_w4 + gx] = quad_bit ? count_nonzero(zz, 16) : 0;
+        ncs->luma_mode4[gy * luma_w4 + gx] = I4_DC;
+    }
+    if (w->cbp_chroma >= 1) {
+        cavlc_encode_block(bs, w->dc_levels_u, 4, BLK_CHROMA_DC, -1);
+        cavlc_encode_block(bs, w->dc_levels_v, 4, BLK_CHROMA_DC, -1);
+    }
+    for (int comp = 0; comp < 2; comp++) {
+        u8 *cnc = (comp == 0) ? ncs->chroma_u_nc : ncs->chroma_v_nc;
+        i16 (*ac_levels)[16] = (comp == 0) ? w->ac_levels_u : w->ac_levels_v;
+        for (int br = 0; br < 2; br++)
+            for (int bc = 0; bc < 2; bc++) {
+                int idx = br * 2 + bc;
+                i16 zz[16];
+                for (int k = 0; k < 16; k++) zz[k] = ac_levels[idx][zz_scan_4x4[k]];
+                int gx = mb_c * 2 + bc, gy = mb_r * 2 + br;
+                int top_nc  = (gy > 0) ? cnc[(gy - 1) * chroma_w4 + gx] : 0;
+                int left_nc = (gx > 0) ? cnc[gy * chroma_w4 + (gx - 1)] : 0;
+                int nC = cavlc_compute_nC(top_nc, left_nc, gy > 0, gx > 0);
+                if (w->cbp_chroma == 2) cavlc_encode_block(bs, &zz[1], 15, BLK_CHROMA_AC, nC);
+                cnc[gy * chroma_w4 + gx] = (w->cbp_chroma == 2) ? count_nonzero(&zz[1], 15) : 0;
+            }
+    }
+    return 0;
+}
+
+/* keep the reconstruction as the next frame's reference */
+static void keep_reference(const u8 *recon_y, const u8 *recon_uv, int width, int height)
+{
+    memcpy(arena_ref_y,  recon_y,  (size_t)width * height);
+    memcpy(arena_ref_uv, recon_uv, (size_t)width * (height / 2));
+    ref_valid = 1; ref_w = width; ref_h = height;
 }
 
 int encode_frame_h264(int width, int height, int qp,
@@ -1689,6 +1927,24 @@ int encode_frame_h264(int width, int height, int qp,
                       u8 *bs_out, int bs_max_size, int frame_num,
                       encode_stats_t *stats)
 {
+    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0 };
+    return encode_frame_h264_ext(width, height, qp, src_y, stride_y, src_uv, stride_uv,
+                                 recon_y_out, recon_stride_y, recon_uv_out, recon_stride_uv,
+                                 bs_out, bs_max_size, &cfg, stats, NULL);
+}
+
+int encode_frame_h264_ext(int width, int height, int qp,
+                          const u8 *src_y,  int stride_y,
+                          const u8 *src_uv, int stride_uv,
+                          u8 *recon_y_out,  int recon_stride_y,
+                          u8 *recon_uv_out, int recon_stride_uv,
+                          u8 *bs_out, int bs_max_size,
+                          const encode_cfg_t *cfg,
+                          encode_stats_t *stats, encode_pstats_t *pstats)
+{
+    int frame_num = cfg->frame_num;
+    int is_p = (cfg->frame_type == 1);
+    if (is_p && !(ref_valid && ref_w == width && ref_h == height)) return -7;
     if (width  % 16 != 0) return -1;
     if (height % 16 != 0) return -1;
     if (qp < 0 || qp > 51) return -2;
@@ -1703,15 +1959,17 @@ int encode_frame_h264(int width, int height, int qp,
     int chroma_w4 = mbs_w * 2;
     int chroma_h4 = mbs_h * 2;
 
-    /* === SPS + PPS === */
     int dst_pos = 0;
-    int n = nal_write_sps(bs_out + dst_pos, bs_max_size - dst_pos,
-                          width, height, qp);
-    if (n < 0) return -4;
-    dst_pos += n;
-    n = nal_write_pps(bs_out + dst_pos, bs_max_size - dst_pos, qp);
-    if (n < 0) return -4;
-    dst_pos += n;
+    int n;
+    if (!is_p) {
+        /* === SPS + PPS (IDR only) === */
+        n = nal_write_sps(bs_out + dst_pos, bs_max_size - dst_pos, width, height, qp);
+        if (n < 0) return -4;
+        dst_pos += n;
+        n = nal_write_pps(bs_out + dst_pos, bs_max_size - dst_pos, qp);
+        if (n < 0) return -4;
+        dst_pos += n;
+    }
 
     /* === Slice RBSP === */
     bitstream_t bs;
@@ -1719,12 +1977,18 @@ int encode_frame_h264(int width, int height, int qp,
 
     /* Slice header */
     bs_put_ue(&bs, 0);                       /* first_mb_in_slice */
-    bs_put_ue(&bs, 7);                       /* slice_type = 7 (I) */
+    bs_put_ue(&bs, is_p ? 5 : 7);            /* slice_type: 5 = P, 7 = I (all slices same) */
     bs_put_ue(&bs, 0);                       /* pic_parameter_set_id */
     bs_put_bits(&bs, frame_num & 0xF, 4);    /* frame_num */
-    bs_put_ue(&bs, frame_num & 0xF);         /* idr_pic_id */
-    bs_put_bits(&bs, 0, 1);                  /* no_output_of_prior_pics_flag */
-    bs_put_bits(&bs, 0, 1);                  /* long_term_reference_flag */
+    if (!is_p) {
+        bs_put_ue(&bs, frame_num & 0xF);     /* idr_pic_id */
+        bs_put_bits(&bs, 0, 1);              /* no_output_of_prior_pics_flag */
+        bs_put_bits(&bs, 0, 1);              /* long_term_reference_flag */
+    } else {
+        bs_put_bits(&bs, 0, 1);              /* num_ref_idx_active_override_flag */
+        bs_put_bits(&bs, 0, 1);              /* ref_pic_list_reordering_flag_l0 */
+        bs_put_bits(&bs, 0, 1);              /* adaptive_ref_pic_marking_mode_flag (sliding window) */
+    }
     bs_put_se(&bs, 0);                       /* slice_qp_delta */
     /* disable_deblocking_filter_idc = 1: in-loop deblocking is OFF.
      * Our internal recon doesn't deblock (deblock module deferred), so to
@@ -1738,6 +2002,19 @@ int encode_frame_h264(int width, int height, int qp,
     u8 *recon_uv_int = arena_recon_uv;
     memset(recon_y_int,  128, (size_t)width * height);
     memset(recon_uv_int, 128, (size_t)width * (height / 2));
+
+    /* P frame: padded reference from the previous reconstruction, and the
+     * vector field of this picture */
+    ref_planes_t rp;
+    mv_field_t mf = { arena_mvx, arena_mvy, arena_mb_intra, mbs_w, mbs_h };
+    if (is_p) {
+        ref_build(&rp, arena_pad_y, arena_pad_u, arena_pad_v,
+                  arena_ref_y, width, arena_ref_uv, width, width, height);
+        memset(arena_mb_intra, 0, (size_t)mb_count);
+        memset(arena_mvx, 0, (size_t)mb_count * sizeof(i16));
+        memset(arena_mvy, 0, (size_t)mb_count * sizeof(i16));
+    }
+    if (pstats) { pstats->mbs_intra = 0; pstats->mbs_inter = 0; pstats->mbs_skip = 0; }
 
     nc_state_t ncs;
     ncs.luma_nc     = arena_luma_nc;
@@ -1756,19 +2033,28 @@ int encode_frame_h264(int width, int height, int qp,
     int qp_c = chroma_qp(qp, 0);
 
 #ifdef MB_SELFDECODE
-    dec_state_init(luma_w4, chroma_w4);
+    if (!is_p) dec_state_init(luma_w4, chroma_w4);
 #endif
 
     /* Per-MB encoding into the slice RBSP */
     int payload_start_bit = bs.byte_pos * 8 + bs.n_in_cur;
+    int skip_run = 0;
+    int intra_budget = cfg->intra_budget;
     for (int r = 0; r < mbs_h; r++) {
         for (int c = 0; c < mbs_w; c++) {
-            encode_mb_emit(src_y, stride_y, src_uv, stride_uv,
-                           recon_y_int, width, recon_uv_int, width,
-                           r, c, width, height, mbs_w,
-                           qp, qp_c, &ncs, &bs);
+            if (is_p)
+                encode_mb_p(src_y, stride_y, src_uv, stride_uv,
+                            recon_y_int, width, recon_uv_int, width,
+                            r, c, width, height, mbs_w, qp, qp_c, &ncs, &rp, &mf, cfg,
+                            &intra_budget, &bs, &skip_run, pstats);
+            else
+                encode_mb_emit(src_y, stride_y, src_uv, stride_uv,
+                               recon_y_int, width, recon_uv_int, width,
+                               r, c, width, height, mbs_w,
+                               qp, qp_c, &ncs, &bs);
         }
     }
+    if (is_p && skip_run > 0) bs_put_ue(&bs, skip_run);   /* trailing skipped MBs */
 
     /* DCC_DUMP_SLICE=<path>: the MB-layer bits of this slice, re-aligned to
      * start at bit 0, with the rbsp stop bit and zero padding -- exactly
@@ -1799,10 +2085,13 @@ int encode_frame_h264(int width, int height, int qp,
     int rbsp_len = bs_byte_count(&bs);
     if (bs.overflow) return -6;
 
-    /* Wrap in IDR NAL */
-    n = nal_emit_idr(bs_out + dst_pos, bs_max_size - dst_pos, arena_rbsp, rbsp_len);
+    /* Wrap in the slice NAL */
+    if (is_p) n = nal_emit_slice(bs_out + dst_pos, bs_max_size - dst_pos, arena_rbsp, rbsp_len);
+    else      n = nal_emit_idr(bs_out + dst_pos, bs_max_size - dst_pos, arena_rbsp, rbsp_len);
     if (n < 0) return -6;
     dst_pos += n;
+
+    keep_reference(recon_y_int, recon_uv_int, width, height);
 
     /* Optional recon copy-out (test bench / measurement only — the FPGA IP
      * does not write recon to host memory). */

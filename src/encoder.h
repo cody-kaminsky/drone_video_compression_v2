@@ -61,4 +61,46 @@ int encode_frame_h264(int width, int height, int qp,
                       u8 *bs_out, int bs_max_size, int frame_num,
                       encode_stats_t *stats);
 
+/* ===== P frames with rolling intra refresh =====
+ *
+ * A sequence is coded as one IDR frame followed by P frames that predict
+ * from the previous frame's reconstruction (one reference, 16x16 vectors,
+ * quarter-sample motion compensation). Instead of periodic I frames, a
+ * band of refresh_cols MB columns is forced intra in every P frame and
+ * walks across the picture (refresh_col is the band's first column), so
+ * every MB is refreshed once per mbs_w / refresh_cols frames and the frame
+ * size stays flat. Outside the band an MB may still be coded intra when
+ * that is cheaper, but only intra_budget MBs per frame may do so, which
+ * bounds the per-frame work of the hardware pipeline.
+ *
+ * Every P_Skip / P_L0_16x16 / intra decision is made from estimated
+ * CAVLC bits, as the intra paths do. */
+typedef struct {
+    int frame_type;      /* 0 = IDR, 1 = P */
+    int frame_num;       /* frame_num for the slice header (IDR: also idr_pic_id) */
+    int me_range;        /* integer search range in samples around the predictor */
+    int refresh_col;     /* first MB column of the intra refresh band (P frames) */
+    int refresh_cols;    /* width of the band in MB columns (0 = no refresh) */
+    int intra_budget;    /* extra intra MBs allowed per P frame outside the band */
+} encode_cfg_t;
+
+typedef struct {
+    int mbs_intra;       /* per-frame decision counts */
+    int mbs_inter;
+    int mbs_skip;
+} encode_pstats_t;
+
+/* Encode one frame per cfg. The reconstruction of the previous call is the
+ * reference for a P frame (the encoder keeps it internally). An IDR frame
+ * writes SPS + PPS + IDR NAL; a P frame writes one non-IDR slice NAL.
+ * pstats may be NULL. */
+int encode_frame_h264_ext(int width, int height, int qp,
+                          const u8 *src_y,  int stride_y,
+                          const u8 *src_uv, int stride_uv,
+                          u8 *recon_y_out,  int recon_stride_y,
+                          u8 *recon_uv_out, int recon_stride_uv,
+                          u8 *bs_out, int bs_max_size,
+                          const encode_cfg_t *cfg,
+                          encode_stats_t *stats, encode_pstats_t *pstats);
+
 #endif

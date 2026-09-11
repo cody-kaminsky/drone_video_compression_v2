@@ -119,6 +119,16 @@ int nal_write_slice_header(u8 *rbsp_dst, int dst_cap, int frame_num,
     return bs.byte_pos * 8 + bs.n_in_cur;
 }
 
+int nal_emit_slice(u8 *dst, int dst_cap, const u8 *rbsp, int rbsp_len)
+{
+    if (dst_cap < 5 + rbsp_len * 2) return -1;
+    dst[0] = 0x00; dst[1] = 0x00; dst[2] = 0x00; dst[3] = 0x01;
+    dst[4] = 0x41;                    /* nal_ref_idc=2, type=1 (non-IDR slice) */
+    int n = rbsp_emulation_prevent(dst + 5, dst_cap - 5, rbsp, rbsp_len);
+    if (n < 0) return -1;
+    return 5 + n;
+}
+
 int nal_emit_idr(u8 *dst, int dst_cap, const u8 *rbsp, int rbsp_len)
 {
     if (dst_cap < 5 + rbsp_len * 2) return -1;

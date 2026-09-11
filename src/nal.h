@@ -45,4 +45,7 @@ int nal_write_slice_header(u8 *rbsp_dst, int dst_cap, int frame_num,
  * Returns bytes written, or -1 on overflow. */
 int nal_emit_idr(u8 *dst, int dst_cap, const u8 *rbsp, int rbsp_len);
 
+/* Same for a non-IDR slice: nal_unit_type 1, nal_ref_idc 2 (reference). */
+int nal_emit_slice(u8 *dst, int dst_cap, const u8 *rbsp, int rbsp_len);
+
 #endif

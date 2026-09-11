@@ -240,4 +240,11 @@ static const u8 cbp_intra_to_codenum[48] = {
     41, 42, 43, 25, 44, 26, 46, 12, 45, 47, 27, 13, 28, 14, 15,  0,
 };
 
+/* Same table, column "Inter" (P macroblocks other than P_Skip). */
+static const u8 cbp_inter_to_codenum[48] = {
+     0,  2,  3,  7,  4,  8, 17, 13,  5, 18,  9, 14, 10, 15, 16, 11,
+     1, 32, 33, 36, 34, 37, 44, 40, 35, 45, 38, 41, 39, 42, 43, 19,
+     6, 24, 25, 20, 26, 21, 46, 28, 27, 47, 22, 29, 23, 30, 31, 12,
+};
+
 #endif
