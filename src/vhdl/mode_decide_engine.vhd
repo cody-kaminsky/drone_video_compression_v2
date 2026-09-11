@@ -172,7 +172,7 @@ architecture rtl of mode_decide_engine is
     constant W_INV16 : integer := 4;
     constant W_FULL4 : integer := 16;   -- the last J lands as the wait expires; commit reads it the cycle after
     constant W_SCRC  : integer := 10;
-    constant W_FWDC  : integer := 9;
+    constant W_FWDC  : integer := 10;   -- +1: the DC vector is registered at the HADC issue
     constant W_HADC  : integer := 14;
     constant W_INVC  : integer := 11;
 
@@ -603,6 +603,7 @@ architecture rtl of mode_decide_engine is
     signal t_tag_q : tag_t := TAG_NONE;
     signal t_dc0_q : s32 := (others => '0');
     signal t_dc0_en_q : std_logic := '0';
+    signal t_dcv_q : s16_arr16 := (others => (others => '0'));   -- DC vector, loaded at the HAD issue
     signal tt : tag_arr(1 to 2) := (others => TAG_NONE);
 
     -- quant (q_deq: fused dequantised block, one cycle after q_dout)
@@ -925,11 +926,7 @@ begin
         elsif t_sel_dq_q = '1' then
             for k in 0 to 15 loop t_din(k) <= q_deq(k); end loop;
         elsif t_sel_dc_q = '1' then
-            if bhead_tag.op = OP_HAD16 then
-                for k in 0 to 15 loop t_din(k) <= resize(dc16(k), 32); end loop;
-            else
-                for k in 0 to 3 loop t_din(k) <= resize(dcc(bhead_tag.plane - 1)(k), 32); end loop;
-            end if;
+            for k in 0 to 15 loop t_din(k) <= resize(t_dcv_q(k), 32); end loop;
         elsif t_sel_r4_q = '1' then
             for k in 0 to 15 loop t_din(k) <= resize(res4_q(k), 32); end loop;
         elsif t_sel_r16_q = '1' then
@@ -1897,6 +1894,12 @@ begin
                 bhead_tag <= bht;
                 if bht.plane = 1 then pc_top <= top_u; pc_left <= left_u; pc_tl <= tl_u;
                 else pc_top <= top_v; pc_left <= left_v; pc_tl <= tl_v;
+                end if;
+                if bht.op = OP_HAD16 then
+                    t_dcv_q <= dc16;
+                elsif bht.op = OP_HADC then
+                    t_dcv_q <= (others => (others => '0'));
+                    for k in 0 to 3 loop t_dcv_q(k) <= dcc(bht.plane - 1)(k); end loop;
                 end if;
             end if;
 

@@ -43,7 +43,7 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: impl_ooc all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
@@ -171,6 +171,12 @@ $(BUILD)/hls:
 test: $(BIN_REF)
 	@python tools/make_test_frame.py $(BUILD)/test.yuv 256 256
 	$(BIN_REF) $(BUILD)/test.yuv 256 256 30 $(BUILD)/test_recon.yuv
+
+# Out-of-context implementation (synth, place, route) of the AXI wrapper;
+# reports and checkpoints in build/impl. Needs vivado on PATH.
+impl_ooc:
+	@mkdir -p $(BUILD)/impl
+	vivado -mode batch -source scripts/impl_ooc.tcl -log $(BUILD)/impl/vivado.log -journal $(BUILD)/impl/vivado.jou -tclargs $(BUILD)/impl 1920 2
 
 clean:
 	rm -rf $(BUILD)

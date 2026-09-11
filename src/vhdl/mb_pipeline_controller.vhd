@@ -194,7 +194,7 @@ architecture rtl of mb_pipeline_controller is
     type st_t is (S_IDLE, S_WAIT_BANK, S_ROW, S_FETCH, S_FETCH_WAIT, S_START, S_SRC_PRE, S_SRC, S_WAIT_MD,
                   S_WAIT_REC, S_STOP, S_FLUSH, S_FLUSH_WAIT);
     signal st : st_t := S_IDLE;
-    type est_t is (E_IDLE, E_HDR, E_HDR_WAIT, E_LEVELS, E_LEVEL_PUSH);
+    type est_t is (E_IDLE, E_HDR, E_HDR_WAIT, E_LEVELS, E_LEVEL_BUILD, E_LEVEL_PUSH);
     signal est : est_t := E_IDLE;
     signal em_start : std_logic := '0';
     signal frame_done_q : std_logic := '0';
@@ -210,6 +210,12 @@ architecture rtl of mb_pipeline_controller is
     signal pk_ix : integer range 0 to 15 := 0;
     signal pk_kind : std_logic := '0';
     signal pk_cnt_pend : std_logic := '0';
+    -- level item captured from the decider's stream (keeps the decider's
+    -- stream index off the nC / packet path)
+    signal it_plane : integer range 0 to 2 := 0;
+    signal it_idx : integer range 0 to 15 := 0;
+    signal it_kind : std_logic := '0';
+    signal it_levels : level_array_t := (others => (others => '0'));
 
 begin
 
@@ -523,11 +529,19 @@ begin
                     end if;
                 when E_LEVELS =>
                     if md_blk_valid = '1' then
-                        pl := to_integer(md_blk_plane); ix := to_integer(md_blk_idx);
+                        it_plane <= to_integer(md_blk_plane); it_idx <= to_integer(md_blk_idx);
+                        it_kind <= md_blk_kind; it_levels <= md_blk_levels;
+                        lvl_cnt <= lvl_cnt + 1;
+                        est <= E_LEVEL_BUILD;
+                    elsif md_sdone = '1' or (lvl_cnt > 0 and md_sbusy = '0') then
+                        est <= E_IDLE;
+                    end if;
+                when E_LEVEL_BUILD =>
+                        pl := it_plane; ix := it_idx;
                         br := ix / 4; bc := ix mod 4;
                         -- nC from the neighbours' TotalCoeff (spec 9.2.1)
                         if pl = 0 then
-                            if md_blk_kind = '1' then br := 0; bc := 0; end if;
+                            if it_kind = '1' then br := 0; bc := 0; end if;
                             if br > 0 then nt := ncy_loc((br - 1) * 4 + bc); tok := true;
                             else nt := to_integer(unsigned(d_ncy_top(5 * bc + 4 downto 5 * bc))); tok := (d_at = '1'); end if;
                             if bc > 0 then nl := ncy_loc(br * 4 + bc - 1); lok := true;
@@ -552,10 +566,10 @@ begin
                         else ncv := 0;
                         end if;
                         -- zigzag and packet shape
-                        for k in 0 to 15 loop zz(k) := md_blk_levels(ZIGZAG(k)); end loop;
+                        for k in 0 to 15 loop zz(k) := it_levels(ZIGZAG(k)); end loop;
                         p.nC := to_unsigned(ncv, 5);
                         p.levels := (others => (others => '0'));
-                        if md_blk_kind = '1' then
+                        if it_kind = '1' then
                             if pl = 0 then
                                 p.block_type := to_unsigned(BLK_LUMA_DC_16x16, 3); p.n_coefs := to_unsigned(16, 5);
                                 p.levels := zz;
@@ -563,7 +577,7 @@ begin
                             else
                                 p.block_type := to_unsigned(BLK_CHROMA_DC, 3); p.n_coefs := to_unsigned(4, 5);
                                 p.nC := to_unsigned(31, 5);
-                                for k in 0 to 3 loop p.levels(k) := md_blk_levels(k); end loop;
+                                for k in 0 to 3 loop p.levels(k) := it_levels(k); end loop;
                                 emit := (cbpc_q >= 1);
                             end if;
                         elsif pl = 0 and d_is4 = '1' then
@@ -581,13 +595,9 @@ begin
                             emit := (cbpc_q = 2);
                         end if;
                         pk_pkt <= p;
-                        pk_pl <= pl; pk_ix <= ix; pk_kind <= md_blk_kind; pk_cnt_pend <= '1';
+                        pk_pl <= pl; pk_ix <= ix; pk_kind <= it_kind; pk_cnt_pend <= '1';
                         if emit then pk_emit <= '1'; else pk_emit <= '0'; end if;
-                        lvl_cnt <= lvl_cnt + 1;
                         est <= E_LEVEL_PUSH;
-                    elsif md_sdone = '1' or (lvl_cnt > 0 and md_sbusy = '0') then
-                        est <= E_IDLE;
-                    end if;
                 when E_LEVEL_PUSH =>
                     -- TotalCoeff for the neighbours (0 when the block is not coded)
                     if pk_cnt_pend = '1' then
