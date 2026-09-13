@@ -134,8 +134,13 @@ static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
     /* The HP port is not coherent with the A9 data cache. The frame was
      * written by JTAG straight to DDR and the CPU never touches it, so it
      * needs nothing. The payload buffer does: the DMA writes it behind the
-     * cache's back. */
-    Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
+     * cache's back.
+     *
+     * Invalidate only what the DMA will write. Doing the whole 8 MB buffer
+     * costs 262144 line operations, twice a frame, which is milliseconds of
+     * pure overhead on an A9 -- and it was being counted against nothing,
+     * because until now only the PL's own cycle counter was measured. */
+    Xil_DCacheInvalidateRange((UINTPTR)payload, rx_len);
 
     dcc_kernel_clear_done(k);
     /* Per-record QP: CONFIG is latched at START, so a sequence can sweep QP
@@ -189,7 +194,7 @@ static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
     }
 
     dcc_kernel_perf(k, perf);
-    Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
+    Xil_DCacheInvalidateRange((UINTPTR)payload, rx_len);
 
     /* Simple-mode S2MM cannot report how many bytes it received. It does not
      * have to: the kernel counts its own output and reports it in BYTES. */
@@ -223,6 +228,16 @@ int main(void)
     uint64_t cyc_total = 0, t_a, t_b;
     uint32_t cyc_min = 0xFFFFFFFFu, cyc_max = 0;
     long bytes_total = 0;
+    /* Wall clock, not PL cycles. The kernel's CYCLES register measures START
+     * to DONE inside the PL and says nothing about what the host spends
+     * between frames re-arming DMA, maintaining caches and checking results.
+     * A camera feed has to keep up with the whole loop, not the fast part of
+     * it, so the encode phase and the verify phase are timed separately: a
+     * real pipeline does the first and not the second. */
+    uint64_t enc_us_total = 0, ver_us_total = 0;
+    uint64_t enc_us_min = ~0ull, enc_us_max = 0;
+    uint32_t late = 0;
+    uint64_t t_f0, t_f1, t_f2;
 
     Xil_DCacheEnable();
     printf("\n=== DCC codec kernel, sequence run (L5) ===\n");
@@ -319,7 +334,9 @@ int main(void)
             }
             Xil_DCacheInvalidateRange((UINTPTR)golden, r->golden_len);
 
+            t_f0 = dcc_time_us();
             n = encode_one(&k, m, r, &perf, rep, i);
+            t_f1 = dcc_time_us();
             if (n < 0) return 1;
 
             if (n != (int)r->golden_len) {
@@ -329,7 +346,16 @@ int main(void)
                 return 1;
             }
             if (compare(payload, golden, n, i) != 0) return 1;
+            t_f2 = dcc_time_us();
 
+            {
+                uint64_t e = t_f1 - t_f0, v = t_f2 - t_f1;
+                enc_us_total += e;
+                ver_us_total += v;
+                if (e < enc_us_min) enc_us_min = e;
+                if (e > enc_us_max) enc_us_max = e;
+                if (e > 33333ull) late++;
+            }
             cyc_total += perf.cycles;
             if (perf.cycles < cyc_min) cyc_min = perf.cycles;
             if (perf.cycles > cyc_max) cyc_max = perf.cycles;
@@ -349,18 +375,35 @@ int main(void)
     }
 
     {
-        double avg_cy = (double)cyc_total / encoded;
-        double avg_ms = avg_cy * 1000.0 / m->aclk_hz;
+        double avg_cy  = (double)cyc_total / encoded;
+        double pl_ms   = avg_cy * 1000.0 / m->aclk_hz;
+        double enc_ms  = (double)enc_us_total / encoded / 1000.0;
+        double ver_ms  = (double)ver_us_total / encoded / 1000.0;
+        double tot_ms  = enc_ms + ver_ms;
+
         printf("\nPASS: %lu frames encoded, every payload byte-exact with the "
                "C reference\n", (unsigned long)encoded);
-        printf("  cycles   avg %.0f  min %lu  max %lu  (%.1f cy/MB)\n",
+
+        printf("  kernel   %.0f cycles avg (min %lu, max %lu), %.1f cy/MB\n",
                avg_cy, (unsigned long)cyc_min, (unsigned long)cyc_max, avg_cy / mbs);
-        printf("  frame    %.2f ms -> %.1f fps at %lu MHz\n",
-               avg_ms, 1000.0 / avg_ms, (unsigned long)(m->aclk_hz / 1000000u));
+        printf("           %.2f ms -> %.1f fps   -- the PL alone\n",
+               pl_ms, 1000.0 / pl_ms);
+
+        /* What a camera feed would actually have to keep up with. */
+        printf("  system   %.2f ms -> %.1f fps   -- PL + DMA + host, no verify\n",
+               enc_ms, 1000.0 / enc_ms);
+        printf("           min %.2f  max %.2f ms\n",
+               enc_us_min / 1000.0, enc_us_max / 1000.0);
+        printf("  verify   %.2f ms/frame, not part of a real pipeline\n", ver_ms);
+        printf("  loop     %.2f ms -> %.1f fps   -- everything this test does\n",
+               tot_ms, 1000.0 / tot_ms);
+
+        printf("  host     %.2f ms/frame above the PL (%.0f%% overhead)\n",
+               enc_ms - pl_ms, 100.0 * (enc_ms - pl_ms) / pl_ms);
         printf("  bitrate  %ld bytes total, %.2f Mbps at 30 fps\n",
                bytes_total, (double)bytes_total / encoded * 8.0 * 30.0 / 1e6);
-        printf("  30 fps   %s (needs <= 33.33 ms/frame)\n",
-               avg_ms <= 33.33 ? "MET" : "MISSED");
+        printf("  30 fps   %s on the system rate (needs <= 33.33 ms), %lu frame(s) late\n",
+               enc_ms <= 33.33 ? "MET" : "MISSED", (unsigned long)late);
     }
 
     {
