@@ -4,7 +4,11 @@ The practical sequence, with the values this project's scripts actually
 produced. The reasoning behind it all is in `docs/m5-hw-validation.md`; this
 file is the checklist.
 
-**L4 passed on hardware on 2026-09-13.** The kernel produced a payload
+**L5 passed on hardware on 2026-09-13**: 100 frames of 1080p, every payload
+byte-exact, 337.7 cycles/MB, 36.3 fps at 100 MHz, 1080p30 met with 21% margin.
+Use `scripts/run_board.tcl`, which does the whole flow in one xsdb command.
+
+**L4 passed earlier the same day.** The kernel produced a payload
 byte-exact with the C reference on a Zybo Z7-20 at 100 MHz. Everything in this
 file has now been run for real except the follow-on work in section 6.
 

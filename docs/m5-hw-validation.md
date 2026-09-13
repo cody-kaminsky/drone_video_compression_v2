@@ -12,6 +12,10 @@ first.
 
 ---
 
+**Status: L5 passing on hardware.** 100 frames of 1080p encoded byte-exact on
+a Zybo Z7-20 at 100 MHz, 36.3 fps, after three RTL fixes that hardware found
+and simulation had missed. Section 6b records those.
+
 ## 1. What is already true
 
 The kernel is further along than "untested RTL". Before designing anything,
@@ -169,7 +173,7 @@ suspect.
 | L2 | `encoder_axi_top_tb` | slice payload vs `DCC_DUMP_SLICE` | passing |
 | L3 | host stream assembly on x86 | reassembled `.264` vs reference `.264` | passing |
 | L4 | board, staged frame, simple DMA | payload vs `DCC_DUMP_SLICE`, on-board | **passing** |
-| L5 | board, scatter-gather, at rate | same, plus cycles and dropped frames | next |
+| L5 | board, sequence at full resolution | same, every frame, plus cycles | **passing** |
 
 L3 is the rung that was missing and is now closed. It matters more than its
 position suggests: it means that when L4 runs for the first time, the input
@@ -495,11 +499,13 @@ in the same cycle.
 
 Honest list of what is still open, in the order it will probably matter.
 
-- ~~The board has not run anything.~~ **L4 passed on 2026-09-13**: a Zybo
-  Z7-20 at 100 MHz produced a payload byte-exact with the C reference, in
-  174,350 cycles against simulation's 174,913. What remains untested is
-  everything past a single 480x272 frame: multiple frames back to back, full
-  width, and running at rate.
+- ~~The board has not run anything.~~ **L4 and L5 both passed on 2026-09-13.**
+  L4: one 480x272 frame byte-exact, 174,350 cycles against simulation's
+  174,913. L5: **100 frames of 1080p, every payload byte-exact** -- 816,000
+  macroblocks, four distinct frames cycled 25 times, 337.7 cycles/MB against
+  simulation's 337.0, 27.56 ms a frame, 36.3 fps, 1080p30 met with 21% margin,
+  cycle spread 0.06%. What remains untested is a live source rather than
+  frames staged in DDR, and the scatter-gather path that a camera would need.
 - **Frame ingest is a file, not a camera.** Bring-up loads a frame over JTAG
   or from SD. A real source needs the SG path and a capture front end, and
   the Zybo Z7-20 has no camera interface worth using for 1080p.
