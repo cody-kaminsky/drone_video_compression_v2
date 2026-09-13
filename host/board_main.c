@@ -11,13 +11,16 @@
  *   - No staging copy. Frames are already in the kernel's stream order,
  *     because the reordering is deterministic and was done once on the
  *     workstation by the same h264_nv12_to_stream() that `make host_test`
- *     checks. MM2S reads each frame where it lies. That removes about 3 MB of
- *     memcpy per 1080p frame, which was the main thing eating the 33 ms
- *     budget at 30 fps -- and the main argument for scatter-gather.
+ *     checks. MM2S reads each frame where it lies.
  *
  *   - No buffers in bss. The payload, scratch and Annex B buffers live at
  *     fixed DDR addresses from the memory map, so frame size is a runtime
  *     property rather than something baked into the ELF.
+ *
+ * Every wait in here is bounded by an iteration count rather than by
+ * dcc_time_us(). If the A9 global timer is not running, a time-based timeout
+ * silently becomes infinite, and an infinite wait looks exactly like a
+ * hardware hang. A stall prints the kernel and DMA state instead.
  *
  * NOT BUILT BY THE WORKSTATION MAKEFILE: needs the Vitis BSP. Everything it
  * calls into is exercised on x86 by `make host_test`.
@@ -32,9 +35,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Addresses assigned by scripts/build_zybo_bd.tcl, printed as BD_ADDR lines.
- * Literals rather than XPAR_* symbols, whose spelling depends on the block
- * design cell name and the Vitis release. */
+/* Addresses assigned by scripts/build_zybo_bd.tcl, printed as BD_ADDR lines. */
 #ifndef DCC_ENC_BASE
 #define DCC_ENC_BASE   0x43C00000u      /* SEG_enc_reg0 */
 #endif
@@ -42,17 +43,53 @@
 #define DCC_DMA_BASE   0x40400000u      /* SEG_dma_Reg  */
 #endif
 
+/* Roughly a second or two of spinning on a 667 MHz A9. Generous: a 1080p
+ * frame is 27.6 ms, so anything near this limit is stuck, not slow. */
+#define DCC_SPIN_LIMIT  300000000u
+
 static XAxiDma dma;
 
 static uint8_t *const payload = (uint8_t *)DCC_PAYLOAD_ADDR;
 static uint8_t *const scratch = (uint8_t *)DCC_SCRATCH_ADDR;
 static uint8_t *const annexb  = (uint8_t *)DCC_ANNEXB_ADDR;
 
+static uint32_t dma_reg(uint32_t chan_off, uint32_t reg_off)
+{
+    return XAxiDma_ReadReg(DCC_DMA_BASE, chan_off + reg_off);
+}
+
+/* Everything worth knowing when something stops moving. The DMA status bits
+ * are the ones that actually localise a stall: Halted means the channel
+ * stopped, Idle means it finished, and the error bits say whose fault it was. */
+static void dump_state(const dcc_kernel_t *k, const char *where,
+                       uint32_t rep, uint32_t frame)
+{
+    uint32_t st   = dcc_mmio_read(k->base, DCC_REG_STATUS);
+    uint32_t tsr  = dma_reg(XAXIDMA_TX_OFFSET, XAXIDMA_SR_OFFSET);
+    uint32_t rsr  = dma_reg(XAXIDMA_RX_OFFSET, XAXIDMA_SR_OFFSET);
+
+    printf("STALL in %s, repeat %lu frame %lu\n",
+           where, (unsigned long)rep, (unsigned long)frame);
+    printf("  kernel STATUS %08lx  busy=%lu done=%lu s_axis_tready=%lu m_axis_tvalid=%lu\n",
+           (unsigned long)st,
+           (unsigned long)((st >> 0) & 1u), (unsigned long)((st >> 1) & 1u),
+           (unsigned long)((st >> 2) & 1u), (unsigned long)((st >> 3) & 1u));
+    printf("  kernel FRAMES %lu  CYCLES %lu  BYTES %lu\n",
+           (unsigned long)dcc_mmio_read(k->base, DCC_REG_UNITS),
+           (unsigned long)dcc_mmio_read(k->base, DCC_REG_CYCLES),
+           (unsigned long)dcc_mmio_read(k->base, DCC_REG_BYTES));
+    printf("  MM2S CR %08lx SR %08lx  halted=%lu idle=%lu err=%lx\n",
+           (unsigned long)dma_reg(XAXIDMA_TX_OFFSET, XAXIDMA_CR_OFFSET),
+           (unsigned long)tsr, (unsigned long)(tsr & 1u),
+           (unsigned long)((tsr >> 1) & 1u), (unsigned long)((tsr >> 4) & 7u));
+    printf("  S2MM CR %08lx SR %08lx  halted=%lu idle=%lu err=%lx\n",
+           (unsigned long)dma_reg(XAXIDMA_RX_OFFSET, XAXIDMA_CR_OFFSET),
+           (unsigned long)rsr, (unsigned long)(rsr & 1u),
+           (unsigned long)((rsr >> 1) & 1u), (unsigned long)((rsr >> 4) & 7u));
+}
+
 static int dma_init(void)
 {
-    /* Vitis moved this driver from device-id to base-address lookup around
-     * 2023.2. Both spellings are here because which one compiles depends on
-     * the BSP. */
 #ifdef XPAR_XAXIDMA_0_BASEADDR
     XAxiDma_Config *cfg = XAxiDma_LookupConfig(DCC_DMA_BASE);
 #else
@@ -75,41 +112,65 @@ static int dma_init(void)
 /* Encode one frame already sitting in DDR in stream order. Returns the
  * kernel's payload length, or negative. */
 static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
-                      const dcc_frame_rec_t *r, dcc_kernel_perf_t *perf)
+                      const dcc_frame_rec_t *r, dcc_kernel_perf_t *perf,
+                      uint32_t rep, uint32_t frame)
 {
-    /* Cache maintenance. The HP port is not coherent with the A9 data cache.
-     * The frame was written by JTAG straight to DDR and the CPU never touches
-     * it, so it needs nothing. The payload buffer does: the DMA writes it
-     * behind the cache's back, so stale lines must go before we read it. */
+    uint32_t spin;
+
+    /* The HP port is not coherent with the A9 data cache. The frame was
+     * written by JTAG straight to DDR and the CPU never touches it, so it
+     * needs nothing. The payload buffer does: the DMA writes it behind the
+     * cache's back. */
     Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
 
     dcc_kernel_clear_done(k);
     dcc_kernel_configure(k, h264_config_word((int)m->width, (int)m->height,
                                              (int)m->qp));
 
-    /* Receive side armed first: the kernel emits as soon as it has a
-     * macroblock, so S2MM must already be listening. */
     if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)payload, DCC_PAYLOAD_MAX,
                                XAXIDMA_DEVICE_TO_DMA) != XST_SUCCESS) {
-        printf("FAIL: S2MM start\n"); return -1;
+        printf("FAIL: S2MM start refused\n");
+        dump_state(k, "S2MM start", rep, frame);
+        return -1;
     }
-    /* MM2S armed before START, not after. s_axis_tready is held low until
-     * START so an early transfer just stalls harmlessly, and arming first
-     * keeps DMA setup latency out of the CYCLES measurement. */
+    /* MM2S armed before START. s_axis_tready is held low until START, so an
+     * early transfer just stalls harmlessly, and arming first keeps DMA setup
+     * latency out of the CYCLES measurement. */
     if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)r->frame_addr, r->frame_len,
                                XAXIDMA_DMA_TO_DEVICE) != XST_SUCCESS) {
-        printf("FAIL: MM2S start\n"); return -1;
+        printf("FAIL: MM2S start refused\n");
+        dump_state(k, "MM2S start", rep, frame);
+        return -1;
     }
     dcc_kernel_start(k);
 
-    if (dcc_kernel_wait_done(k, 5000000u) != 0) {
-        printf("FAIL: kernel timeout. STATUS=%08lx, MM2S busy=%lu, S2MM busy=%lu\n",
-               (unsigned long)dcc_mmio_read(k->base, DCC_REG_STATUS),
-               (unsigned long)XAxiDma_Busy(&dma, XAXIDMA_DMA_TO_DEVICE),
-               (unsigned long)XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA));
-        return -1;
+    for (spin = 0; ; spin++) {
+        if (dcc_mmio_read(k->base, DCC_REG_STATUS) & DCC_STATUS_DONE) break;
+        if (spin > DCC_SPIN_LIMIT) {
+            printf("FAIL: kernel never asserted DONE\n");
+            dump_state(k, "wait for DONE", rep, frame);
+            return -1;
+        }
     }
-    while (XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA)) { }
+
+    /* Let S2MM retire the beats after tlast. Bounded: this is the wait that
+     * has no natural end if the channel errored. */
+    for (spin = 0; XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA); spin++) {
+        if (spin > DCC_SPIN_LIMIT) {
+            printf("FAIL: S2MM never went idle after the kernel finished\n");
+            dump_state(k, "wait for S2MM idle", rep, frame);
+            return -1;
+        }
+    }
+    /* MM2S too: if it did not drain, the next frame's SimpleTransfer is
+     * refused and the failure appears one frame later than its cause. */
+    for (spin = 0; XAxiDma_Busy(&dma, XAXIDMA_DMA_TO_DEVICE); spin++) {
+        if (spin > DCC_SPIN_LIMIT) {
+            printf("FAIL: MM2S never went idle after the kernel finished\n");
+            dump_state(k, "wait for MM2S idle", rep, frame);
+            return -1;
+        }
+    }
 
     dcc_kernel_perf(k, perf);
     Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
@@ -119,13 +180,14 @@ static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
     return (int)perf->bytes;
 }
 
-static int compare(const uint8_t *got, const uint8_t *want, int n, int frame)
+static int compare(const uint8_t *got, const uint8_t *want, int n, uint32_t frame)
 {
     int i;
     for (i = 0; i < n; i++) {
         if (got[i] != want[i]) {
-            printf("FAIL frame %d: first difference at payload byte %d "
-                   "(got %02X, want %02X)\n", frame, i, got[i], want[i]);
+            printf("FAIL frame %lu: first difference at payload byte %d "
+                   "(got %02X, want %02X)\n",
+                   (unsigned long)frame, i, got[i], want[i]);
             printf("      that is bit %d of the macroblock layer; re-run the\n"
                    "      reference with DCC_DUMP_MB to find which macroblock\n"
                    "      spans it. See docs/m5-hw-validation.md 5.4.\n", i * 8);
@@ -141,56 +203,71 @@ int main(void)
     const dcc_frame_rec_t *recs;
     dcc_kernel_t k;
     dcc_kernel_perf_t perf;
-    uint32_t rep, i, mbs, encoded = 0, repeats;
-    uint64_t cyc_total = 0;
+    uint32_t rep, i, mbs, encoded = 0, repeats, spin;
+    uint64_t cyc_total = 0, t_a, t_b;
     uint32_t cyc_min = 0xFFFFFFFFu, cyc_max = 0;
     long bytes_total = 0;
 
     Xil_DCacheEnable();
     printf("\n=== DCC codec kernel, sequence run (L5) ===\n");
 
-    /* Wait for a manifest rather than failing when it is not there yet.
-     * The application is launched first and the data is pushed in after,
-     * which is the order that needs no breakpoint: the loader halts the
-     * core, writes DDR over JTAG, and resumes into this loop.
-     *
-     * Invalidate on every pass. JTAG writes DDR behind the data cache, so
-     * once this loop has read the address the CPU would hold that line
-     * forever and never see the magic arrive. */
+    /* Does the global timer actually advance? Nothing below depends on it,
+     * but the answer decides whether a reported millisecond figure means
+     * anything, and a dead timer is worth knowing about once rather than
+     * guessing at later. */
+    t_a = dcc_time_us();
+    for (spin = 0; spin < 2000000u; spin++) { __asm__ volatile ("nop"); }
+    t_b = dcc_time_us();
+    printf("timer:    %s (%lu us over 2M nops)\n",
+           t_b > t_a ? "running" : "NOT RUNNING -- ms figures are meaningless",
+           (unsigned long)(t_b - t_a));
+
+    /* Wait for a manifest rather than failing when it is not there yet. The
+     * loader halts the core, writes DDR over JTAG, and resumes into this
+     * loop. Invalidate on every pass: JTAG writes DDR behind the data cache,
+     * so a cached line would never show the magic arriving. */
     {
-        uint64_t t0 = dcc_time_us();
         int announced = 0;
-        for (;;) {
+        for (spin = 0; ; spin++) {
             Xil_DCacheInvalidateRange((UINTPTR)DCC_MANIFEST_ADDR, 64u * 1024u);
             if (m->magic == DCC_MANIFEST_MAGIC) break;
             if (!announced) {
                 printf("waiting for a manifest at %08lx ...\n"
-                       "  run the generated load.tcl now:\n"
-                       "    xsdb <seq dir>/load.tcl\n",
+                       "  run the generated load.tcl now\n",
                        (unsigned long)DCC_MANIFEST_ADDR);
                 announced = 1;
             }
-            if (dcc_time_us() - t0 > 300u * 1000u * 1000u) {
-                printf("FAIL: no manifest after 300 s (magic reads %08lx, "
-                       "want %08lx)\n", (unsigned long)m->magic,
-                       (unsigned long)DCC_MANIFEST_MAGIC);
+            if (spin > 20u * DCC_SPIN_LIMIT) {
+                printf("FAIL: no manifest (magic reads %08lx, want %08lx)\n",
+                       (unsigned long)m->magic, (unsigned long)DCC_MANIFEST_MAGIC);
                 return 1;
             }
         }
     }
+
     if (m->version != DCC_MANIFEST_VER) {
         printf("FAIL: manifest version %lu, this build expects %lu\n",
                (unsigned long)m->version, (unsigned long)DCC_MANIFEST_VER);
         return 1;
+    }
+
+    /* Consume the magic. DRAM cells hold their charge for a while, so a
+     * power cycle does not reliably clear DDR and a manifest can outlive
+     * the data it describes -- which would silently run the next session
+     * on stale frames. Clearing it here makes every run require a fresh
+     * load, so the sequence on the board is always the one just pushed.
+     * Flush it: the write must reach DDR, not sit in the cache. */
+    {
+        volatile uint32_t *magic = (volatile uint32_t *)DCC_MANIFEST_ADDR;
+        *magic = 0u;
+        Xil_DCacheFlushRange((UINTPTR)DCC_MANIFEST_ADDR, 64u);
     }
     recs    = (const dcc_frame_rec_t *)(m + 1);
     mbs     = (m->width / 16u) * (m->height / 16u);
     repeats = m->repeats ? m->repeats : 1u;
 
     if (dcc_kernel_probe(&k, DCC_ENC_BASE, DCC_ID_H264, m->aclk_hz) != 0) {
-        printf("FAIL: ID at %08lx reads %08lx, expected %08lx ('H264').\n"
-               "      Check the bitstream is programmed, PL reset released,\n"
-               "      and the base address matches the BD_ADDR output.\n",
+        printf("FAIL: ID at %08lx reads %08lx, expected %08lx ('H264').\n",
                (unsigned long)DCC_ENC_BASE, (unsigned long)k.id,
                (unsigned long)DCC_ID_H264);
         return 1;
@@ -206,32 +283,36 @@ int main(void)
     if (dma_init() != 0) return 1;
     if (dcc_kernel_reset(&k) != 0) { printf("FAIL: kernel reset timeout\n"); return 1; }
 
+    /* Frame records come from DDR written over JTAG, so the same staleness
+     * argument as the manifest applies to them. */
+    Xil_DCacheInvalidateRange((UINTPTR)recs,
+                              m->n_frames * sizeof(dcc_frame_rec_t) + 64u);
+
     for (rep = 0; rep < repeats; rep++) {
         for (i = 0; i < m->n_frames; i++) {
             const dcc_frame_rec_t *r = &recs[i];
             const uint8_t *golden = (const uint8_t *)r->golden_addr;
             int n;
 
-            if (r->golden_len > DCC_PAYLOAD_MAX) {
-                printf("FAIL frame %lu: golden is %lu bytes, buffer is %lu\n",
+            if (r->golden_len == 0u || r->golden_len > DCC_PAYLOAD_MAX) {
+                printf("FAIL frame %lu: golden_len %lu is not sane "
+                       "(buffer is %lu). Manifest or load is bad.\n",
                        (unsigned long)i, (unsigned long)r->golden_len,
                        (unsigned long)DCC_PAYLOAD_MAX);
                 return 1;
             }
             Xil_DCacheInvalidateRange((UINTPTR)golden, r->golden_len);
 
-            n = encode_one(&k, m, r, &perf);
-            if (n < 0) {
-                printf("       (frame %lu of repeat %lu)\n",
-                       (unsigned long)i, (unsigned long)rep);
-                return 1;
-            }
+            n = encode_one(&k, m, r, &perf, rep, i);
+            if (n < 0) return 1;
+
             if (n != (int)r->golden_len) {
                 printf("FAIL frame %lu: payload is %d bytes, golden is %lu\n",
                        (unsigned long)i, n, (unsigned long)r->golden_len);
+                dump_state(&k, "length mismatch", rep, i);
                 return 1;
             }
-            if (compare(payload, golden, n, (int)i) != 0) return 1;
+            if (compare(payload, golden, n, i) != 0) return 1;
 
             cyc_total += perf.cycles;
             if (perf.cycles < cyc_min) cyc_min = perf.cycles;
@@ -250,7 +331,6 @@ int main(void)
                    (unsigned long)(rep + 1u), (unsigned long)repeats);
     }
 
-    /* ---- what the run says about running at rate ---- */
     {
         double avg_cy = (double)cyc_total / encoded;
         double avg_ms = avg_cy * 1000.0 / m->aclk_hz;
@@ -266,7 +346,6 @@ int main(void)
                avg_ms <= 33.33 ? "MET" : "MISSED");
     }
 
-    /* ---- and the stream a decoder would see, for the last frame ---- */
     {
         const dcc_frame_rec_t *r = &recs[m->n_frames - 1u];
         int au = h264_assemble_idr(annexb, (int)DCC_ANNEXB_MAX,
