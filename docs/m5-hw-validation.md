@@ -341,7 +341,19 @@ The reference needs exactly one hook for this, and it is cheap:
 
 L4 passed on a single frame. Running a *sequence* broke, and the three faults
 below are worth recording because of what each says about the test that missed
-it.
+it. B1 and B2 are fixed and validated; B3 is understood and open.
+
+Verification matrix after both fixes, `encoder_axi_top_tb`, two frames each:
+
+| Payload | (bits+stop) mod 8 | Backpressure | Result |
+|---|---|---|---|
+| 18717 (QP 26) | 3 | one-in-five | PASS |
+| 18717 (QP 26) | 3 | stalls to 128 cycles | PASS |
+| 24451 (QP 23) | 0 | one-in-five | PASS |
+| 24451 (QP 23) | 0 | stalls to 128 cycles | PASS |
+
+Before the fixes the bottom three were: PASS, corrupt from byte 606, watchdog
+hang, watchdog hang.
 
 ### B1. `m_axis_tlast` is lost on one frame in eight (fatal with a real DMA)
 
@@ -413,18 +425,50 @@ not just unmarked -- but it is kept because completing on a known length is
 the stricter check: a kernel that emits the wrong number of bytes hangs the
 channel rather than quietly passing a truncated compare.
 
-### B2. Data corruption under long output stalls
+### B2. Four bits inserted at a block boundary under output stalls (fixed)
 
-Changing the testbench's output backpressure from a tidy one-cycle-in-five
-pattern to LFSR-driven stalls of up to 128 cycles produces byte mismatches
-*early* in the frame, at byte 461 of 24451. That is not an end-of-frame
-effect and it is not the same bug as B1.
+**Symptom.** With the testbench's output backpressure changed from a tidy
+one-cycle-in-five pattern to LFSR-driven stalls of up to 128 cycles, the
+payload corrupts *mid-frame* -- byte 461, then byte 606 once B1 was fixed and
+the timing shifted. Contiguous mismatches from that point, not an end effect.
 
-A real AXI DMA does not deassert `tready` politely every fifth cycle; it
-disappears for tens of cycles when its FIFO fills or DDR is busy. The regular
-pattern exercised the handshake but never the sustained stall. `BP_MODE` on
-`encoder_axi_top_tb` selects between the two; this is unfixed and needs
-tracking down before the kernel can be trusted with a real capture path.
+**How it was identified.** A first-difference report cannot tell apart a
+dropped beat, a duplicated beat and a bit-level insertion, and the three have
+completely different causes. Dumping the received stream and comparing at bit
+level (`tools/diff_stream.py`) made it plain once the nibbles were lined up:
+
+```
+expected  E 7 2 0 3 E 1 B C 7 F 6 ...
+got       E 0 7 2 0 3 E 1 B C 7 F ...
+```
+
+Four zero bits inserted, everything after shifted by 4, recurring at block
+boundaries. A sub-byte quantity at block boundaries points at one thing: the
+merger's per-block trim.
+
+**Cause.** `cavlc_dispatch`'s merger computed the trim combinationally:
+
+```vhdl
+r := to_integer(eng_blk_bits(cur_e)(2 downto 0));
+```
+
+`block_bits_o` is valid only from `flush_i` until `flushed_o`, and the packer
+restarts the count straight after. On the cycle the engine's flushed pulse
+arrives `r` is correct. If `op_ready` is low that cycle there is no handshake,
+and by the next cycle the count has restarted, so `r` reads 0 -- which this
+code treats as a full 8 bits. The merger pushes 8 bits where it should push
+`block_bits mod 8`.
+
+**Fix.** `blk_r` captures the trim alongside `blk_done`, and the merger uses
+the captured value from then on. Same bug class as the `cavlc_engine` fault
+recorded earlier: what a packer is being offered must stay stable until the
+handshake completes. There it was the field; here it was the length.
+
+**Why it hid.** It needs `op_ready` low on the exact cycle a block's flush
+pulse lands, so a one-in-five pattern almost never hits it and a testbench
+holding `tready` high never can. And it corrupts mid-frame, so it reads as a
+codec fault rather than a handshake one. `BP_MODE` now defaults to 1, the
+adversarial pattern, so the regression stays covered.
 
 ### B3. `bytes_last` undercounts by one beat (cosmetic)
 
