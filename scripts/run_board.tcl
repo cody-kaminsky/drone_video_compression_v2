@@ -21,7 +21,10 @@ proc arg {i default} {
     return $default
 }
 
-set seq  [arg 0 "build/seq_board_480"]
+# Absolute: xsdb does not start in the project root, so a relative default
+# would resolve against wherever the shell happened to be.
+set root "C:/Users/kamin/OneDrive/Documents/drone_video_compression_v2"
+set seq  [arg 0 "$root/build/seq_board_480"]
 set elf  [arg 1 "C:/Users/kamin/Vivado_Projects/zybo_encoder_test/dcc_14/build/dcc_14.elf"]
 set bit  [arg 2 "C:/Users/kamin/Vivado_Projects/zybo_encoder_test/dcc_plat/export/dcc_plat/hw/dcc_enc.bit"]
 set xsa  [arg 3 "C:/Users/kamin/Vivado_Projects/zybo_encoder_test/dcc_plat/hw/dcc_enc.xsa"]
