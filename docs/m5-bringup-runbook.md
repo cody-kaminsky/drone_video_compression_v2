@@ -116,12 +116,28 @@ So the build targets **100 MHz**, a real PS frequency with about a nanosecond
 of margin. The cost is small: at 337 cycles per macroblock a 1080p frame is
 27.5 ms, so 36 fps, and 1080p30 is still met with 21% to spare.
 
-| FCLK | Period | Kernel OOC slack | 1080p fps |
-|---|---|---|---|
-| 111.111 MHz | 9.000 ns | about -0.04 ns | 40.4 |
-| 100 MHz | 10.000 ns | roughly +1 ns | 36.4 |
+| FCLK | Period | Kernel OOC slack | In-system slack | 1080p fps |
+|---|---|---|---|---|
+| 111.111 MHz | 9.000 ns | about -0.04 ns | about -0.9 ns | 40.4 |
+| 100 MHz | 10.000 ns | n/a | **+0.094 ns (built)** | 36.4 |
 
-Chase 111.111 MHz later if you want the extra 4 fps. Not during bring-up.
+**Out-of-context slack does not extrapolate to in-system slack.** The built
+design closed at only +0.094 ns, not the nanosecond of margin a linear
+extrapolation from the OOC run suggests. The worst path is the mode decider's
+transform input select into the transform row register -- the same path the
+OOC run found -- but it went from about 9.04 ns standalone to 9.767 ns in the
+system, and 66% of that is routing, not logic.
+
+The reason is congestion. The encoder is 24k LUTs and the plumbing adds
+another 1.9k, so the device sits at 49% and the placer has much less freedom
+than it does with the kernel alone. Nothing about the kernel changed; its
+routing just got worse.
+
+Two things follow. First, 100 MHz was not a conservative choice, it was the
+necessary one: at 111.111 MHz this design would have missed by roughly 0.9 ns,
+not the 0.04 ns the OOC number implied. Second, re-measure in-system after any
+RTL change; `make impl_ooc` is a fast proxy for the kernel in isolation but it
+flatters the real design by most of a nanosecond on this part.
 
 To check a change to the script without the wait, validate only:
 
@@ -149,6 +165,19 @@ values. Those come from Digilent's own board file and are normal for Zybo.
 
 Output: `build/zybo/dcc_enc.xsa`, containing the bitstream and the hardware
 handoff.
+
+**Built result**, for comparison when you rebuild:
+
+| | Value |
+|---|---|
+| WNS / WHS | +0.094 ns / +0.024 ns, no failing endpoints |
+| LUTs | 25,945 of 53,200 (49%) |
+| Flip-flops | 18,183 of 106,400 (17%) |
+| BRAM tiles | 34.5 of 140 (25%) |
+| DSPs | 49 of 220 (22%) |
+
+The plumbing -- DMA, two interconnects, reset and concat -- costs about 1,900
+LUTs and 5 BRAM tiles on top of the kernel's 24,063.
 
 ---
 
