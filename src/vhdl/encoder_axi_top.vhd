@@ -187,6 +187,7 @@ begin
     axi_p : process(aclk)
         variable wr : boolean;
         variable a : std_logic_vector(5 downto 0);
+        variable bytes_tot : unsigned(31 downto 0);
     begin
         if rising_edge(aclk) then
             if rst_sync(1) = '0' then
@@ -250,16 +251,30 @@ begin
                 end if;
                 if rvalid_q = '1' and s_axi_rready = '1' then rvalid_q <= '0'; end if;
 
-                -- frame bookkeeping
+                -- frame bookkeeping.
+                --
+                -- bytes_run and bytes_last are both signals, so an assignment
+                -- to bytes_run here is not visible to a read of it in the same
+                -- process. When the frame's final beat handshakes on the very
+                -- cycle k_done arrives -- which is exactly when it is most
+                -- likely to -- a plain `bytes_last <= bytes_run` captures the
+                -- count from before that beat and reports one beat short.
+                -- Compute the total once and use it for both.
                 if counting = '1' then cyc_run <= cyc_run + 1; end if;
+                -- Assign bytes_run only on a handshake. START clears it in the
+                -- register-write section above, and the last assignment in a
+                -- process wins, so an unconditional assignment here would
+                -- silently defeat that clear and accumulate across frames.
+                bytes_tot := bytes_run;
                 if k_o_valid = '1' and m_axis_tready = '1' then
-                    bytes_run <= bytes_run + keep_count(k_o_keep);
+                    bytes_tot := bytes_tot + keep_count(k_o_keep);
+                    bytes_run <= bytes_tot;
                 end if;
                 if k_done = '1' then
                     done_flag <= '1';
                     frames <= frames + 1;
                     cyc_last <= cyc_run + 1;
-                    bytes_last <= bytes_run;
+                    bytes_last <= bytes_tot;
                     counting <= '0';
                     frame_active <= '0';
                 end if;
