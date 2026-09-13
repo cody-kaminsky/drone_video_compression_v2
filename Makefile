@@ -43,7 +43,7 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: impl_ooc all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: impl_ooc host_test ip ip_check zybo board_vectors all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
@@ -180,3 +180,52 @@ impl_ooc:
 
 clean:
 	rm -rf $(BUILD)
+
+# ---------------------------------------------------------------- host ---
+# Board-side stream assembly, checked on a workstation against the reference.
+# The same h264_host.c compiles for bare-metal; only the platform shim differs.
+HOST_DIR := host
+
+$(BUILD)/test_assemble: $(HOST_DIR)/test_assemble.c $(HOST_DIR)/h264_host.c \
+                        $(BUILD)/nal.o $(BUILD)/bitstream.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -I$(HOST_DIR) -o $@ $^ $(LDLIBS)
+
+# Encode the test frame, dump the payload the kernel would produce and the
+# pixel stream it would be fed, then check the host path reproduces both.
+host_test: $(BUILD)/test_assemble $(BIN_REF) tools/frames/old_town_cross_480x272.png
+	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png \
+	        -pix_fmt nv12 -f rawvideo $(BUILD)/md_frame.yuv
+	@DCC_DUMP_SLICE=$(BUILD)/ht_payload.txt $(BIN_REF) $(BUILD)/md_frame.yuv 480 272 26 \
+	        $(BUILD)/ht_recon.yuv $(BUILD)/ht_ref.264 > /dev/null
+	@python tools/gen_frame_stream.py $(BUILD)/md_frame.yuv 480 272 $(BUILD)/ht_stream.txt > /dev/null
+	./$(BUILD)/test_assemble $(BUILD)/md_frame.yuv 480 272 26 \
+	        $(BUILD)/ht_payload.txt $(BUILD)/ht_stream.txt $(BUILD)/ht_ref.264
+
+# --------------------------------------------------- hardware packaging ---
+# VIVADO is not on PATH in a default install; override if yours differs.
+VIVADO ?= /c/AMDDesignTools/2025.2/Vivado/bin/vivado.bat
+PART   ?= xc7z020clg400-1
+CLKMHZ ?= 110
+
+# Package the kernel as dcc:codec:dcc_h264_enc:1.0 into build/ip.
+ip:
+	@mkdir -p $(BUILD)
+	$(VIVADO) -mode batch -source scripts/package_ip.tcl 	    -log $(BUILD)/ip_pkg.log -journal $(BUILD)/ip_pkg.jou 	    -tclargs $(BUILD)/ip $(PART)
+
+# Prove the packaged IP instantiates, elaborates and synthesizes from a block
+# design. Run after `make ip`, before trusting it in a board design.
+ip_check:
+	$(VIVADO) -mode batch -source scripts/check_ip.tcl 	    -log $(BUILD)/ip_check.log -journal $(BUILD)/ip_check.jou 	    -tclargs $(BUILD)/ip $(PART)
+
+# Zybo Z7-20 block design, bitstream and XSA. Needs Digilent board files;
+# see docs/m5-hw-validation.md 5.1.
+zybo:
+	$(VIVADO) -mode batch -source scripts/build_zybo_bd.tcl 	    -log $(BUILD)/zybo.log -journal $(BUILD)/zybo.jou 	    -tclargs $(BUILD)/zybo $(BUILD)/ip $(CLKMHZ)
+
+# L4 vectors: the input frame and the golden payload as C arrays, to link
+# into the Vitis application. See docs/m5-hw-validation.md 5.2.
+board_vectors: $(BIN_REF) tools/frames/old_town_cross_480x272.png
+	@mkdir -p $(BUILD)/board
+	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png 	        -pix_fmt nv12 -f rawvideo $(BUILD)/md_frame.yuv
+	@DCC_DUMP_SLICE=$(BUILD)/board/payload.txt $(BIN_REF) 	        $(BUILD)/md_frame.yuv 480 272 26 > /dev/null
+	python tools/gen_board_vectors.py $(BUILD)/md_frame.yuv 	        $(BUILD)/board/payload.txt $(BUILD)/board
