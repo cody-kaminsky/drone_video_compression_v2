@@ -17,9 +17,9 @@ entity encoder_axi_top_tb is
         OUT_FILE : string := "build/slice_payload.txt";
         MBS_W    : natural := 30;
         MBS_H    : natural := 17;
-        QP       : natural := 26;
+        QP       : natural := 23;
         FRAMES   : natural := 2;
-        BP_MODE  : natural := 0
+        BP_MODE  : natural := 1
     );
 end entity;
 
@@ -151,6 +151,8 @@ begin
 
     main_p : process
         file f : text;
+        file fdump : text;                 -- received bytes, for offline analysis
+        variable Ld : line;
         variable L : line;
         variable val, got, nb : integer;
         variable open_status : file_open_status;
@@ -179,6 +181,14 @@ begin
 
         for k in 0 to FRAMES - 1 loop
             file_open(open_status, f, OUT_FILE, read_mode);
+            -- Received bytes, one decimal per line, so a mismatch can be
+            -- analysed offline: a bit shift, a dropped byte and a
+            -- duplicated byte all look the same in a first-difference report.
+            if k = 0 then
+                file_open(open_status, fdump, "build/got_frame0.txt", write_mode);
+            else
+                file_open(open_status, fdump, "build/got_frame1.txt", write_mode);
+            end if;
             assert open_status = open_ok report "could not open " & OUT_FILE severity failure;
             n := 0; mc := 0; last_seen := false;
             t0 := cycle;
@@ -192,6 +202,7 @@ begin
                     if m_tkeep = "1111" then nb := 4; elsif m_tkeep = "0111" then nb := 3; elsif m_tkeep = "0011" then nb := 2; else nb := 1; end if;
                     for i in 0 to nb - 1 loop
                         got := to_integer(unsigned(m_tdata(8 * i + 7 downto 8 * i)));
+                        write(Ld, got); writeline(fdump, Ld);
                         if endfile(f) then
                             mc := mc + 1;
                             if mc <= 10 then report "MISMATCH: extra byte " & integer'image(got) severity error; end if;
@@ -213,6 +224,7 @@ begin
             end loop;
             if not endfile(f) then mc := mc + 1; report "MISMATCH: stream ended early" severity error; end if;
             file_close(f);
+            file_close(fdump);
             -- status readback
             axi_read(aclk, 16#08#, r, araddr, arvalid, rready, arready, rvalid, rdata);
             assert r(1) = '1' report "DONE not set" severity error;
