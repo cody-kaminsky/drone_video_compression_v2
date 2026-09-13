@@ -78,11 +78,28 @@ puts "PL configured"
 # ---- 3. bring the PS up, which is what releases the DDR controller ----------
 targets -set -filter {name =~ "ARM*#0"}
 loadhw -hw $xsa -mem-ranges [list {0x40000000 0xbfffffff}] -regs
+
+# loadhw does not define ps7_init in the system-device-tree platform flow, so
+# source the generated Tcl directly. It is what actually releases the DDR
+# controller; without it every write to DDR fails.
+set ps7tcl "$proj/dcc_plat/export/dcc_plat/hw/ps7_init.tcl"
+if {![file exists $ps7tcl]} {
+    puts "ERROR: no ps7_init.tcl at $ps7tcl"
+    exit 1
+}
+source $ps7tcl
 configparams force-mem-access 1
 ps7_init
 ps7_post_config
 configparams force-mem-access 0
 puts "PS initialised, DDR up"
+
+# ps7_init leaves the A9 global timer stopped -- it ends by writing 0 to the
+# control register at 0xF8F00208. That is why the application has been
+# reporting "timer NOT RUNNING" and why every millisecond figure it prints has
+# been meaningless. The same file provides the proc to start it.
+perf_reset_and_start_timer
+puts "global timer started" 
 
 # ---- 4. application ---------------------------------------------------------
 dow $elf
