@@ -168,8 +168,8 @@ suspect.
 | L1 | per-block RTL testbenches | block vectors from the C reference | passing |
 | L2 | `encoder_axi_top_tb` | slice payload vs `DCC_DUMP_SLICE` | passing |
 | L3 | host stream assembly on x86 | reassembled `.264` vs reference `.264` | passing |
-| L4 | board, staged frame, simple DMA | payload vs `DCC_DUMP_SLICE`, on-board | next |
-| L5 | board, scatter-gather, at rate | same, plus cycles and dropped frames | after L4 |
+| L4 | board, staged frame, simple DMA | payload vs `DCC_DUMP_SLICE`, on-board | **passing** |
+| L5 | board, scatter-gather, at rate | same, plus cycles and dropped frames | next |
 
 L3 is the rung that was missing and is now closed. It matters more than its
 position suggests: it means that when L4 runs for the first time, the input
@@ -341,8 +341,11 @@ The reference needs exactly one hook for this, and it is cheap:
 
 Honest list of what is still open, in the order it will probably matter.
 
-- **The board has not run anything.** Everything above is measurement,
-  simulation and x86 tests. L4 is genuinely untested.
+- ~~The board has not run anything.~~ **L4 passed on 2026-09-13**: a Zybo
+  Z7-20 at 100 MHz produced a payload byte-exact with the C reference, in
+  174,350 cycles against simulation's 174,913. What remains untested is
+  everything past a single 480x272 frame: multiple frames back to back, full
+  width, and running at rate.
 - **Frame ingest is a file, not a camera.** Bring-up loads a frame over JTAG
   or from SD. A real source needs the SG path and a capture front end, and
   the Zybo Z7-20 has no camera interface worth using for 1080p.

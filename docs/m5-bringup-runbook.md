@@ -4,8 +4,9 @@ The practical sequence, with the values this project's scripts actually
 produced. The reasoning behind it all is in `docs/m5-hw-validation.md`; this
 file is the checklist.
 
-Everything here up to step 4 has been run on this machine. Steps 5 and 6 need
-the board.
+**L4 passed on hardware on 2026-09-13.** The kernel produced a payload
+byte-exact with the C reference on a Zybo Z7-20 at 100 MHz. Everything in this
+file has now been run for real except the follow-on work in section 6.
 
 **Known values.** Referred to throughout, all confirmed from the build:
 
@@ -227,7 +228,7 @@ that code, so the container cannot disagree with itself.
 2. **File -> New Component -> Application.** Name `dcc_l4`, platform
    `dcc_plat`, domain `standalone_ps7_cortexa9_0`, template
    *Empty Application (C)*.
-3. **Copy the twelve files into `dcc_l4/src/`.** The component's
+3. **Copy the thirteen files into `dcc_l4/src/`.** The component's
    `CMakeLists.txt` calls `aux_source_directory` on that directory, so
    anything dropped there is compiled with no registration step -- a plain
    filesystem copy plus a refresh is enough. (The scripted path puts them in
@@ -283,9 +284,31 @@ access unit: 18744 bytes of Annex B, ready to pull off and decode
 ```
 
 The two numbers that must match exactly are **18717 payload bytes** and the
-byte-for-byte compare. The cycle count is informational; on the 480×272 frame
-the simulation measured 342 cycles/MB, so expect roughly 174,000 cycles and
-about 1.6 ms.
+byte-for-byte compare.
+
+**Measured on hardware**, for comparison on future runs:
+
+| | Simulation | Hardware |
+|---|---|---|
+| Payload bytes | 18,717 | 18,717 |
+| Cycles | 174,913 | **174,350** |
+| Cycles/MB | 342 | 342 |
+| Frame time at 100 MHz | - | 1.74 ms |
+
+Hardware came in 563 cycles (0.32%) *faster* than simulation, which is worth
+understanding rather than shrugging at. Two effects cancel. `board_main.c`
+pulses START before programming the MM2S transfer, so the kernel idles while
+the CPU writes DMA registers, which should inflate the count. Against that,
+the real DMA streams from DDR with fewer gaps than the testbench's feed, so
+the kernel stalls less on input. The second effect is the larger one.
+
+The useful conclusion: **the kernel is compute-bound on hardware, not
+input-bound**, so the data path has margin. A count far above this, say
+200,000+, would mean the opposite and would point at the DMA rather than the
+encoder.
+
+Extrapolating to 1080p at 342 cycles/MB: 8,160 macroblocks is 27.9 ms, so
+35.8 fps. 1080p30 with about 19% to spare.
 
 ---
 
