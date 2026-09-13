@@ -348,7 +348,17 @@ it.
 **Symptom.** Frame 0 of a 1080p sequence encoded perfectly. Frame 1 completed
 inside the kernel -- `FRAMES` incremented, `DONE` set, `BUSY` clear -- but
 `m_axis_tvalid` was low and S2MM never went idle, so the host hung waiting for
-a transfer that could never finish.
+a transfer that could never finish. `BYTES` read 253656 against a golden of
+253657.
+
+**The final byte is lost, not merely unmarked.** That distinction took a wrong
+turn to find. Arming S2MM for exactly the golden length, so the channel
+completes on byte count rather than `tlast`, did *not* help: it still waited,
+because the byte genuinely never arrives. `frame_io`'s byte-to-word packer
+only marks a word valid when `n = 4 or b_last_i = '1'`, so with `out_last`
+lost, a final partial word is never presented at all. 253657 mod 4 = 1, so
+exactly one byte stayed stuck in the register. One root cause, three
+symptoms: a short payload, no `tlast`, and a hung DMA.
 
 **Cause.** `bit_packer` emits a byte as soon as it has eight bits. Its own
 header documents the consequence: *"flush_i with empty accum pulses flushed_o
@@ -389,10 +399,19 @@ so a byte is always held back and the flush always has one left to mark. The
 one-byte latency is irrelevant at frame scale. Do not change the default: the
 merger already compensates for per-block flush behaviour and would double up.
 
-**Workaround in use.** `board_main.c` arms S2MM for exactly the expected
-payload length, so the channel completes on byte count rather than `tlast`.
-That is sound for validation, which already knows the answer, and unsound for
-a real capture path, which does not.
+**Fixed.** `bit_packer` gained a `HOLD_LAST` generic, default false, enabled
+only on the output packer in `cavlc_dispatch`. Validated in simulation:
+
+| Case | (bits+stop) mod 8 | Before | After |
+|---|---|---|---|
+| QP 23, 24451 bytes | 0 | watchdog hang | PASS, 0 mismatches |
+| QP 26, 18717 bytes | 3 | PASS | PASS, cycle counts unchanged |
+
+`board_main.c` still arms S2MM for exactly the expected payload length. That
+was written as a workaround and does not work as one -- the byte is missing,
+not just unmarked -- but it is kept because completing on a known length is
+the stricter check: a kernel that emits the wrong number of bytes hangs the
+channel rather than quietly passing a truncated compare.
 
 ### B2. Data corruption under long output stalls
 

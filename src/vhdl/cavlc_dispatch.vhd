@@ -352,7 +352,10 @@ begin
     end process;
 
     packer : entity work.bit_packer
-        generic map (DATA_W => 8)
+        -- HOLD_LAST: this is the packer whose out_last becomes
+        -- m_axis_tlast, so it must always have a byte left to mark when
+        -- the frame flush arrives. The engine-side packers keep the default.
+        generic map (DATA_W => 8, HOLD_LAST => true)
         port map (
             clk       => clk,
             rst_n     => rst_n,
