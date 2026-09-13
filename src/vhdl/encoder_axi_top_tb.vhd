@@ -17,8 +17,9 @@ entity encoder_axi_top_tb is
         OUT_FILE : string := "build/slice_payload.txt";
         MBS_W    : natural := 30;
         MBS_H    : natural := 17;
-        QP       : natural := 26;
-        FRAMES   : natural := 2
+        QP       : natural := 23;
+        FRAMES   : natural := 2;
+        BP_MODE  : natural := 0
     );
 end entity;
 
@@ -90,11 +91,31 @@ begin
                   m_axis_tdata => m_tdata, m_axis_tkeep => m_tkeep, m_axis_tlast => m_tlast,
                   m_axis_tvalid => m_tvalid, m_axis_tready => m_tready, irq => irq);
 
+    -- Output backpressure. BP_MODE 0 is the original tidy 1-in-5 pattern.
+    -- BP_MODE 1 is adversarial: an LFSR drives long stalls, because a real
+    -- AXI DMA does not deassert tready politely every fifth cycle -- it goes
+    -- away for tens of cycles when its FIFO fills or DDR is busy, and that is
+    -- the case a regular pattern never exercises.
     cyc_p : process(aclk)
+        variable lfsr  : unsigned(15 downto 0) := x"ACE1";
+        variable stall : integer := 0;
     begin
         if rising_edge(aclk) then
             cycle <= cycle + 1;
-            if (cycle mod 5) = 2 then m_tready <= '0'; else m_tready <= '1'; end if;
+            if BP_MODE = 0 then
+                if (cycle mod 5) = 2 then m_tready <= '0'; else m_tready <= '1'; end if;
+            else
+                lfsr := lfsr(14 downto 0) & (lfsr(15) xor lfsr(13) xor lfsr(12) xor lfsr(10));
+                if stall > 0 then
+                    stall := stall - 1;
+                    m_tready <= '0';
+                elsif lfsr(3 downto 0) = "0000" then
+                    stall := 1 + to_integer(lfsr(6 downto 0));   -- up to 128 cycles
+                    m_tready <= '0';
+                else
+                    m_tready <= '1';
+                end if;
+            end if;
         end if;
     end process;
 

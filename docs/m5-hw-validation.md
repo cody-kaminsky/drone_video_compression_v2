@@ -337,6 +337,84 @@ The reference needs exactly one hook for this, and it is cheap:
 
 ---
 
+## 6b. Bugs hardware found that simulation did not
+
+L4 passed on a single frame. Running a *sequence* broke, and the three faults
+below are worth recording because of what each says about the test that missed
+it.
+
+### B1. `m_axis_tlast` is lost on one frame in eight (fatal with a real DMA)
+
+**Symptom.** Frame 0 of a 1080p sequence encoded perfectly. Frame 1 completed
+inside the kernel -- `FRAMES` incremented, `DONE` set, `BUSY` clear -- but
+`m_axis_tvalid` was low and S2MM never went idle, so the host hung waiting for
+a transfer that could never finish.
+
+**Cause.** `bit_packer` emits a byte as soon as it has eight bits. Its own
+header documents the consequence: *"flush_i with empty accum pulses flushed_o
+the next cycle (no byte emitted, out_last not set)"*. So when the payload's bit
+count including the RBSP stop bit is an exact multiple of 8, the last byte has
+already left by the time the flush arrives, nothing is emitted, and `out_last`
+is never asserted. That signal is wired straight through `cavlc_dispatch` and
+`frame_io` to `m_axis_tlast`.
+
+**Why it is one frame in eight.** The condition is purely
+`(macroblock_layer_bits + 1) mod 8 == 0`, which is uniform over content. The
+four 1080p frames tested gave 6, **0**, 4, 7 -- and exactly the one that gave 0
+hung.
+
+**Why simulation missed it.** The testbench checks `tlast` properly. It simply
+never ran a frame that triggered the condition: both 480x272 frames it uses are
+mod 8 = 3, and it ran the *same* frame twice, so it sampled one value of an
+eight-valued variable. Encoding the same test frame at QP 23 instead of 26
+reproduces it in 90 seconds.
+
+**Fix direction.** Give `bit_packer` a `HOLD_LAST` generic, default false so
+nothing else changes, and set it true only for the output packer in
+`cavlc_dispatch`. With it set, emit only when `n_v >= 16` in normal operation,
+so a byte is always held back and the flush always has one left to mark. The
+one-byte latency is irrelevant at frame scale. Do not change the default: the
+merger already compensates for per-block flush behaviour and would double up.
+
+**Workaround in use.** `board_main.c` arms S2MM for exactly the expected
+payload length, so the channel completes on byte count rather than `tlast`.
+That is sound for validation, which already knows the answer, and unsound for
+a real capture path, which does not.
+
+### B2. Data corruption under long output stalls
+
+Changing the testbench's output backpressure from a tidy one-cycle-in-five
+pattern to LFSR-driven stalls of up to 128 cycles produces byte mismatches
+*early* in the frame, at byte 461 of 24451. That is not an end-of-frame
+effect and it is not the same bug as B1.
+
+A real AXI DMA does not deassert `tready` politely every fifth cycle; it
+disappears for tens of cycles when its FIFO fills or DDR is busy. The regular
+pattern exercised the handshake but never the sustained stall. `BP_MODE` on
+`encoder_axi_top_tb` selects between the two; this is unfixed and needs
+tracking down before the kernel can be trusted with a real capture path.
+
+### B3. `bytes_last` undercounts by one beat (cosmetic)
+
+In `encoder_axi_top.vhd` the byte accumulator and the capture into
+`bytes_last` are separate signal assignments in the same clocked process:
+
+```vhdl
+if k_o_valid = '1' and m_axis_tready = '1' then
+    bytes_run <= bytes_run + keep_count(k_o_keep);
+end if;
+if k_done = '1' then
+    bytes_last <= bytes_run;     -- pre-update value
+```
+
+When the final beat handshakes in the same cycle `k_done` arrives,
+`bytes_last` captures the value from before that beat. The hardware reported
+253656 for a 253657-byte payload, and 253657 mod 4 = 1, so the missing beat
+carried exactly one byte. Fix by adding `keep_count` when both conditions hold
+in the same cycle.
+
+---
+
 ## 7. What this does not yet cover
 
 Honest list of what is still open, in the order it will probably matter.

@@ -116,6 +116,20 @@ static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
                       uint32_t rep, uint32_t frame)
 {
     uint32_t spin;
+    /* Arm S2MM for exactly the expected length rather than the whole
+     * buffer, so the channel completes on byte count instead of tlast.
+     *
+     * This works around a known kernel bug: bit_packer does not assert
+     * out_last when the flush finds an empty accumulator, which happens
+     * whenever the payload bit count including the stop bit is a multiple
+     * of 8 -- one frame in eight. m_axis_tlast then never fires and a
+     * length-unbounded S2MM waits forever. See docs/m5-hw-validation.md.
+     *
+     * It is a validation workaround, not a fix: a real capture path does
+     * not know the length in advance. It is sound here because the test
+     * already knows what the payload must be, and a kernel that emits a
+     * different length is still caught by the BYTES check below. */
+    uint32_t rx_len = r->golden_len;
 
     /* The HP port is not coherent with the A9 data cache. The frame was
      * written by JTAG straight to DDR and the CPU never touches it, so it
@@ -127,7 +141,7 @@ static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
     dcc_kernel_configure(k, h264_config_word((int)m->width, (int)m->height,
                                              (int)m->qp));
 
-    if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)payload, DCC_PAYLOAD_MAX,
+    if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)payload, rx_len,
                                XAXIDMA_DEVICE_TO_DMA) != XST_SUCCESS) {
         printf("FAIL: S2MM start refused\n");
         dump_state(k, "S2MM start", rep, frame);
