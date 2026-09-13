@@ -44,13 +44,15 @@
 #define DCC_GOLDEN_ROOM     (DCC_PAYLOAD_ADDR - DCC_GOLDEN_ADDR)
 
 #define DCC_MANIFEST_MAGIC  0x4D434344u   /* 'DCCM' little-endian */
-#define DCC_MANIFEST_VER    1u
+#define DCC_MANIFEST_VER    2u
 
 typedef struct {
     uint32_t frame_addr;    /* frame in kernel stream order */
     uint32_t frame_len;     /* width * height * 3 / 2 */
     uint32_t golden_addr;   /* expected payload bytes */
     uint32_t golden_len;
+    uint32_t qp;            /* this record's QP; see below */
+    uint32_t reserved;      /* keep the record 8-byte aligned */
 } dcc_frame_rec_t;
 
 typedef struct {
@@ -58,7 +60,12 @@ typedef struct {
     uint32_t version;       /* DCC_MANIFEST_VER */
     uint32_t width;
     uint32_t height;
-    uint32_t qp;
+    uint32_t qp;            /* nominal QP, for reporting; each record carries
+                               its own, so one sequence can sweep QP without
+                               reloading. The frame data is identical across
+                               QPs, so a sweep stores each frame once and one
+                               golden per (frame, QP) pair -- eight QPs of a
+                               480x272 frame cost 196 kB plus a few goldens. */
     uint32_t n_frames;      /* records that follow */
     uint32_t repeats;       /* times to cycle the sequence; 0 means 1 */
     uint32_t aclk_hz;       /* PL clock, so timing is right without a rebuild */

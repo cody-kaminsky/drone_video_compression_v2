@@ -138,8 +138,10 @@ static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
     Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
 
     dcc_kernel_clear_done(k);
+    /* Per-record QP: CONFIG is latched at START, so a sequence can sweep QP
+     * without reloading anything. */
     dcc_kernel_configure(k, h264_config_word((int)m->width, (int)m->height,
-                                             (int)m->qp));
+                                             (int)r->qp));
 
     if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)payload, rx_len,
                                XAXIDMA_DEVICE_TO_DMA) != XST_SUCCESS) {

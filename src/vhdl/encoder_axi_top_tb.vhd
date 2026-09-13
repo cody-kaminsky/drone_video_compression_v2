@@ -19,7 +19,8 @@ entity encoder_axi_top_tb is
         MBS_H    : natural := 17;
         QP       : natural := 26;
         FRAMES   : natural := 2;
-        BP_MODE  : natural := 1
+        BP_MODE  : natural := 1;    -- output backpressure: 0 tidy, 1 long stalls
+        IN_BP    : natural := 1     -- input stalls:        0 tidy, 1 long stalls
     );
 end entity;
 
@@ -119,13 +120,23 @@ begin
         end if;
     end process;
 
-    -- pixel feeder (DMA model) with random gaps
+    -- Pixel feeder, standing in for MM2S.
+    --
+    -- IN_BP 0 is the original: a one-cycle gap on a fixed pattern, which
+    -- exercises the handshake but never a sustained stall. IN_BP 1 withholds
+    -- data for up to 128 cycles at a time, which is what a real DMA does when
+    -- DDR is busy or the HP port is arbitrating against the PS. Every bug
+    -- found on this design so far has been a valid/ready field or length
+    -- moving while un-handshaken, and the input path has the same structure as
+    -- the output path that produced three of them.
     src_p : process
         file f : text;
         variable L : line;
         variable w32 : std_logic_vector(31 downto 0);
         variable open_status : file_open_status;
         variable gap : natural := 0;
+        variable ilfsr : unsigned(15 downto 0) := x"BEEF";
+        variable istall : integer := 0;
     begin
         for k in 0 to FRAMES - 1 loop
             wait until feed_go;
@@ -139,8 +150,19 @@ begin
                 s_tdata <= w32; s_tvalid <= '1';
                 loop wait until rising_edge(aclk); exit when s_tready = '1'; end loop;
                 s_tvalid <= '0';
-                gap := (gap * 5 + 1) mod 4;
-                if gap = 3 then wait until rising_edge(aclk); end if;
+                if IN_BP = 0 then
+                    gap := (gap * 5 + 1) mod 4;
+                    if gap = 3 then wait until rising_edge(aclk); end if;
+                else
+                    ilfsr := ilfsr(14 downto 0) &
+                             (ilfsr(15) xor ilfsr(13) xor ilfsr(12) xor ilfsr(10));
+                    if ilfsr(3 downto 0) = "0000" then
+                        istall := 1 + to_integer(ilfsr(6 downto 0));
+                        for z in 1 to istall loop
+                            wait until rising_edge(aclk);
+                        end loop;
+                    end if;
+                end if;
             end loop;
             file_close(f);
             feed_done <= true;
