@@ -529,6 +529,53 @@ direct confirmation of the `bit_packer` fix rather than a simulation result.
 
 ---
 
+## 6d. System rate versus PL rate, measured
+
+The `CYCLES` register measures START to DONE inside the PL. It says nothing
+about what the host spends between frames, so quoting it as a frame rate
+overstates what a camera feed would get. Measured separately on 100 frames of
+1080p at QP 26:
+
+| | ms/frame | fps |
+|---|---|---|
+| kernel, the PL alone | 27.56 | 36.3 |
+| **system: PL + DMA + host** | **28.39** | **35.2** |
+| verify, test only | 2.54 | — |
+| whole test loop | 30.93 | 32.3 |
+
+**Host overhead is 0.83 ms a frame, 3%.** That is far better than the 3–5 ms
+estimated before measuring, and the difference is the cache fix: the payload
+invalidates had been covering the whole 8 MB buffer, 262,144 line operations
+twice a frame, rather than the roughly 250 kB actually written. Sizing them to
+the payload removed almost all of it.
+
+The loop is also very steady: 28.37 to 28.41 ms across 100 frames, a 0.04 ms
+spread.
+
+**Combining this with the QP sweep gives the real margin.** Adding the measured
+0.83 ms to each QP's PL time:
+
+| QP | PL | system | fps | 30 fps margin |
+|---|---|---|---|---|
+| 14 | 32.30 ms | 33.13 ms | 30.2 | **+0.6%** |
+| 18 | 30.49 ms | 31.32 ms | 31.9 | +6.4% |
+| 22 | 28.66 ms | 29.49 ms | 33.9 | +13.0% |
+| 26 | 27.87 ms | 28.70 ms | 34.8 | +16.1% |
+| 30+ | 27.85 ms | 28.68 ms | 34.9 | +16.2% |
+
+So at practical operating points the system has 13–16% margin, and **at QP 14
+it has essentially none: 33.13 ms against a 33.33 ms budget.** 1080p30 is met
+across the whole QP range, but QP 14 is the edge, not a comfortable corner.
+Rate control should hold a floor above about QP 18 at 1080p on this part, for
+throughput reasons rather than quality ones.
+
+What this still is not: the loop is serial, with no overlap between capture,
+encode and write-out, no deadline, and a sink that is DDR rather than a card
+or a radio. A real pipeline would overlap those three and could do better than
+28.39 ms, or worse if the sink stalls.
+
+---
+
 ## 7. What this does not yet cover
 
 Honest list of what is still open, in the order it will probably matter.
