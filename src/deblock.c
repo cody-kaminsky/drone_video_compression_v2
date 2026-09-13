@@ -1,6 +1,7 @@
 /* deblock.c — H.264 deblocking filter, spec 8.7. See deblock.h. */
 
 #include "deblock.h"
+#include "quant.h"
 
 /* Table 8-16: alpha' and beta' by indexA / indexB (0..51) */
 static const u8 ALPHA[52] = {
@@ -86,12 +87,8 @@ static int bs_of(const dbk_mb_t *p, int pblk, const dbk_mb_t *q, int qblk, int m
 }
 
 void deblock_frame(u8 *y, int stride_y, u8 *uv, int stride_uv,
-                   int mbs_w, int mbs_h, const dbk_mb_t *info, int qp_y, int qp_c)
+                   int mbs_w, int mbs_h, const dbk_mb_t *info)
 {
-    int ia = clip3(0, 51, qp_y), ic = clip3(0, 51, qp_c);
-    int alpha = ALPHA[ia], beta = BETA[ia];
-    int alpha_c = ALPHA[ic], beta_c = BETA[ic];
-
     for (int mr = 0; mr < mbs_h; mr++)
         for (int mc = 0; mc < mbs_w; mc++) {
             const dbk_mb_t *cur = &info[mr * mbs_w + mc];
@@ -100,6 +97,15 @@ void deblock_frame(u8 *y, int stride_y, u8 *uv, int stride_uv,
             u8 *ly = y + (mr * 16) * stride_y + mc * 16;
             u8 *cuv = uv + (mr * 8) * stride_uv + mc * 16;    /* U at even bytes, V at odd */
             int bsv[4][4], bsh[4][4];                          /* [edge][segment] */
+            /* thresholds: qPav = (qPp + qPq + 1) >> 1 per edge; internal edges
+             * use the MB's own QP, the left/top MB edges the average */
+            int qcur = cur->qp, qleft = left ? left->qp : qcur, qtop = top ? top->qp : qcur;
+            int ia_in = clip3(0, 51, qcur);
+            int ia_l  = clip3(0, 51, (qleft + qcur + 1) >> 1);
+            int ia_t  = clip3(0, 51, (qtop + qcur + 1) >> 1);
+            int ic_in = clip3(0, 51, chroma_qp(qcur, 0));
+            int ic_l  = clip3(0, 51, (chroma_qp(qleft, 0) + chroma_qp(qcur, 0) + 1) >> 1);
+            int ic_t  = clip3(0, 51, (chroma_qp(qtop, 0) + chroma_qp(qcur, 0) + 1) >> 1);
 
             /* strengths: vertical edges e (x = 4e), segment = block row */
             for (int e = 0; e < 4; e++)
@@ -116,16 +122,18 @@ void deblock_frame(u8 *y, int stride_y, u8 *uv, int stride_uv,
             /* luma vertical edges, then horizontal edges */
             for (int e = 0; e < 4; e++) {
                 if (e == 0 && !left) continue;
+                int ia = e == 0 ? ia_l : ia_in;
                 for (int r = 0; r < 16; r++) {
                     int bs = bsv[e][r >> 2];
-                    if (bs) filter_line(ly + r * stride_y + 4 * e, 1, bs, alpha, beta, bs < 4 ? TC0[ia][bs - 1] : 0, 0);
+                    if (bs) filter_line(ly + r * stride_y + 4 * e, 1, bs, ALPHA[ia], BETA[ia], bs < 4 ? TC0[ia][bs - 1] : 0, 0);
                 }
             }
             for (int e = 0; e < 4; e++) {
                 if (e == 0 && !top) continue;
+                int ia = e == 0 ? ia_t : ia_in;
                 for (int c = 0; c < 16; c++) {
                     int bs = bsh[e][c >> 2];
-                    if (bs) filter_line(ly + (4 * e) * stride_y + c, stride_y, bs, alpha, beta, bs < 4 ? TC0[ia][bs - 1] : 0, 0);
+                    if (bs) filter_line(ly + (4 * e) * stride_y + c, stride_y, bs, ALPHA[ia], BETA[ia], bs < 4 ? TC0[ia][bs - 1] : 0, 0);
                 }
             }
             /* chroma: edges at 0 and 4 (chroma samples) use the luma strengths
@@ -134,16 +142,18 @@ void deblock_frame(u8 *y, int stride_y, u8 *uv, int stride_uv,
                 u8 *cp = cuv + comp;
                 for (int e = 0; e < 2; e++) {
                     if (e == 0 && !left) continue;
+                    int ic = e == 0 ? ic_l : ic_in;
                     for (int r = 0; r < 8; r++) {
                         int bs = bsv[2 * e][r >> 1];
-                        if (bs) filter_line(cp + r * stride_uv + 2 * (4 * e), 2, bs, alpha_c, beta_c, bs < 4 ? TC0[ic][bs - 1] : 0, 1);
+                        if (bs) filter_line(cp + r * stride_uv + 2 * (4 * e), 2, bs, ALPHA[ic], BETA[ic], bs < 4 ? TC0[ic][bs - 1] : 0, 1);
                     }
                 }
                 for (int e = 0; e < 2; e++) {
                     if (e == 0 && !top) continue;
+                    int ic = e == 0 ? ic_t : ic_in;
                     for (int c = 0; c < 8; c++) {
                         int bs = bsh[2 * e][c >> 1];
-                        if (bs) filter_line(cp + (4 * e) * stride_uv + 2 * c, stride_uv, bs, alpha_c, beta_c, bs < 4 ? TC0[ic][bs - 1] : 0, 1);
+                        if (bs) filter_line(cp + (4 * e) * stride_uv + 2 * c, stride_uv, bs, ALPHA[ic], BETA[ic], bs < 4 ? TC0[ic][bs - 1] : 0, 1);
                     }
                 }
             }

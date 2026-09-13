@@ -83,6 +83,32 @@ static int ref_valid = 0;          /* a reference frame exists */
 static int ref_w = 0, ref_h = 0;
 static dbk_mb_t arena_dbk[ARENA_MBS];   /* per-MB deblocking info of the current picture */
 
+/* ===== MB-level rate control state ===== */
+static struct {
+    long   fill;              /* leaky bucket, bits */
+    double c_i, c_p;          /* complexity: bits * 2^(qp/6) of the last I / P frame */
+    int    have_i, have_p;
+    int    qp_last;           /* frame QP of the previous frame */
+    int    pps_qp;            /* pic_init_qp written in the PPS */
+    long   total_prev;        /* bits of the previous frame (for the MB weights) */
+    int    prev_mbs;
+    long   overflow;          /* bits the bucket could not absorb since the reset */
+} rc;
+static u32 arena_mb_bits[ARENA_MBS];      /* bits per MB of the previous frame */
+static u32 arena_mb_bits_cur[ARENA_MBS];  /* bits per MB of the current frame */
+
+static int ilog2_x6(double r)             /* round(6 * log2(r)) */
+{
+    double v = 0; int n = 0;
+    if (r <= 0) return 0;
+    while (r >= 2.0) { r /= 2.0; n++; }
+    while (r < 1.0)  { r *= 2.0; n--; }
+    /* log2(r) for r in [1,2) by a short series on (r-1) */
+    v = (r - 1.0) * (1.4427 - 0.7213 * (r - 1.0) + 0.4809 * (r - 1.0) * (r - 1.0));
+    v = (v + n) * 6.0;
+    return (int)(v > 0 ? v + 0.5 : v - 0.5);
+}
+
 /* ===== local helpers ===== */
 
 static int clip_u8(int x)
@@ -1076,7 +1102,7 @@ static int dbg_encode_block(bitstream_t *bs, const i16 *c, int n, block_type_t b
     return cavlc_encode_block(bs, c, n, bt, nC);
 }
 
-static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs, int mb_type_off)
+static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs, int mb_type_off, int qp_delta)
 {
     int start_bits = bs->byte_pos * 8 + bs->n_in_cur;
     int luma_w4   = ncs->luma_w4;
@@ -1111,7 +1137,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs, int m
          * (spec 7.3.5.1 "if any nonzero residual"). */
         int has_residual = (st->cbp_luma != 0) || (st->cbp_chroma != 0);
         if (has_residual) {
-            bs_put_se(bs, 0);   /* mb_qp_delta = 0 */
+            bs_put_se(bs, qp_delta);   /* mb_qp_delta */
 
             /* Luma blocks in scan order. Each block belongs to 8x8 quadrant
              * (s / 4); emit only if cbp_luma's bit for that quadrant is set. */
@@ -1194,7 +1220,7 @@ static int mb_cavlc_emit(mb_state_t *st, nc_state_t *ncs, bitstream_t *bs, int m
     int mb_type = 1 + st->mode16 + 4 * st->cbp_chroma + 12 * st->cbp_luma;
     bs_put_ue(bs, mb_type + mb_type_off);
     bs_put_ue(bs, st->mode_chroma);     /* intra_chroma_pred_mode */
-    bs_put_se(bs, 0);                   /* mb_qp_delta = 0 (always for I_16x16) */
+    bs_put_se(bs, qp_delta);            /* mb_qp_delta (always present for I_16x16) */
 
     /* Luma DC block (always emitted for I_16x16). nC from block-0 neighbors. */
     {
@@ -1659,7 +1685,7 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                           u8 *recon_uv, int recon_stride_uv,
                           int mb_r, int mb_c, int width, int height, int mbs_w,
                           int qp_y, int qp_c, nc_state_t *ncs,
-                          bitstream_t *bs)
+                          bitstream_t *bs, int *qp_prev)
 {
     mb_state_t st = {0};
     st.mb_r = mb_r;
@@ -1688,7 +1714,11 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
                                st.recon_u, st.recon_v);
 
     mb_compute_cbp(&st);
+    /* the MB's QP takes effect only when mb_qp_delta is transmitted */
+    int emits_delta = !st.mb_type_is_i4x4 || st.cbp_luma != 0 || st.cbp_chroma != 0;
+    int qp_eff = emits_delta ? qp_y : *qp_prev;
     arena_dbk[mb_r * mbs_w + mb_c].intra = 1;
+    arena_dbk[mb_r * mbs_w + mb_c].qp = (u8)qp_eff;
     arena_dbk[mb_r * mbs_w + mb_c].nz = 0;
     arena_dbk[mb_r * mbs_w + mb_c].mvx = 0;
     arena_dbk[mb_r * mbs_w + mb_c].mvy = 0;
@@ -1698,7 +1728,8 @@ static int encode_mb_emit(const u8 *src_y,  int stride_y,
 #ifdef MB_SELFDECODE
     int mb_start_bit = bs->byte_pos * 8 + bs->n_in_cur;
 #endif
-    int rc = mb_cavlc_emit(&st, ncs, bs, 0);
+    int rc = mb_cavlc_emit(&st, ncs, bs, 0, qp_y - *qp_prev);
+    *qp_prev = qp_eff;
 #ifdef MB_SELFDECODE
     if (dec_state.initialized) {
         verify_mb_at(bs, mb_start_bit, &st, ncs);
@@ -1791,7 +1822,7 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
                        int mb_r, int mb_c, int width, int height, int mbs_w,
                        int qp_y, int qp_c, nc_state_t *ncs, const ref_planes_t *rp,
                        mv_field_t *mf, const encode_cfg_t *cfg, int *intra_budget,
-                       bitstream_t *bs, int *skip_run, encode_pstats_t *ps)
+                       bitstream_t *bs, int *skip_run, encode_pstats_t *ps, int *qp_prev)
 {
     mb_state_t st = {0};
     st.mb_r = mb_r; st.mb_c = mb_c; st.qp_y = qp_y; st.qp_c = qp_c;
@@ -1847,13 +1878,16 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
 
     mb_state_t *w = use_intra ? &st : &si;
     dbk_mb_t *dk = &arena_dbk[mb_r * mbs_w + mb_c];
+    int emits_delta;
     if (use_intra) {
         mb_compute_cbp(w);
+        emits_delta = !w->mb_type_is_i4x4 || w->cbp_luma != 0 || w->cbp_chroma != 0;
         mf->is_intra[mb_r * mbs_w + mb_c] = 1;
         mf->mvx[mb_r * mbs_w + mb_c] = 0; mf->mvy[mb_r * mbs_w + mb_c] = 0;
         dk->intra = 1; dk->nz = 0; dk->mvx = 0; dk->mvy = 0;
         if (ps) ps->mbs_intra++;
     } else {
+        emits_delta = !w->is_skip && (w->cbp_luma != 0 || w->cbp_chroma != 0);
         mf->is_intra[mb_r * mbs_w + mb_c] = 0;
         mf->mvx[mb_r * mbs_w + mb_c] = (i16)w->mvx; mf->mvy[mb_r * mbs_w + mb_c] = (i16)w->mvy;
         dk->intra = 0; dk->mvx = (i16)w->mvx; dk->mvy = (i16)w->mvy; dk->nz = 0;
@@ -1862,6 +1896,9 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
                 if (w->ac_levels_y_full[idx][k]) { dk->nz |= (u16)(1u << idx); break; }
         if (ps) { if (w->is_skip) ps->mbs_skip++; else ps->mbs_inter++; }
     }
+    dk->qp = (u8)(emits_delta ? qp_y : *qp_prev);
+    int qp_delta = qp_y - *qp_prev;
+    if (emits_delta) *qp_prev = qp_y;
 
     copy_out_mb_luma(recon_y, recon_stride_y, mb_r, mb_c, w->recon_y);
     copy_out_mb_chroma_combine(recon_uv, recon_stride_uv, mb_r, mb_c, w->recon_u, w->recon_v);
@@ -1870,7 +1907,7 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
     int luma_w4 = ncs->luma_w4, chroma_w4 = ncs->chroma_w4;
     if (use_intra) {
         bs_put_ue(bs, *skip_run); *skip_run = 0;
-        mb_cavlc_emit(w, ncs, bs, 5);
+        mb_cavlc_emit(w, ncs, bs, 5, qp_delta);
         return 0;
     }
     if (w->is_skip) {
@@ -1897,7 +1934,7 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
     bs_put_se(bs, w->mvd_y);
     int cbp = (w->cbp_luma & 0xF) | ((w->cbp_chroma & 3) << 4);
     bs_put_ue(bs, cbp_inter_to_codenum[cbp]);
-    if (cbp) bs_put_se(bs, 0);                /* mb_qp_delta */
+    if (cbp) bs_put_se(bs, qp_delta);         /* mb_qp_delta */
     /* luma 4x4 blocks in scan order, per coded 8x8 quadrant */
     for (int s = 0; s < 16; s++) {
         int br = blk_scan_br[s], bc = blk_scan_bc[s], idx = br * 4 + bc;
@@ -1951,7 +1988,7 @@ int encode_frame_h264(int width, int height, int qp,
                       u8 *bs_out, int bs_max_size, int frame_num,
                       encode_stats_t *stats)
 {
-    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1 };
+    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1, 0, 30, 0, 51, 4, 1, 1 };
     return encode_frame_h264_ext(width, height, qp, src_y, stride_y, src_uv, stride_uv,
                                  recon_y_out, recon_stride_y, recon_uv_out, recon_stride_uv,
                                  bs_out, bs_max_size, &cfg, stats, NULL);
@@ -1970,6 +2007,22 @@ int encode_frame_h264_ext(int width, int height, int qp,
     int is_p = (cfg->frame_type == 1);
     if (is_p && !(ref_valid && ref_w == width && ref_h == height)) return -7;
     if (width  % 16 != 0) return -1;
+    int rc_on = cfg->rc_bps > 0;
+    if (cfg->rc_reset || !is_p) {
+        if (cfg->rc_reset) {
+            rc.fill = 0; rc.have_i = 0; rc.have_p = 0; rc.prev_mbs = 0; rc.overflow = 0;
+            /* No history yet, so the caller's qp argument is the seed (this is
+             * what --bitrate documents). The frame model slews at most 3 QP per
+             * frame, so a seed far from the right answer costs several frames
+             * of ramp; the MB loop still corrects inside the first frame. */
+            rc.qp_last = qp;
+            if (rc_on) {
+                if (rc.qp_last < cfg->rc_qp_min) rc.qp_last = cfg->rc_qp_min;
+                if (rc.qp_last > cfg->rc_qp_max) rc.qp_last = cfg->rc_qp_max;
+            }
+        }
+        rc.pps_qp = qp;     /* the PPS is rewritten with every IDR */
+    }
     if (height % 16 != 0) return -1;
     if (qp < 0 || qp > 51) return -2;
     if (!bs_out)           return -3;
@@ -1990,10 +2043,50 @@ int encode_frame_h264_ext(int width, int height, int qp,
         n = nal_write_sps(bs_out + dst_pos, bs_max_size - dst_pos, width, height, qp);
         if (n < 0) return -4;
         dst_pos += n;
-        n = nal_write_pps(bs_out + dst_pos, bs_max_size - dst_pos, qp);
+        n = nal_write_pps(bs_out + dst_pos, bs_max_size - dst_pos, rc.pps_qp);
         if (n < 0) return -4;
         dst_pos += n;
     }
+
+    /* ---- rate control: frame target and frame QP ---- */
+    long frame_budget = 0, frame_target = 0, bucket_cap = 0;
+    int qp_frame = qp;
+    double rc_w_total = 0;
+    if (rc_on) {
+        frame_budget = cfg->rc_bps / (cfg->rc_fps > 0 ? cfg->rc_fps : 30);
+        bucket_cap = (long)(cfg->rc_bucket_frames > 0 ? cfg->rc_bucket_frames : 4) * frame_budget;
+        /* Every frame repays the backlog over ~2 frames. On top of that an
+         * intra frame may draw ahead, because it costs several P frames and a
+         * flat target would guarantee an overshoot the bucket absorbs blind.
+         * The draw is bounded twice: by the room left in the bucket, and by
+         * what the P frames of this GOP can plausibly give back. With a GOP of
+         * 1 (intra only) nothing can repay, so there is no draw and the intra
+         * frame lives on the plain per-frame budget like any other. */
+        long extra = 0;
+        if (!is_p) {
+            int gop = cfg->rc_gop > 1 ? cfg->rc_gop : 1;
+            long room  = bucket_cap - rc.fill;
+            long repay = (long)(gop - 1) * frame_budget / 2;
+            extra = room > 0 ? room * 3 / 4 : 0;
+            if (extra > repay) extra = repay;
+        }
+        frame_target = frame_budget - rc.fill / 2 + extra;
+        if (frame_target < frame_budget / 4) frame_target = frame_budget / 4;
+        double c = is_p ? rc.c_p : rc.c_i;
+        int have = is_p ? rc.have_p : rc.have_i;
+        if (!have && is_p && rc.have_i) { c = rc.c_i / 4.0; have = 1; }   /* first P: a guess */
+        if (have) {
+            qp_frame = ilog2_x6(c / (double)frame_target);
+            if (qp_frame > rc.qp_last + 3) qp_frame = rc.qp_last + 3;
+            if (qp_frame < rc.qp_last - 3) qp_frame = rc.qp_last - 3;
+        } else {
+            qp_frame = rc.qp_last;
+        }
+        if (qp_frame < cfg->rc_qp_min) qp_frame = cfg->rc_qp_min;
+        if (qp_frame > cfg->rc_qp_max) qp_frame = cfg->rc_qp_max;
+        for (int i = 0; i < rc.prev_mbs; i++) rc_w_total += arena_mb_bits[i];
+    }
+    qp = qp_frame;
 
     /* === Slice RBSP === */
     bitstream_t bs;
@@ -2013,7 +2106,7 @@ int encode_frame_h264_ext(int width, int height, int qp,
         bs_put_bits(&bs, 0, 1);              /* ref_pic_list_reordering_flag_l0 */
         bs_put_bits(&bs, 0, 1);              /* adaptive_ref_pic_marking_mode_flag (sliding window) */
     }
-    bs_put_se(&bs, 0);                       /* slice_qp_delta */
+    bs_put_se(&bs, qp - rc.pps_qp);          /* slice_qp_delta */
     if (cfg->deblock) {
         bs_put_ue(&bs, 0);                   /* disable_deblocking_filter_idc = 0: filter on */
         bs_put_se(&bs, 0);                   /* slice_alpha_c0_offset_div2 */
@@ -2067,21 +2160,76 @@ int encode_frame_h264_ext(int width, int height, int qp,
     int payload_start_bit = bs.byte_pos * 8 + bs.n_in_cur;
     int skip_run = 0;
     int intra_budget = cfg->intra_budget;
+    int qp_prev = qp;              /* QP_Y,PRED: the slice QP, then the last transmitted MB QP */
+    int qp_mb = qp;
+    long qp_sum = 0; int qp_lo = qp, qp_hi = qp;
+    double w_cum = 0;
     for (int r = 0; r < mbs_h; r++) {
         for (int c = 0; c < mbs_w; c++) {
+            int i = r * mbs_w + c;
+            long bits_before = bs.byte_pos * 8L + bs.n_in_cur;
+            /* ---- MB QP from the spend so far vs the expected spend ---- */
+            if (rc_on && i > 0) {
+                long spent = bits_before - payload_start_bit;
+                double expect;
+                if (rc.prev_mbs == mb_count && rc_w_total > 0) expect = (double)frame_target * (w_cum / rc_w_total);
+                else expect = (double)frame_target * ((double)i / mb_count);
+                int adj = 0;
+                if (expect > frame_target * 0.01 && spent > 0) {
+                    adj = ilog2_x6((double)spent / expect);          /* rate ratio -> QP steps */
+                    adj += (int)(4.0 * (spent - expect) / (double)frame_target);  /* accumulated error */
+                }
+                int qp_target = qp_frame + adj;
+                if (qp_target < cfg->rc_qp_min) qp_target = cfg->rc_qp_min;
+                if (qp_target > cfg->rc_qp_max) qp_target = cfg->rc_qp_max;
+                if (qp_target > qp_mb) qp_mb++; else if (qp_target < qp_mb) qp_mb--;
+            }
+            int qp_c_mb = rc_on ? chroma_qp(qp_mb, 0) : qp_c;
             if (is_p)
                 encode_mb_p(src_y, stride_y, src_uv, stride_uv,
                             recon_y_int, width, recon_uv_int, width,
-                            r, c, width, height, mbs_w, qp, qp_c, &ncs, &rp, &mf, cfg,
-                            &intra_budget, &bs, &skip_run, pstats);
+                            r, c, width, height, mbs_w, qp_mb, qp_c_mb, &ncs, &rp, &mf, cfg,
+                            &intra_budget, &bs, &skip_run, pstats, &qp_prev);
             else
                 encode_mb_emit(src_y, stride_y, src_uv, stride_uv,
                                recon_y_int, width, recon_uv_int, width,
                                r, c, width, height, mbs_w,
-                               qp, qp_c, &ncs, &bs);
+                               qp_mb, qp_c_mb, &ncs, &bs, &qp_prev);
+            long bits_after = bs.byte_pos * 8L + bs.n_in_cur;
+            arena_mb_bits_cur[i] = (u32)(bits_after - bits_before);
+            if (rc.prev_mbs == mb_count) w_cum += arena_mb_bits[i];
+            qp_sum += qp_mb;
+            if (qp_mb < qp_lo) qp_lo = qp_mb;
+            if (qp_mb > qp_hi) qp_hi = qp_mb;
         }
     }
     if (is_p && skip_run > 0) bs_put_ue(&bs, skip_run);   /* trailing skipped MBs */
+
+    /* ---- rate control: fit the model on this frame, update the bucket ---- */
+    {
+        long frame_bits = bs.byte_pos * 8L + bs.n_in_cur - payload_start_bit + 64;   /* + header, NAL */
+        double qp_avg = (double)qp_sum / mb_count;
+        double p2 = 1.0; for (int k = 0; k < (int)(qp_avg + 0.5); k++) p2 *= 1.122462;   /* 2^(qp/6) */
+        if (is_p) { rc.c_p = frame_bits * p2; rc.have_p = 1; }
+        else      { rc.c_i = frame_bits * p2; rc.have_i = 1; }
+        rc.qp_last = qp_frame;
+        if (rc_on) {
+            rc.fill += frame_bits - frame_budget;
+            if (rc.fill < 0) rc.fill = 0;
+            /* The bucket is the receiver's buffer: what does not fit is what
+             * the link cannot carry. Clamp and count it -- a nonzero overflow
+             * means the QP ceiling cannot meet the requested bit rate. */
+            if (rc.fill > bucket_cap) { rc.overflow += rc.fill - bucket_cap; rc.fill = bucket_cap; }
+        }
+        memcpy(arena_mb_bits, arena_mb_bits_cur, (size_t)mb_count * sizeof(u32));
+        rc.prev_mbs = mb_count;
+        if (pstats) {
+            pstats->qp_frame = qp_frame; pstats->qp_avg100 = (int)(qp_avg * 100 + 0.5);
+            pstats->qp_lo = qp_lo; pstats->qp_hi = qp_hi; pstats->bucket_fill = rc.fill;
+            pstats->frame_target = frame_target; pstats->bucket_cap = bucket_cap;
+            pstats->rc_overflow = rc.overflow;
+        }
+    }
 
     /* DCC_DUMP_SLICE=<path>: the MB-layer bits of this slice, re-aligned to
      * start at bit 0, with the rbsp stop bit and zero padding -- exactly
@@ -2123,7 +2271,7 @@ int encode_frame_h264_ext(int width, int height, int qp,
      * defines. */
     keep_reference(recon_y_int, recon_uv_int, width, height);
     if (cfg->deblock)
-        deblock_frame(arena_ref_y, width, arena_ref_uv, width, mbs_w, mbs_h, arena_dbk, qp, qp_c);
+        deblock_frame(arena_ref_y, width, arena_ref_uv, width, mbs_w, mbs_h, arena_dbk);
 
     /* Optional recon copy-out (test bench / measurement only — the FPGA IP
      * does not write recon to host memory). */

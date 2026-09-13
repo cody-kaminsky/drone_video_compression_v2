@@ -19,6 +19,13 @@
  *   --me-range R      integer search range in samples (default 16)
  *   --no-strict-refresh  let MBs left of the band reference unrefreshed area
  *   --no-deblock      in-loop deblocking off (the I-only hardware kernel's mode)
+ * Rate control (MB level):
+ *   --bitrate BPS     target / ceiling bit rate; <qp> is then the start QP
+ *   --fps N           frames per second (default 30)
+ *   --qp-min A --qp-max B   MB QP range (default 22..32)
+ *   --rc-buffer F     bucket size in frame budgets (default 4). This is the
+ *                     receiver buffering the link must have; it also sets how
+ *                     many bits the IDR may draw ahead.
  *
  * Stdout:
  *   STAT key: value lines per frame and totals, suitable for parsing.
@@ -42,7 +49,8 @@ int main(int argc, char **argv)
         fprintf(stderr,
             "usage: %s <in.yuv> <width> <height> <qp> [recon.yuv [bitstream.264]] [options]\n"
             "  --frames N  --intra-only  --gop G  --refresh-cols C  --intra-budget B  --me-range R\n"
-            "  --no-strict-refresh  --no-deblock\n",
+            "  --no-strict-refresh  --no-deblock\n"
+            "  --bitrate BPS --fps N --qp-min A --qp-max B --rc-buffer F\n",
             argv[0]);
         return 1;
     }
@@ -53,6 +61,7 @@ int main(int argc, char **argv)
     const char *recon_path = NULL, *bs_path = NULL;
     int max_frames = -1, intra_only = 0, gop = 0, refresh_cols = 1, intra_budget = 64, me_range = 16;
     int strict = 1, deblock = 1;
+    long bitrate = 0; int fps = 30, qp_min = 22, qp_max = 32, rc_buffer = 4;
     int npos = 0;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc)            max_frames = atoi(argv[++i]);
@@ -63,6 +72,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--me-range") && i + 1 < argc)     me_range = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-strict-refresh"))            strict = 0;
         else if (!strcmp(argv[i], "--no-deblock"))                   deblock = 0;
+        else if (!strcmp(argv[i], "--bitrate") && i + 1 < argc)      bitrate = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--fps") && i + 1 < argc)          fps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--qp-min") && i + 1 < argc)       qp_min = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--qp-max") && i + 1 < argc)       qp_max = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rc-buffer") && i + 1 < argc)    rc_buffer = atoi(argv[++i]);
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); return 1; }
         else if (npos == 0) { recon_path = argv[i]; npos++; }
         else if (npos == 1) { bs_path = argv[i]; npos++; }
@@ -99,6 +113,8 @@ int main(int argc, char **argv)
     double sum_psnr_y = 0;
     int refresh_col = 0, frame_num = 0;
     long tot_intra = 0, tot_inter = 0, tot_skip = 0;
+    long max_fill = 0, over_budget = 0, rc_overflow = 0;
+    long frame_budget = bitrate > 0 ? bitrate / fps : 0;
 
     for (int fi = 0; fi < nframes; fi++) {
         if (fread(frame, 1, fr_size, fin) != fr_size) { fprintf(stderr, "short read at frame %d\n", fi); break; }
@@ -112,9 +128,12 @@ int main(int argc, char **argv)
         cfg.intra_budget = intra_budget;
         cfg.refresh_strict = strict;
         cfg.deblock = deblock;
+        cfg.rc_bps = bitrate; cfg.rc_fps = fps; cfg.rc_qp_min = qp_min; cfg.rc_qp_max = qp_max;
+        cfg.rc_bucket_frames = rc_buffer; cfg.rc_reset = (fi == 0);
+        cfg.rc_gop = intra_only ? 1 : (gop > 0 ? gop : nframes);
 
         encode_stats_t stats;
-        encode_pstats_t ps = {0, 0, 0};
+        encode_pstats_t ps = {0};
         int rc = encode_frame_h264_ext(width, height, qp,
                                        frame, width, frame + y_size, width,
                                        recon, width, recon + y_size, width,
@@ -135,9 +154,18 @@ int main(int argc, char **argv)
         sum_psnr_y += py;
         tot_intra += idr ? stats.mb_count : ps.mbs_intra;
         tot_inter += ps.mbs_inter; tot_skip += ps.mbs_skip;
-        printf("STAT FRAME %d: type %s bytes %d psnr_y %.4f psnr_u %.4f psnr_v %.4f intra %d inter %d skip %d\n",
+        printf("STAT FRAME %d: type %s bytes %d psnr_y %.4f psnr_u %.4f psnr_v %.4f intra %d inter %d skip %d",
                fi, idr ? "IDR" : "P", stats.bytes_out, py, pu, pv,
                idr ? stats.mb_count : ps.mbs_intra, ps.mbs_inter, ps.mbs_skip);
+        if (bitrate > 0) {
+            printf(" qp %d avg %.2f range %d-%d target %ld bucket %ld/%ld",
+                   ps.qp_frame, ps.qp_avg100 / 100.0, ps.qp_lo, ps.qp_hi,
+                   ps.frame_target, ps.bucket_fill, ps.bucket_cap);
+            if (ps.bucket_fill > max_fill) max_fill = ps.bucket_fill;
+            if ((long)stats.bytes_out * 8 > frame_budget) over_budget++;
+            rc_overflow = ps.rc_overflow;
+        }
+        printf("\n");
     }
     if (frec) fclose(frec);
     if (fbs) fclose(fbs);
@@ -153,6 +181,14 @@ int main(int argc, char **argv)
     printf("STAT BYTES_OUT: %ld\n", total_bytes);
     printf("STAT BPP: %.6f\n", (double)total_bytes * 8 / ((double)width * height * nframes));
     printf("STAT MBS: intra %ld inter %ld skip %ld\n", tot_intra, tot_inter, tot_skip);
+    if (bitrate > 0) {
+        printf("STAT RC: target %ld bps, achieved %.0f bps, frames over budget %ld/%d, max bucket %ld bits (%.1f ms of link)\n",
+               bitrate, (double)total_bytes * 8 * fps / nframes, over_budget, nframes, max_fill, 1000.0 * max_fill / bitrate);
+        printf("STAT RC_OVERFLOW: %ld bits\n", rc_overflow);
+        if (rc_overflow > 0)
+            printf("STAT RC_WARN: bucket overflowed by %ld bits -- qp-max %d cannot hold %ld bps on this content\n",
+                   rc_overflow, qp_max, bitrate);
+    }
 
     free(bs_buf); free(frame); free(recon);
     return 0;

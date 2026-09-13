@@ -14,13 +14,14 @@
 /* Per-MB information the boundary strength derivation needs. */
 typedef struct {
     u8  intra;         /* intra coded */
+    u8  qp;            /* the MB's luma QP (QP_Y; chroma QP is derived) */
     u16 nz;            /* bit (br*4+bc): luma 4x4 block has nonzero levels (inter MBs) */
     i16 mvx, mvy;      /* vector in quarter samples (inter MBs) */
 } dbk_mb_t;
 
-/* Filter an NV12 frame in place. info is one entry per MB in raster order.
- * qp_y / qp_c are the (constant) luma and chroma QPs of the picture. */
+/* Filter an NV12 frame in place. info is one entry per MB in raster order;
+ * the edge thresholds use the average QP of the two MBs (spec 8.7.2.2). */
 void deblock_frame(u8 *y, int stride_y, u8 *uv, int stride_uv,
-                   int mbs_w, int mbs_h, const dbk_mb_t *info, int qp_y, int qp_c);
+                   int mbs_w, int mbs_h, const dbk_mb_t *info);
 
 #endif

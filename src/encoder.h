@@ -88,12 +88,41 @@ typedef struct {
                             refresh actually recovers from losses */
     int deblock;         /* in-loop deblocking filter (spec 8.7) on the output and
                             the reference; intra prediction stays unfiltered */
+    /* MB-level rate control (rc_bps > 0). The qp argument of the encode call
+     * is then the starting QP of the first frame only. A leaky bucket drains
+     * rc_bps / rc_fps bits per frame; the frame QP comes from a bits ~
+     * C * 2^(-QP/6) model fitted on the previous frame, and inside the frame
+     * the QP of each MB is corrected by the ratio of bits spent to the bits
+     * expected at that point (the previous frame's per-MB bit map is the
+     * expectation), one step per MB, within [rc_qp_min, rc_qp_max]. */
+    long rc_bps;         /* target (ceiling) bit rate, bits per second; 0 = fixed QP */
+    int rc_fps;          /* frames per second */
+    int rc_qp_min, rc_qp_max;
+    int rc_bucket_frames;/* bucket size in frame budgets; this is the receiver
+                            buffering the link must have, i.e. the latency the
+                            link may absorb. An IDR is allowed to spend the
+                            frame budget plus 3/4 of the room left in the
+                            bucket, so this also sets how good the IDR is.
+                            0 selects the default of 4 (133 ms at 30 fps). */
+    int rc_reset;        /* 1 on the first frame of a sequence: clear the controller */
+    int rc_gop;          /* frames per GOP, so the controller knows how many P
+                            frames will repay what an I frame draws ahead.
+                            1 (or 0) means every frame is intra, and then an
+                            intra frame gets only the plain per-frame budget. */
 } encode_cfg_t;
 
 typedef struct {
     int mbs_intra;       /* per-frame decision counts */
     int mbs_inter;
     int mbs_skip;
+    int qp_frame;        /* rate control: frame QP, average MB QP (x100), min / max MB QP */
+    int qp_avg100;
+    int qp_lo, qp_hi;
+    long bucket_fill;    /* bits in the bucket after this frame */
+    long bucket_cap;     /* bucket capacity, bits */
+    long frame_target;   /* bits this frame was aiming for */
+    long rc_overflow;    /* cumulative bits the bucket could not absorb; nonzero
+                            means rc_qp_max cannot meet rc_bps on this content */
 } encode_pstats_t;
 
 /* Encode one frame per cfg. The reconstruction of the previous call is the
