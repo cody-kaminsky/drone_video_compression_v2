@@ -340,22 +340,36 @@ Extrapolating to 1080p at 342 cycles/MB: 8,160 macroblocks is 27.9 ms, so
 
 ## 5b. Loading the sequence and running it
 
-The ELF and the data are loaded separately. Download the ELF first, then the
-sequence, then resume:
+The ELF and the data are loaded separately, and the application waits for the
+data rather than needing a breakpoint.
 
-1. In Vitis, **Run -> Launch on Hardware** with *Program FPGA* enabled. If the
-   run configuration stops at `main`, leave it halted.
-2. In a second terminal, load the data and resume:
+1. In Vitis, **Run -> Launch on Hardware** with *Program FPGA* enabled. Let it
+   run. The UART prints:
 
-```sh
-xsdb build/seq_board/load.tcl
-```
+   ```
+   waiting for a manifest at 03000000 ...
+     run the generated load.tcl now:
+       xsdb <seq dir>/load.tcl
+   ```
 
-The generated script connects, halts core 0, `dow -data`s every frame and
-golden to its manifest address, writes the manifest last, and resumes. Writing
-the manifest last matters: its magic number is what tells the application the
-rest of the data is really there, so a load that dies halfway leaves the
-application reporting a missing manifest rather than running on garbage.
+2. In a second terminal:
+
+   ```sh
+   xsdb build/seq_board_1080/load.tcl
+   ```
+
+The script connects, halts core 0, `dow -data`s every frame and golden to its
+address, writes the manifest last, and resumes into the poll. The application
+sees the magic appear and starts encoding.
+
+Two details that matter. The manifest is written **last** because its magic
+number is what tells the application the rest of the data really arrived, so a
+load that dies halfway leaves it waiting rather than running on garbage. And
+the poll **invalidates the cache on every pass**: JTAG writes DDR behind the
+data cache, so without that the CPU would hold the stale line forever and
+never see the manifest arrive.
+
+The wait times out after 300 seconds.
 
 Expected output for a 4-frame 1080p sequence at QP 26:
 

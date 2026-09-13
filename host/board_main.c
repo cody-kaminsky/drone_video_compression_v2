@@ -149,16 +149,34 @@ int main(void)
     Xil_DCacheEnable();
     printf("\n=== DCC codec kernel, sequence run (L5) ===\n");
 
-    /* The manifest arrived by JTAG straight into DDR, so any cache line the
-     * CPU still holds for it is stale from a previous run. */
-    Xil_DCacheInvalidateRange((UINTPTR)DCC_MANIFEST_ADDR, 64u * 1024u);
-
-    if (m->magic != DCC_MANIFEST_MAGIC) {
-        printf("FAIL: no manifest at %08lx (magic reads %08lx, want %08lx).\n"
-               "      Load one with the generated load.tcl before resuming.\n",
-               (unsigned long)DCC_MANIFEST_ADDR, (unsigned long)m->magic,
-               (unsigned long)DCC_MANIFEST_MAGIC);
-        return 1;
+    /* Wait for a manifest rather than failing when it is not there yet.
+     * The application is launched first and the data is pushed in after,
+     * which is the order that needs no breakpoint: the loader halts the
+     * core, writes DDR over JTAG, and resumes into this loop.
+     *
+     * Invalidate on every pass. JTAG writes DDR behind the data cache, so
+     * once this loop has read the address the CPU would hold that line
+     * forever and never see the magic arrive. */
+    {
+        uint64_t t0 = dcc_time_us();
+        int announced = 0;
+        for (;;) {
+            Xil_DCacheInvalidateRange((UINTPTR)DCC_MANIFEST_ADDR, 64u * 1024u);
+            if (m->magic == DCC_MANIFEST_MAGIC) break;
+            if (!announced) {
+                printf("waiting for a manifest at %08lx ...\n"
+                       "  run the generated load.tcl now:\n"
+                       "    xsdb <seq dir>/load.tcl\n",
+                       (unsigned long)DCC_MANIFEST_ADDR);
+                announced = 1;
+            }
+            if (dcc_time_us() - t0 > 300u * 1000u * 1000u) {
+                printf("FAIL: no manifest after 300 s (magic reads %08lx, "
+                       "want %08lx)\n", (unsigned long)m->magic,
+                       (unsigned long)DCC_MANIFEST_MAGIC);
+                return 1;
+            }
+        }
     }
     if (m->version != DCC_MANIFEST_VER) {
         printf("FAIL: manifest version %lu, this build expects %lu\n",
