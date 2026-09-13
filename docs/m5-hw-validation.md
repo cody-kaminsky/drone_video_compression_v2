@@ -366,8 +366,21 @@ hung.
 **Why simulation missed it.** The testbench checks `tlast` properly. It simply
 never ran a frame that triggered the condition: both 480x272 frames it uses are
 mod 8 = 3, and it ran the *same* frame twice, so it sampled one value of an
-eight-valued variable. Encoding the same test frame at QP 23 instead of 26
-reproduces it in 90 seconds.
+eight-valued variable.
+
+**Reproduction, confirmed.** Encode the same 480x272 test frame at QP 23
+instead of QP 26. That gives a 24451-byte payload with mod 8 = 0. Regenerate
+the vectors, set the testbench's `QP` generic to 23, and run it:
+
+```sh
+DCC_DUMP_SRC=build/frame_src_words.txt DCC_DUMP_SLICE=build/slice_payload.txt     build/dcc_encoder.exe build/md_frame.yuv 480 272 23
+python tools/gen_frame_stream.py build/md_frame.yuv 480 272 build/frame_stream.txt
+```
+
+Result: **zero byte mismatches** and `Failure: watchdog timeout` at 8 ms. Every
+payload byte is correct and the testbench hangs waiting for `last_seen`, which
+is exactly what the board did. This is the regression test for the fix -- it
+must report PASS at QP 23 as well as QP 26.
 
 **Fix direction.** Give `bit_packer` a `HOLD_LAST` generic, default false so
 nothing else changes, and set it true only for the output packer in

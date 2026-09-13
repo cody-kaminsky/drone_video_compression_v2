@@ -17,7 +17,7 @@ entity encoder_axi_top_tb is
         OUT_FILE : string := "build/slice_payload.txt";
         MBS_W    : natural := 30;
         MBS_H    : natural := 17;
-        QP       : natural := 23;
+        QP       : natural := 26;
         FRAMES   : natural := 2;
         BP_MODE  : natural := 0
     );
