@@ -291,7 +291,7 @@ int main(void)
     printf("kernel:   ID 'H264' version %lu.%lu at %08lx, %lu MHz\n",
            (unsigned long)(k.version >> 16), (unsigned long)(k.version & 0xFFFF),
            (unsigned long)DCC_ENC_BASE, (unsigned long)(m->aclk_hz / 1000000u));
-    printf("sequence: %lux%lu QP%lu, %lu frames x %lu repeats, %lu MBs/frame\n",
+    printf("sequence: %lux%lu QP%lu nominal, %lu records x %lu repeats, %lu MBs/frame\n",
            (unsigned long)m->width, (unsigned long)m->height,
            (unsigned long)m->qp, (unsigned long)m->n_frames,
            (unsigned long)repeats, (unsigned long)mbs);
@@ -337,8 +337,9 @@ int main(void)
             encoded++;
 
             if (rep == 0)
-                printf("  frame %2lu: %6d bytes, %7lu cycles (%.2f ms, %.0f cy/MB) OK\n",
-                       (unsigned long)i, n, (unsigned long)perf.cycles,
+                printf("  rec %2lu: QP%-3lu %8d bytes, %8lu cycles (%.2f ms, %.0f cy/MB) OK\n",
+                       (unsigned long)i, (unsigned long)r->qp, n,
+                       (unsigned long)perf.cycles,
                        perf.cycles * 1000.0 / m->aclk_hz,
                        (double)perf.cycles / mbs);
         }
