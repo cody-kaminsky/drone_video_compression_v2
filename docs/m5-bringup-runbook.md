@@ -217,17 +217,50 @@ that code, so the container cannot disagree with itself.
 ### By hand in the IDE instead
 
 ```sh
-/c/AMDDesignTools/2025.2/Vitis/bin/vitis -w build/vitis
+/c/AMDDesignTools/2025.2/Vitis/bin/vitis.bat -w build/vitis
 ```
 
-1. **Create Platform Component** from `build/zybo/dcc_enc.xsa`, OS
-   `standalone`, processor `ps7_cortexa9_0`. Build it.
-2. **Create Application Component** against that platform, domain
-   `standalone_ps7_cortexa9_0`, template *Empty Application (C)*.
-3. Drag the twelve files above into the component's `src/`.
-4. Set optimization to `-O2` in the component's build settings. At `-O0` the
-   staging memcpy and the payload compare dominate the timings the run
-   reports, which makes the numbers meaningless.
+1. **File -> New Component -> Platform.** Name `dcc_plat`, hardware design
+   `build/zybo/dcc_enc.xsa`, OS `standalone`, processor `ps7_cortexa9_0`.
+   Finish, then select it and **Build**. A few minutes; it also generates an
+   FSBL you do not need for JTAG bring-up.
+2. **File -> New Component -> Application.** Name `dcc_l4`, platform
+   `dcc_plat`, domain `standalone_ps7_cortexa9_0`, template
+   *Empty Application (C)*.
+3. **Copy the twelve files into `dcc_l4/src/`.** The component's
+   `CMakeLists.txt` calls `aux_source_directory` on that directory, so
+   anything dropped there is compiled with no registration step -- a plain
+   filesystem copy plus a refresh is enough. (The scripted path puts them in
+   the component root instead and registers them through
+   `USER_COMPILE_SOURCES`; both work, `src/` is the simpler one by hand.)
+4. **Set `-O2`** in the component's build settings. At `-O0` the staging
+   memcpy and the payload compare dominate the timings the run reports.
+5. **Build.**
+
+### What actually goes wrong first
+
+The application has now been built on this machine, and two things needed
+fixing that are worth knowing about because both are Cortex-A9 specific:
+
+- **`xtime_l.h: No such file or directory`.** That header exists on
+  UltraScale+ (A53/R5) but not in a Cortex-A9 system-device-tree BSP. The
+  same `XTime_GetTime` and `COUNTS_PER_SECOND` come from **`xiltimer.h`**,
+  which pulls in `xtimer_config.h`. Already fixed in
+  `host/platform_standalone.c`.
+- **`XAxiDma_Busy` returns `u32`, not `int`**, so `%d` is a `-Wformat` error
+  under the default `-Wall -Wextra`. Already fixed in `host/board_main.c`.
+
+Note also that `COUNTS_PER_SECOND` expands to a bare
+`XPAR_CPU_CORE_CLOCK_FREQ_HZ/2` with no parentheses, so parenthesise it before
+dividing again or it reassociates.
+
+Result: `build/vitis/dcc_l4/build/dcc_l4.elf`, about 554 kB, 281 kB of text
+and 1.27 MB of bss (the staging, payload, Annex B and scratch buffers). To
+rebuild after editing a source without going through the IDE:
+
+```sh
+cd build/vitis/dcc_l4/build && ninja
+```
 
 ---
 

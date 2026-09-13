@@ -10,7 +10,10 @@
 
 #include "codec_kernel.h"
 #include "xil_io.h"
-#include "xtime_l.h"
+/* xiltimer.h, not xtime_l.h. The latter exists on UltraScale+ (A53/R5) but
+ * not in a Cortex-A9 system-device-tree BSP, where the same XTime_GetTime and
+ * COUNTS_PER_SECOND come from xiltimer.h (which pulls in xtimer_config.h). */
+#include "xiltimer.h"
 
 uint32_t dcc_mmio_read(uintptr_t base, uint32_t off)
 {
@@ -26,8 +29,9 @@ uint64_t dcc_time_us(void)
 {
     XTime t;
     XTime_GetTime(&t);
-    /* The A9 global timer runs at half the CPU clock. COUNTS_PER_SECOND is
-     * defined by the BSP for this part; do the divide in 64 bits or a 1080p
-     * frame's worth of counts overflows. */
-    return (uint64_t)t / (COUNTS_PER_SECOND / 1000000ull);
+    /* COUNTS_PER_SECOND is XPAR_CPU_CORE_CLOCK_FREQ_HZ/2 here: the A9 global
+     * timer runs at half the CPU clock. Parenthesise it, because the macro
+     * expands to a bare division and would otherwise reassociate. Do the
+     * divide in 64 bits or a frame's worth of counts overflows. */
+    return (uint64_t)t / ((uint64_t)(COUNTS_PER_SECOND) / 1000000ull);
 }

@@ -135,10 +135,10 @@ static int encode_one(dcc_kernel_t *k, int width, int height, int qp,
     }
 
     if (dcc_kernel_wait_done(k, 2000000u) != 0) {
-        printf("FAIL: kernel timeout. STATUS=%08lx, MM2S busy=%d, S2MM busy=%d\n",
+        printf("FAIL: kernel timeout. STATUS=%08lx, MM2S busy=%lu, S2MM busy=%lu\n",
                (unsigned long)dcc_mmio_read(k->base, DCC_REG_STATUS),
-               XAxiDma_Busy(&dma, XAXIDMA_DMA_TO_DEVICE),
-               XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA));
+               (unsigned long)XAxiDma_Busy(&dma, XAXIDMA_DMA_TO_DEVICE),
+               (unsigned long)XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA));
         return -1;
     }
     /* Let S2MM retire the last beats after tlast before reading the buffer. */

@@ -104,7 +104,15 @@ def main():
     if not args.no_build:
         print("building...")
         comp.build()
-        print("built. ELF under %s" % os.path.join(ws, APP, "build"))
+        # comp.build() does not raise on a failed compile -- it prints and
+        # returns -- so check for the artifact rather than trusting it.
+        elf = os.path.join(ws, APP, "build", APP + ".elf")
+        if not os.path.isfile(elf):
+            vitis.dispose()
+            sys.exit("BUILD FAILED: no %s. Scroll up for the compiler "
+                     "error, or rebuild in place with: cd %s && ninja"
+                     % (elf, os.path.join(ws, APP, "build")))
+        print("built: %s (%d bytes)" % (elf, os.path.getsize(elf)))
 
     print("""
 next:
