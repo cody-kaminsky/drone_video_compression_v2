@@ -25,7 +25,14 @@
 --   0x14 CYCLES   R  aclk cycles of the last frame, START to frame done
 --   0x18 BYTES    R  payload bytes of the last frame
 --   0x1C ID       R  0x48323634 ("H264")
---   0x20 VERSION  R  0x00010000
+--   0x20 VERSION  R  0x00010001
+--        1.0 = original. 1.1 = the output-path fixes: bit_packer
+--        HOLD_LAST (tlast on a payload that is a whole number of
+--        bytes), the merger block-trim latch (4 bits inserted under
+--        output stalls), and bytes_last no longer dropping the final
+--        beat. Bump this on any change software can observe: PL
+--        configuration survives an ELF reload, so without a version
+--        there is no way to tell which bitstream is really loaded.
 --
 -- The slice header, SPS/PPS and NAL framing are done by the host around
 -- the payload, exactly as the C reference splits them (src/nal.c).
@@ -245,7 +252,7 @@ begin
                         when "000101" => rdata_q <= std_logic_vector(cyc_last);
                         when "000110" => rdata_q <= std_logic_vector(bytes_last);
                         when "000111" => rdata_q <= x"48323634";
-                        when "001000" => rdata_q <= x"00010000";
+                        when "001000" => rdata_q <= x"00010001";
                         when others   => rdata_q <= (others => '0');
                     end case;
                 end if;
