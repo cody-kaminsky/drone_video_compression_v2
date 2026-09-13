@@ -43,7 +43,7 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: impl_ooc host_test ip ip_check zybo board_vectors all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
@@ -229,3 +229,24 @@ board_vectors: $(BIN_REF) tools/frames/old_town_cross_480x272.png
 	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png 	        -pix_fmt nv12 -f rawvideo $(BUILD)/md_frame.yuv
 	@DCC_DUMP_SLICE=$(BUILD)/board/payload.txt $(BIN_REF) 	        $(BUILD)/md_frame.yuv 480 272 26 > /dev/null
 	python tools/gen_board_vectors.py $(BUILD)/md_frame.yuv 	        $(BUILD)/board/payload.txt $(BUILD)/board
+
+# Tool that writes a frame in the kernel's stream order, using the same
+# h264_nv12_to_stream() the x86 test covers. One implementation of the order.
+board_seq_tools: $(BUILD)/gen_stream_frame
+
+$(BUILD)/gen_stream_frame: tools/gen_stream_frame.c $(HOST_DIR)/h264_host.c                            $(BUILD)/nal.o $(BUILD)/bitstream.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -I$(HOST_DIR) -o $@ $^ $(LDLIBS)
+
+# L5 sequence for the board: frames in kernel stream order, golden payloads,
+# a manifest and an xsdb loader. Override any of these on the command line.
+#   make board_seq SEQ=build/zoom_1080p.yuv W=1920 H=1088 QP=26 FRAMES=4 REPEATS=25
+SEQ     ?= build/zoom_1080p.yuv
+W       ?= 1920
+H       ?= 1088
+QP      ?= 26
+FRAMES  ?= 4
+REPEATS ?= 25
+SEQOUT  ?= $(BUILD)/seq_board
+
+board_seq: $(BIN_REF) $(BUILD)/gen_stream_frame
+	python tools/gen_board_sequence.py $(SEQ) $(W) $(H) $(QP) 	    --frames $(FRAMES) --repeats $(REPEATS) --out $(SEQOUT)

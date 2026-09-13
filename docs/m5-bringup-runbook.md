@@ -184,12 +184,34 @@ LUTs and 5 BRAM tiles on top of the kernel's 24,063.
 
 ## 4. Vitis setup
 
-Generate the test vectors first — the frame and the golden payload are linked
-into the application as C arrays, so there is no file I/O on the first run:
+Generate the test sequence first. It is loaded into DDR over JTAG rather than
+linked into the ELF, so the application is resolution-independent and changing
+the sequence never needs a recompile:
 
 ```sh
-make board_vectors      # -> build/board/{frame_data.c,golden_data.c,golden.bin}
+make board_seq_tools
+make board_seq SEQ=build/zoom_1080p.yuv W=1920 H=1088 QP=26 FRAMES=4 REPEATS=25
 ```
+
+That writes, into `build/seq_board`:
+
+| File | Contents |
+|---|---|
+| `frame_NNN.bin` | the frame in the kernel's **stream order** |
+| `golden_NNN.bin` | the payload the C reference says the kernel must emit |
+| `manifest.bin` | geometry, QP, repeats, and the address of every frame |
+| `load.tcl` | an xsdb script that pushes it all into DDR |
+
+Frames are pre-shuffled on the workstation by the same `h264_nv12_to_stream()`
+that `make host_test` checks, so **the board does no staging copy at all** --
+MM2S reads each frame where it lies. At 1080p that removes about 3 MB of
+memcpy per frame, which was the main thing eating the 33 ms budget at 30 fps
+and the main argument for scatter-gather.
+
+Because the encoder is intra only, frames are independent: the kernel carries
+no state between them. So four frames cycled twenty-five times exercises
+restart and sustained throughput exactly as well as a hundred distinct
+frames, and loads in thirteen seconds instead of minutes.
 
 Then create the workspace, platform and application:
 
@@ -205,10 +227,14 @@ imports the sources **flat into one directory** so `#include "nal.h"` resolves
 with no include paths to configure:
 
 ```
-board_main.c  codec_kernel.c/.h  h264_host.c/.h  platform_standalone.c
+board_main.c  codec_kernel.c/.h  h264_host.c/.h  dcc_memmap.h
+platform_standalone.c
 nal.c/.h  bitstream.c/.h  types.h          <- verbatim from src/
-frame_data.c  golden_data.c                <- from make board_vectors
 ```
+
+Twelve files, and no generated data: the frames and goldens live in DDR, not
+in the ELF. The application comes out at about 69 kB of text and 25 kB of bss,
+whatever the resolution.
 
 Note what is *not* being reimplemented. `src/nal.c` and `src/bitstream.c` are
 the same files that produce the byte-exact reference stream on the
@@ -228,7 +254,7 @@ that code, so the container cannot disagree with itself.
 2. **File -> New Component -> Application.** Name `dcc_l4`, platform
    `dcc_plat`, domain `standalone_ps7_cortexa9_0`, template
    *Empty Application (C)*.
-3. **Copy the thirteen files into `dcc_l4/src/`.** The component's
+3. **Copy the twelve files into `dcc_l4/src/`.** The component's
    `CMakeLists.txt` calls `aux_source_directory` on that directory, so
    anything dropped there is compiled with no registration step -- a plain
    filesystem copy plus a refresh is enough. (The scripted path puts them in
@@ -309,6 +335,52 @@ encoder.
 
 Extrapolating to 1080p at 342 cycles/MB: 8,160 macroblocks is 27.9 ms, so
 35.8 fps. 1080p30 with about 19% to spare.
+
+---
+
+## 5b. Loading the sequence and running it
+
+The ELF and the data are loaded separately. Download the ELF first, then the
+sequence, then resume:
+
+1. In Vitis, **Run -> Launch on Hardware** with *Program FPGA* enabled. If the
+   run configuration stops at `main`, leave it halted.
+2. In a second terminal, load the data and resume:
+
+```sh
+xsdb build/seq_board/load.tcl
+```
+
+The generated script connects, halts core 0, `dow -data`s every frame and
+golden to its manifest address, writes the manifest last, and resumes. Writing
+the manifest last matters: its magic number is what tells the application the
+rest of the data is really there, so a load that dies halfway leaves the
+application reporting a missing manifest rather than running on garbage.
+
+Expected output for a 4-frame 1080p sequence at QP 26:
+
+```
+=== DCC codec kernel, sequence run (L5) ===
+kernel:   ID 'H264' version 1.0 at 43c00000, 100 MHz
+sequence: 1920x1088 QP26, 4 frames x 25 repeats, 8160 MBs/frame
+  frame  0: 256713 bytes, 2750000 cycles (27.50 ms, 337 cy/MB) OK
+  frame  1: 253657 bytes, ...
+  ...
+PASS: 100 frames encoded, every payload byte-exact with the C reference
+  cycles   avg ...  min ...  max ...  (337.0 cy/MB)
+  frame    27.50 ms -> 36.4 fps at 100 MHz
+  bitrate  ... bytes total, 61.0 Mbps at 30 fps
+  30 fps   MET (needs <= 33.33 ms/frame)
+```
+
+The payload byte counts are fixed by the reference and must match exactly:
+**256713, 253657, 252840, 252415** for the first four frames of this clip.
+The cycle counts are the measurement.
+
+Note the bitrate line. At QP 26 a 1080p frame is about 254 kB, which is
+61 Mbps at 30 fps -- twice the 30 Mbps the project targets. That is expected
+for intra-only at this QP and is what the rate control on `claude/p-frames`
+exists to fix; it is not a bring-up problem.
 
 ---
 

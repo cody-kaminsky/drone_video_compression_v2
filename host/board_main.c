@@ -1,81 +1,58 @@
-/* board_main.c — L4 of the validation ladder: run a frame through the real
- * kernel on the board and compare the payload, byte for byte, against the
- * bytes the C reference produced for the same frame and QP.
+/* board_main.c — L4/L5: run a sequence through the real kernel and compare
+ * every frame's payload, byte for byte, against what the C reference says it
+ * must be.
  *
- * NOT BUILT BY THE WORKSTATION MAKEFILE. This needs the Vitis BSP headers and
- * an XSA from scripts/build_zybo_bd.tcl, so it is the one file here that has
- * never been compiled. Everything it calls into (h264_host.c, codec_kernel.c,
- * src/nal.c, src/bitstream.c) is exercised by `make host_test` on x86.
+ * Driven by a manifest in DDR (host/dcc_memmap.h), written by
+ * tools/gen_board_sequence.py and loaded over JTAG. Changing the test
+ * sequence means reloading, never recompiling.
  *
- * Setup is scripted:  make board_vectors  then  scripts/vitis_setup.py.
- * That creates the platform from the XSA and an application whose sources are
- * this file, host/codec_kernel.c, host/h264_host.c,
- * host/platform_standalone.c, and src/nal.c + src/bitstream.c verbatim from
- * the reference encoder.
+ * Two things this does NOT do, both deliberately:
  *
- * The input frame and the golden payload are linked in as C arrays, generated
- * by `make board_vectors`. For 480x272 that is 196 kB of frame and 19 kB of
- * golden, which fits DDR trivially and removes every file-I/O variable from
- * the first run. Move to SD or JTAG-loaded buffers only once this passes, and
- * only because 1080p is too big to link in comfortably.
+ *   - No staging copy. Frames are already in the kernel's stream order,
+ *     because the reordering is deterministic and was done once on the
+ *     workstation by the same h264_nv12_to_stream() that `make host_test`
+ *     checks. MM2S reads each frame where it lies. That removes about 3 MB of
+ *     memcpy per 1080p frame, which was the main thing eating the 33 ms
+ *     budget at 30 fps -- and the main argument for scatter-gather.
+ *
+ *   - No buffers in bss. The payload, scratch and Annex B buffers live at
+ *     fixed DDR addresses from the memory map, so frame size is a runtime
+ *     property rather than something baked into the ELF.
+ *
+ * NOT BUILT BY THE WORKSTATION MAKEFILE: needs the Vitis BSP. Everything it
+ * calls into is exercised on x86 by `make host_test`.
  */
 
 #include "codec_kernel.h"
 #include "h264_host.h"
+#include "dcc_memmap.h"
 #include "xparameters.h"
 #include "xaxidma.h"
 #include "xil_cache.h"
 #include <stdio.h>
 #include <string.h>
 
-/* ---- what the block design produced ----------------------------------------
- * These are the addresses scripts/build_zybo_bd.tcl assigned, printed as
- * BD_ADDR lines when it ran. They are literals rather than XPAR_* symbols
- * because the generated symbol name depends on the BD cell name and the
- * Vitis release, and a wrong guess is a compile error at best and a silent
- * read of the wrong peripheral at worst. If you rename cells or re-run the
- * BD script, take the new values from its BD_ADDR output or xparameters.h. */
+/* Addresses assigned by scripts/build_zybo_bd.tcl, printed as BD_ADDR lines.
+ * Literals rather than XPAR_* symbols, whose spelling depends on the block
+ * design cell name and the Vitis release. */
 #ifndef DCC_ENC_BASE
-#define DCC_ENC_BASE   0x43C00000u      /* SEG_enc_reg0  */
+#define DCC_ENC_BASE   0x43C00000u      /* SEG_enc_reg0 */
 #endif
 #ifndef DCC_DMA_BASE
-#define DCC_DMA_BASE   0x40400000u      /* SEG_dma_Reg   */
+#define DCC_DMA_BASE   0x40400000u      /* SEG_dma_Reg  */
 #endif
-
-/* Must match the PL clock the BD actually synthesised, not the one you asked
- * for. FCLK0 is the IO PLL divided by two integers, so from 1000 MHz the only
- * reachable values near 110 MHz are 1000/9 = 111.111 and 1000/10 = 100: ask
- * for 110 and you silently get 111.111. build_zybo_bd prints the achieved
- * value as BD_FCLK and warns when it differs from the request. Every
- * cycles-to-milliseconds number below is wrong if this is wrong. */
-#define DCC_ACLK_HZ    100000000u
-
-/* ---- the test frame, linked in. See the header comment. ---- */
-extern const unsigned char frame_nv12[];
-extern const unsigned int  frame_nv12_len;
-extern const unsigned char golden_payload[];
-extern const unsigned int  golden_payload_len;
-
-#define FRAME_W   480
-#define FRAME_H   272
-#define FRAME_QP  26
-
-/* Staging and receive buffers. Aligned to a cache line so the flush and
- * invalidate below act on these buffers and nothing that shares a line with
- * them -- invalidating a partial line discards whatever else lives there. */
-static uint8_t stage[FRAME_W * FRAME_H * 3 / 2]   __attribute__((aligned(64)));
-static uint8_t payload[256 * 1024]                __attribute__((aligned(64)));
-static uint8_t annexb[512 * 1024];
-static uint8_t scratch[256 * 1024 + 64];
 
 static XAxiDma dma;
 
+static uint8_t *const payload = (uint8_t *)DCC_PAYLOAD_ADDR;
+static uint8_t *const scratch = (uint8_t *)DCC_SCRATCH_ADDR;
+static uint8_t *const annexb  = (uint8_t *)DCC_ANNEXB_ADDR;
+
 static int dma_init(void)
 {
-    /* Vitis moved the DMA driver from device-id lookup to base-address
-     * lookup around 2023.2. Both spellings are here because which one
-     * compiles depends on the BSP, and this is the most likely first
-     * build error. */
+    /* Vitis moved this driver from device-id to base-address lookup around
+     * 2023.2. Both spellings are here because which one compiles depends on
+     * the BSP. */
 #ifdef XPAR_XAXIDMA_0_BASEADDR
     XAxiDma_Config *cfg = XAxiDma_LookupConfig(DCC_DMA_BASE);
 #else
@@ -87,8 +64,6 @@ static int dma_init(void)
         printf("FAIL: DMA init\n"); return -1;
     }
     if (XAxiDma_HasSg(&dma)) {
-        /* The bring-up path is simple mode on purpose; an SG-configured DMA
-         * would silently ignore the simple transfers below. */
         printf("FAIL: DMA is built for scatter-gather, expected simple mode\n");
         return -1;
     }
@@ -97,127 +72,195 @@ static int dma_init(void)
     return 0;
 }
 
-/* Encode one frame. Returns the kernel's payload length, or negative. */
-static int encode_one(dcc_kernel_t *k, int width, int height, int qp,
-                      const uint8_t *nv12, uint8_t *out, uint32_t out_cap,
-                      dcc_kernel_perf_t *perf)
+/* Encode one frame already sitting in DDR in stream order. Returns the
+ * kernel's payload length, or negative. */
+static int encode_one(const dcc_kernel_t *k, const dcc_manifest_t *m,
+                      const dcc_frame_rec_t *r, dcc_kernel_perf_t *perf)
 {
-    uint32_t frame_bytes = h264_frame_bytes(width, height);
-
-    h264_nv12_to_stream(stage, nv12, width, height);
-
-    /* Cache maintenance. The HP port is not coherent with the A9 data cache:
-     * without the flush the DMA reads stale DDR and the failure is
-     * intermittent and data-dependent, which reads exactly like an encoder
-     * bug. Without the invalidate the CPU reads a stale payload. Neither is
-     * optional and neither fails loudly. */
-    Xil_DCacheFlushRange((UINTPTR)stage, frame_bytes);
-    Xil_DCacheInvalidateRange((UINTPTR)out, out_cap);
+    /* Cache maintenance. The HP port is not coherent with the A9 data cache.
+     * The frame was written by JTAG straight to DDR and the CPU never touches
+     * it, so it needs nothing. The payload buffer does: the DMA writes it
+     * behind the cache's back, so stale lines must go before we read it. */
+    Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
 
     dcc_kernel_clear_done(k);
-    dcc_kernel_configure(k, h264_config_word(width, height, qp));
+    dcc_kernel_configure(k, h264_config_word((int)m->width, (int)m->height,
+                                             (int)m->qp));
 
-    /* Receive side armed first: the kernel can start emitting as soon as it
-     * has a macroblock, and S2MM must already be listening. */
-    if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)out, out_cap,
+    /* Receive side armed first: the kernel emits as soon as it has a
+     * macroblock, so S2MM must already be listening. */
+    if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)payload, DCC_PAYLOAD_MAX,
                                XAXIDMA_DEVICE_TO_DMA) != XST_SUCCESS) {
         printf("FAIL: S2MM start\n"); return -1;
     }
-
-    /* START before the input DMA. s_axis_tready is held low until START, so
-     * the order is not critical, but this way the kernel is never the thing
-     * that is late. */
-    dcc_kernel_start(k);
-
-    if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)stage, frame_bytes,
+    /* MM2S armed before START, not after. s_axis_tready is held low until
+     * START so an early transfer just stalls harmlessly, and arming first
+     * keeps DMA setup latency out of the CYCLES measurement. */
+    if (XAxiDma_SimpleTransfer(&dma, (UINTPTR)r->frame_addr, r->frame_len,
                                XAXIDMA_DMA_TO_DEVICE) != XST_SUCCESS) {
         printf("FAIL: MM2S start\n"); return -1;
     }
+    dcc_kernel_start(k);
 
-    if (dcc_kernel_wait_done(k, 2000000u) != 0) {
+    if (dcc_kernel_wait_done(k, 5000000u) != 0) {
         printf("FAIL: kernel timeout. STATUS=%08lx, MM2S busy=%lu, S2MM busy=%lu\n",
                (unsigned long)dcc_mmio_read(k->base, DCC_REG_STATUS),
                (unsigned long)XAxiDma_Busy(&dma, XAXIDMA_DMA_TO_DEVICE),
                (unsigned long)XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA));
         return -1;
     }
-    /* Let S2MM retire the last beats after tlast before reading the buffer. */
     while (XAxiDma_Busy(&dma, XAXIDMA_DEVICE_TO_DMA)) { }
 
     dcc_kernel_perf(k, perf);
-    Xil_DCacheInvalidateRange((UINTPTR)out, out_cap);
+    Xil_DCacheInvalidateRange((UINTPTR)payload, DCC_PAYLOAD_MAX);
 
-    /* Simple-mode S2MM cannot report how many bytes it received, but it does
-     * not have to: the kernel counts its own output and reports it in BYTES.
-     * That is why simple mode is usable here at all. */
+    /* Simple-mode S2MM cannot report how many bytes it received. It does not
+     * have to: the kernel counts its own output and reports it in BYTES. */
     return (int)perf->bytes;
+}
+
+static int compare(const uint8_t *got, const uint8_t *want, int n, int frame)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        if (got[i] != want[i]) {
+            printf("FAIL frame %d: first difference at payload byte %d "
+                   "(got %02X, want %02X)\n", frame, i, got[i], want[i]);
+            printf("      that is bit %d of the macroblock layer; re-run the\n"
+                   "      reference with DCC_DUMP_MB to find which macroblock\n"
+                   "      spans it. See docs/m5-hw-validation.md 5.4.\n", i * 8);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int main(void)
 {
+    const dcc_manifest_t *m = (const dcc_manifest_t *)DCC_MANIFEST_ADDR;
+    const dcc_frame_rec_t *recs;
     dcc_kernel_t k;
     dcc_kernel_perf_t perf;
-    int n, i, au_len;
-    double ms, mb_cy;
+    uint32_t rep, i, mbs, encoded = 0, repeats;
+    uint64_t cyc_total = 0;
+    uint32_t cyc_min = 0xFFFFFFFFu, cyc_max = 0;
+    long bytes_total = 0;
 
     Xil_DCacheEnable();
-    printf("\n=== DCC codec kernel bring-up (L4) ===\n");
+    printf("\n=== DCC codec kernel, sequence run (L5) ===\n");
 
-    if (dcc_kernel_probe(&k, DCC_ENC_BASE, DCC_ID_H264, DCC_ACLK_HZ) != 0) {
-        /* Absent, held in reset, and wrong base address all look the same
-         * from here, which is precisely why ID is read before anything else. */
+    /* The manifest arrived by JTAG straight into DDR, so any cache line the
+     * CPU still holds for it is stale from a previous run. */
+    Xil_DCacheInvalidateRange((UINTPTR)DCC_MANIFEST_ADDR, 64u * 1024u);
+
+    if (m->magic != DCC_MANIFEST_MAGIC) {
+        printf("FAIL: no manifest at %08lx (magic reads %08lx, want %08lx).\n"
+               "      Load one with the generated load.tcl before resuming.\n",
+               (unsigned long)DCC_MANIFEST_ADDR, (unsigned long)m->magic,
+               (unsigned long)DCC_MANIFEST_MAGIC);
+        return 1;
+    }
+    if (m->version != DCC_MANIFEST_VER) {
+        printf("FAIL: manifest version %lu, this build expects %lu\n",
+               (unsigned long)m->version, (unsigned long)DCC_MANIFEST_VER);
+        return 1;
+    }
+    recs    = (const dcc_frame_rec_t *)(m + 1);
+    mbs     = (m->width / 16u) * (m->height / 16u);
+    repeats = m->repeats ? m->repeats : 1u;
+
+    if (dcc_kernel_probe(&k, DCC_ENC_BASE, DCC_ID_H264, m->aclk_hz) != 0) {
         printf("FAIL: ID at %08lx reads %08lx, expected %08lx ('H264').\n"
-               "      Check the base address in xparameters.h, that the\n"
-               "      bitstream is loaded, and that PL reset is released.\n",
+               "      Check the bitstream is programmed, PL reset released,\n"
+               "      and the base address matches the BD_ADDR output.\n",
                (unsigned long)DCC_ENC_BASE, (unsigned long)k.id,
                (unsigned long)DCC_ID_H264);
         return 1;
     }
-    printf("kernel: ID 'H264' version %lu.%lu at %08lx\n",
+    printf("kernel:   ID 'H264' version %lu.%lu at %08lx, %lu MHz\n",
            (unsigned long)(k.version >> 16), (unsigned long)(k.version & 0xFFFF),
-           (unsigned long)DCC_ENC_BASE);
+           (unsigned long)DCC_ENC_BASE, (unsigned long)(m->aclk_hz / 1000000u));
+    printf("sequence: %lux%lu QP%lu, %lu frames x %lu repeats, %lu MBs/frame\n",
+           (unsigned long)m->width, (unsigned long)m->height,
+           (unsigned long)m->qp, (unsigned long)m->n_frames,
+           (unsigned long)repeats, (unsigned long)mbs);
 
     if (dma_init() != 0) return 1;
     if (dcc_kernel_reset(&k) != 0) { printf("FAIL: kernel reset timeout\n"); return 1; }
 
-    if (frame_nv12_len != h264_frame_bytes(FRAME_W, FRAME_H)) {
-        printf("FAIL: linked frame is %u bytes, expected %u\n",
-               frame_nv12_len, (unsigned)h264_frame_bytes(FRAME_W, FRAME_H));
-        return 1;
-    }
+    for (rep = 0; rep < repeats; rep++) {
+        for (i = 0; i < m->n_frames; i++) {
+            const dcc_frame_rec_t *r = &recs[i];
+            const uint8_t *golden = (const uint8_t *)r->golden_addr;
+            int n;
 
-    n = encode_one(&k, FRAME_W, FRAME_H, FRAME_QP, frame_nv12,
-                   payload, sizeof payload, &perf);
-    if (n < 0) return 1;
+            if (r->golden_len > DCC_PAYLOAD_MAX) {
+                printf("FAIL frame %lu: golden is %lu bytes, buffer is %lu\n",
+                       (unsigned long)i, (unsigned long)r->golden_len,
+                       (unsigned long)DCC_PAYLOAD_MAX);
+                return 1;
+            }
+            Xil_DCacheInvalidateRange((UINTPTR)golden, r->golden_len);
 
-    ms    = (double)perf.cycles * 1000.0 / (double)DCC_ACLK_HZ;
-    mb_cy = (double)perf.cycles / (double)((FRAME_W / 16) * (FRAME_H / 16));
-    printf("frame: %d payload bytes, %lu cycles (%.2f ms, %.0f cycles/MB)\n",
-           n, (unsigned long)perf.cycles, ms, mb_cy);
+            n = encode_one(&k, m, r, &perf);
+            if (n < 0) {
+                printf("       (frame %lu of repeat %lu)\n",
+                       (unsigned long)i, (unsigned long)rep);
+                return 1;
+            }
+            if (n != (int)r->golden_len) {
+                printf("FAIL frame %lu: payload is %d bytes, golden is %lu\n",
+                       (unsigned long)i, n, (unsigned long)r->golden_len);
+                return 1;
+            }
+            if (compare(payload, golden, n, (int)i) != 0) return 1;
 
-    /* ---- the comparison that the whole exercise exists for ---- */
-    if (n != (int)golden_payload_len) {
-        printf("FAIL: payload is %d bytes, golden is %u\n", n, golden_payload_len);
-        return 1;
-    }
-    for (i = 0; i < n; i++) {
-        if (payload[i] != golden_payload[i]) {
-            int mb_bits_in = i * 8;
-            printf("FAIL: first difference at payload byte %d (got %02X, want %02X)\n",
-                   i, payload[i], golden_payload[i]);
-            printf("      that is bit %d of the macroblock layer; re-run the\n"
-                   "      reference with DCC_DUMP_MB to find which macroblock\n"
-                   "      spans it. See docs/m5-hw-validation.md 5.4.\n", mb_bits_in);
-            return 1;
+            cyc_total += perf.cycles;
+            if (perf.cycles < cyc_min) cyc_min = perf.cycles;
+            if (perf.cycles > cyc_max) cyc_max = perf.cycles;
+            bytes_total += n;
+            encoded++;
+
+            if (rep == 0)
+                printf("  frame %2lu: %6d bytes, %7lu cycles (%.2f ms, %.0f cy/MB) OK\n",
+                       (unsigned long)i, n, (unsigned long)perf.cycles,
+                       perf.cycles * 1000.0 / m->aclk_hz,
+                       (double)perf.cycles / mbs);
         }
+        if (repeats > 1u && ((rep + 1u) % 10u == 0u))
+            printf("  ... %lu of %lu repeats, all matching\n",
+                   (unsigned long)(rep + 1u), (unsigned long)repeats);
     }
-    printf("PASS: payload byte-exact with the C reference (%d bytes)\n", n);
 
-    /* ---- and the stream a decoder would actually see ---- */
-    au_len = h264_assemble_idr(annexb, sizeof annexb, scratch, sizeof scratch,
-                               payload, n, FRAME_W, FRAME_H, FRAME_QP, 0, 1);
-    if (au_len < 0) { printf("FAIL: assemble returned %d\n", au_len); return 1; }
-    printf("access unit: %d bytes of Annex B, ready to pull off and decode\n", au_len);
-    printf("=== L4 PASSED ===\n");
+    /* ---- what the run says about running at rate ---- */
+    {
+        double avg_cy = (double)cyc_total / encoded;
+        double avg_ms = avg_cy * 1000.0 / m->aclk_hz;
+        printf("\nPASS: %lu frames encoded, every payload byte-exact with the "
+               "C reference\n", (unsigned long)encoded);
+        printf("  cycles   avg %.0f  min %lu  max %lu  (%.1f cy/MB)\n",
+               avg_cy, (unsigned long)cyc_min, (unsigned long)cyc_max, avg_cy / mbs);
+        printf("  frame    %.2f ms -> %.1f fps at %lu MHz\n",
+               avg_ms, 1000.0 / avg_ms, (unsigned long)(m->aclk_hz / 1000000u));
+        printf("  bitrate  %ld bytes total, %.2f Mbps at 30 fps\n",
+               bytes_total, (double)bytes_total / encoded * 8.0 * 30.0 / 1e6);
+        printf("  30 fps   %s (needs <= 33.33 ms/frame)\n",
+               avg_ms <= 33.33 ? "MET" : "MISSED");
+    }
+
+    /* ---- and the stream a decoder would see, for the last frame ---- */
+    {
+        const dcc_frame_rec_t *r = &recs[m->n_frames - 1u];
+        int au = h264_assemble_idr(annexb, (int)DCC_ANNEXB_MAX,
+                                   scratch, (int)DCC_SCRATCH_MAX,
+                                   payload, (int)r->golden_len,
+                                   (int)m->width, (int)m->height, (int)m->qp, 0, 1);
+        if (au < 0)
+            printf("  assemble returned %d\n", au);
+        else
+            printf("  last frame assembled into %d bytes of Annex B at %08lx\n",
+                   au, (unsigned long)DCC_ANNEXB_ADDR);
+    }
+    printf("=== SEQUENCE PASSED ===\n");
     return 0;
 }
