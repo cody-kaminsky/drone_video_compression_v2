@@ -495,6 +495,40 @@ in the same cycle.
 
 ---
 
+## 6c. Throughput versus QP, measured on hardware
+
+A ten-point QP sweep on the 480x272 frame, 50 frames, every payload
+byte-exact. Extrapolated to 1080p at 100 MHz:
+
+| QP | payload | cy/MB | 1080p frame | fps | 30 fps margin |
+|---|---|---|---|---|---|
+| 14 | 48,913 | 395.8 | 32.30 ms | 31.0 | **+3.2%** |
+| 18 | 36,527 | 373.6 | 30.48 ms | 32.8 | +9.3% |
+| 22 | 26,980 | 351.2 | 28.66 ms | 34.9 | +16.3% |
+| 23 | 24,451 | 346.0 | 28.23 ms | 35.4 | +18.1% |
+| 26 | 18,717 | 341.6 | 27.87 ms | 35.9 | +19.6% |
+| 30–46 | 12,348–1,277 | 341.3 | 27.85 ms | 35.9 | +19.7% |
+
+**Two things this says.**
+
+Throughput is flat at 341.3 cycles/MB for QP 30 and above. That is the mode
+decision, which does the same work regardless of QP. Below QP 22 the cost
+rises as entropy coding starts to dominate: QP 14 adds 54.5 cycles/MB, 16%
+more than the floor.
+
+So 1080p30 is met across the entire QP range, but **the margin is not the 20%
+that a QP 26 measurement suggests.** At QP 14 it is 3.2%. The practical
+operating range for a 30 Mbps target is QP 30 and above, where the floor
+applies and the margin is real, but anything driving QP below about 18 on hard
+content is close to the edge. Rate control should treat QP 14 as a throughput
+limit as well as a quality one.
+
+QP 23 is in the sweep on purpose: its payload is a whole number of bytes, the
+alignment that used to lose the frame's final byte. Passing it on hardware is
+direct confirmation of the `bit_packer` fix rather than a simulation result.
+
+---
+
 ## 7. What this does not yet cover
 
 Honest list of what is still open, in the order it will probably matter.
