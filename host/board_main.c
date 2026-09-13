@@ -7,21 +7,17 @@
  * never been compiled. Everything it calls into (h264_host.c, codec_kernel.c,
  * src/nal.c, src/bitstream.c) is exercised by `make host_test` on x86.
  *
- * Vitis application setup:
- *   sources: this file, host/codec_kernel.c, host/h264_host.c,
- *            host/platform_standalone.c, src/nal.c, src/bitstream.c
- *   include: host/, src/
+ * Setup is scripted:  make board_vectors  then  scripts/vitis_setup.py.
+ * That creates the platform from the XSA and an application whose sources are
+ * this file, host/codec_kernel.c, host/h264_host.c,
+ * host/platform_standalone.c, and src/nal.c + src/bitstream.c verbatim from
+ * the reference encoder.
  *
- * Getting the input and the golden onto the board. Simplest first: convert
- * both to C arrays and link them in, which for 480x272 is 196 kB of frame and
- * 19 kB of golden -- fits DDR trivially and removes every I/O variable from
- * the first run.
- *
- *   xxd -i build/md_frame.yuv   > frame_data.c    (then fix up the names)
- *   xxd -i build/ht_payload.bin > golden_data.c
- *
- * Move to SD or JTAG-loaded buffers only once this passes, and only because
- * 1080p is too big to link in comfortably.
+ * The input frame and the golden payload are linked in as C arrays, generated
+ * by `make board_vectors`. For 480x272 that is 196 kB of frame and 19 kB of
+ * golden, which fits DDR trivially and removes every file-I/O variable from
+ * the first run. Move to SD or JTAG-loaded buffers only once this passes, and
+ * only because 1080p is too big to link in comfortably.
  */
 
 #include "codec_kernel.h"
@@ -32,14 +28,27 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- what the block design produced. Check these against xparameters.h. --- */
+/* ---- what the block design produced ----------------------------------------
+ * These are the addresses scripts/build_zybo_bd.tcl assigned, printed as
+ * BD_ADDR lines when it ran. They are literals rather than XPAR_* symbols
+ * because the generated symbol name depends on the BD cell name and the
+ * Vitis release, and a wrong guess is a compile error at best and a silent
+ * read of the wrong peripheral at worst. If you rename cells or re-run the
+ * BD script, take the new values from its BD_ADDR output or xparameters.h. */
 #ifndef DCC_ENC_BASE
-#define DCC_ENC_BASE   XPAR_ENC_0_BASEADDR
+#define DCC_ENC_BASE   0x43C00000u      /* SEG_enc_reg0  */
 #endif
-#ifndef DCC_DMA_DEVID
-#define DCC_DMA_DEVID  XPAR_AXIDMA_0_DEVICE_ID
+#ifndef DCC_DMA_BASE
+#define DCC_DMA_BASE   0x40400000u      /* SEG_dma_Reg   */
 #endif
-#define DCC_ACLK_HZ    110000000u
+
+/* Must match the PL clock the BD actually synthesised, not the one you asked
+ * for. FCLK0 is the IO PLL divided by two integers, so from 1000 MHz the only
+ * reachable values near 110 MHz are 1000/9 = 111.111 and 1000/10 = 100: ask
+ * for 110 and you silently get 111.111. build_zybo_bd prints the achieved
+ * value as BD_FCLK and warns when it differs from the request. Every
+ * cycles-to-milliseconds number below is wrong if this is wrong. */
+#define DCC_ACLK_HZ    100000000u
 
 /* ---- the test frame, linked in. See the header comment. ---- */
 extern const unsigned char frame_nv12[];
@@ -63,8 +72,17 @@ static XAxiDma dma;
 
 static int dma_init(void)
 {
-    XAxiDma_Config *cfg = XAxiDma_LookupConfig(DCC_DMA_DEVID);
-    if (!cfg) { printf("FAIL: no DMA config for device %d\n", DCC_DMA_DEVID); return -1; }
+    /* Vitis moved the DMA driver from device-id lookup to base-address
+     * lookup around 2023.2. Both spellings are here because which one
+     * compiles depends on the BSP, and this is the most likely first
+     * build error. */
+#ifdef XPAR_XAXIDMA_0_BASEADDR
+    XAxiDma_Config *cfg = XAxiDma_LookupConfig(DCC_DMA_BASE);
+#else
+    XAxiDma_Config *cfg = XAxiDma_LookupConfig(XPAR_AXIDMA_0_DEVICE_ID);
+#endif
+    if (!cfg) { printf("FAIL: no DMA config at %08lx\n",
+                       (unsigned long)DCC_DMA_BASE); return -1; }
     if (XAxiDma_CfgInitialize(&dma, cfg) != XST_SUCCESS) {
         printf("FAIL: DMA init\n"); return -1;
     }
