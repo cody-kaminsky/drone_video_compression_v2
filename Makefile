@@ -44,7 +44,7 @@ BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 BIN_DEC := $(BUILD)/dcc_decoder
 
-.PHONY: dec dec_test bit_reader_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: dec dec_test bit_reader_vectors cavlc_dec_tables impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS) $(BIN_DEC)
 ref: $(BIN_REF)
@@ -295,3 +295,9 @@ $(BUILD)/bit_reader_vectors.txt: $(BUILD)/gen_bit_reader_vectors $(BIN_REF)
 	@DCC_DUMP_SLICE=$(BUILD)/brv_payload.txt $(BIN_REF) $(BUILD)/dt.yuv 480 272 26 > /dev/null
 	@python -c "import sys; d=bytes(int(x) for x in open('$(BUILD)/brv_payload.txt').read().split()); open('$(BUILD)/brv_payload.bin','wb').write(d)"
 	./$< $(BUILD)/brv_payload.bin
+
+# Decode-direction CAVLC tables, inverted from the same C header the encoder's
+# VHDL tables come from. Regenerate whenever src/cavlc_tables.h changes.
+cavlc_dec_tables: src/vhdl/cavlc_dec_tables.vhd
+src/vhdl/cavlc_dec_tables.vhd: src/cavlc_tables.h tools/gen_cavlc_dec_tables_vhd.py
+	python tools/gen_cavlc_dec_tables_vhd.py
