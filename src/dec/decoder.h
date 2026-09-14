@@ -22,6 +22,31 @@
 #define DCC_DECODER_H
 
 #include "types.h"
+#include "bitstream.h"
+
+/* One macroblock header, and everything the parse needs to know about its
+ * neighbours. Exposed so hardware vector generators can be held to the same
+ * routine the golden decoder uses; see dec_mb_header below. */
+typedef struct {
+    /* in */
+    int qp_in;
+    int mode4_top[4];     /* 4x4 modes of the row above, by column; DC(2) if absent */
+    int mode4_left[4];    /* 4x4 modes of the column to the left, by row */
+    int avail_top, avail_left;
+    /* out */
+    int is_i4x4;
+    int mode16;           /* I_16x16 luma mode; 0 for I_4x4 */
+    int modes4[16];       /* 4x4 modes, raster inside the macroblock */
+    int mode_chroma;
+    int cbp_luma;         /* 4 bits, one per 8x8 quadrant */
+    int cbp_chroma;       /* 0 none, 1 DC only, 2 DC and AC */
+    int has_residual;     /* whether mb_qp_delta was present */
+    int qp_out;
+} mb_header_t;
+
+/* Parse the macroblock header of spec 7.3.5. Returns 0, or -1 with the reason
+ * on stderr for syntax this decoder does not handle. */
+int dec_mb_header(bitreader_t *br, mb_header_t *h);
 
 typedef struct {
     int width, height;

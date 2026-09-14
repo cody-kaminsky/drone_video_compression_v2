@@ -150,6 +150,94 @@ static void add_residual_4x4(const i16 zz[16], int qp, int skip_dc, i32 dc,
 
 /* ------------------------------------------------------- macroblock ------ */
 
+/* The macroblock header of spec 7.3.5, for the I macroblocks this decoder
+ * handles. Split out of decode_mb so the VHDL mb_header_dec_engine can be
+ * held to the routine that reconstructs real streams byte-exactly, rather
+ * than to a second implementation written from the same spec paragraph and
+ * free to misread it the same way.
+ *
+ * Neighbour modes come in rather than being looked up, because that is the
+ * shape the hardware has: a line buffer hands over the row above and the
+ * column to the left, and everything inside the macroblock comes from blocks
+ * this routine has already decoded. Unavailable neighbours should be passed
+ * as DC (2), though avail_top / avail_left decide the outcome anyway. */
+int dec_mb_header(bitreader_t *br, mb_header_t *h)
+{
+    int mb_type, s, i;
+
+    h->mode16 = 0;
+    h->cbp_luma = 0;
+    h->cbp_chroma = 0;
+    for (i = 0; i < 16; i++) h->modes4[i] = 2;
+
+    mb_type = (int)br_get_ue(br);
+    if (mb_type == 0) {
+        h->is_i4x4 = 1;
+    } else if (mb_type >= 1 && mb_type <= 24) {
+        h->is_i4x4 = 0;
+        /* I_16x16: mb_type - 1 packs mode, cbp_chroma and cbp_luma. */
+        h->mode16     = (mb_type - 1) % 4;
+        h->cbp_chroma = ((mb_type - 1) / 4) % 3;
+        h->cbp_luma   = ((mb_type - 1) / 12) ? 15 : 0;
+    } else {
+        FAIL("mb_type %d; this decoder handles I macroblocks only", mb_type);
+    }
+
+    if (h->is_i4x4) {
+        for (s = 0; s < 16; s++) {
+            int bcr = scan_br[s], bcc = scan_bc[s];
+            int a_up   = (bcr > 0) || h->avail_top;
+            int a_left = (bcc > 0) || h->avail_left;
+            int up_mode, left_mode, pred_mode, flag;
+
+            /* predIntra4x4PredMode, spec 8.3.1.1: an unavailable or
+             * non-I_4x4 neighbour contributes DC (2). */
+            up_mode   = (bcr > 0) ? h->modes4[(bcr - 1) * 4 + bcc]
+                                  : h->mode4_top[bcc];
+            left_mode = (bcc > 0) ? h->modes4[bcr * 4 + bcc - 1]
+                                  : h->mode4_left[bcr];
+            pred_mode = up_mode < left_mode ? up_mode : left_mode;
+            if (!a_up || !a_left) pred_mode = 2;
+
+            flag = (int)br_get_bits(br, 1);
+            if (flag) {
+                h->modes4[bcr * 4 + bcc] = pred_mode;
+            } else {
+                int rem = (int)br_get_bits(br, 3);
+                h->modes4[bcr * 4 + bcc] = rem < pred_mode ? rem : rem + 1;
+            }
+        }
+    }
+
+    h->mode_chroma = (int)br_get_ue(br);
+    if (h->mode_chroma > 3)
+        FAIL("intra_chroma_pred_mode %d", h->mode_chroma);
+
+    if (h->is_i4x4) {
+        int codenum = (int)br_get_ue(br);
+        int cbp = -1;
+        if (codenum < 0 || codenum >= 48)
+            FAIL("coded_block_pattern codeNum %d", codenum);
+        /* Invert the encoder's table rather than carry a second one. */
+        for (i = 0; i < 48; i++)
+            if (cbp_intra_to_codenum[i] == codenum) { cbp = i; break; }
+        if (cbp < 0) FAIL("no CBP for codeNum %d", codenum);
+        h->cbp_luma   = cbp & 0xF;
+        h->cbp_chroma = (cbp >> 4) & 3;
+    }
+
+    h->has_residual = h->is_i4x4 ? (h->cbp_luma || h->cbp_chroma) : 1;
+    h->qp_out = h->qp_in;
+    if (h->has_residual) {
+        int delta = (int)br_get_se(br);
+        h->qp_out = ((h->qp_in + delta + 52 + 2 * 26) % 52);
+        if (h->qp_out < 0 || h->qp_out > 51)
+            FAIL("QP %d out of range", h->qp_out);
+    }
+    if (br->overflow) FAIL("header ran past the end of the slice");
+    return 0;
+}
+
 static int decode_mb(dec_ctx_t *c, bitreader_t *br, int mb_r, int mb_c)
 {
     int mb_type, s, i, k;
@@ -159,82 +247,38 @@ static int decode_mb(dec_ctx_t *c, bitreader_t *br, int mb_r, int mb_c)
     i16 zz[16];
     int qp_c;
 
-    mb_type = (int)br_get_ue(br);
-    if (mb_type == 0) {
-        is_i4x4 = 1;
-    } else if (mb_type >= 1 && mb_type <= 24) {
-        is_i4x4 = 0;
-        /* I_16x16: mb_type - 1 packs mode, cbp_chroma and cbp_luma. */
-        mode16     = (mb_type - 1) % 4;
-        cbp_chroma = ((mb_type - 1) / 4) % 3;
-        cbp_luma   = ((mb_type - 1) / 12) ? 15 : 0;
-    } else {
-        FAIL("MB(%d,%d): mb_type %d; this decoder handles I macroblocks only",
-             mb_r, mb_c, mb_type);
-    }
-
-    /* ---- intra modes ---- */
-    if (is_i4x4) {
-        for (s = 0; s < 16; s++) {
-            int bcr = scan_br[s], bcc = scan_bc[s];
-            int x4 = mb_c * 4 + bcc, y4 = mb_r * 4 + bcr;
-            int a_up   = (y4 > 0);
-            int a_left = (x4 > 0);
-            int up_mode, left_mode, pred_mode, flag;
-
-            /* predIntra4x4PredMode, spec 8.3.1.1: an unavailable or
-             * non-I_4x4 neighbour contributes DC (2). */
-            up_mode   = a_up   ? c->luma_mode4[(y4 - 1) * c->luma_w4 + x4] : 2;
-            left_mode = a_left ? c->luma_mode4[y4 * c->luma_w4 + x4 - 1] : 2;
-            pred_mode = up_mode < left_mode ? up_mode : left_mode;
-            if (!a_up || !a_left) pred_mode = 2;
-
-            flag = (int)br_get_bits(br, 1);
-            if (flag) {
-                modes4[bcr * 4 + bcc] = pred_mode;
-            } else {
-                int rem = (int)br_get_bits(br, 3);
-                modes4[bcr * 4 + bcc] = rem < pred_mode ? rem : rem + 1;
-            }
-            c->luma_mode4[y4 * c->luma_w4 + x4] = (u8)modes4[bcr * 4 + bcc];
-        }
-    } else {
-        /* An I_16x16 macroblock predicts as DC for its neighbours' purposes. */
-        for (i = 0; i < 16; i++) {
-            int x4 = mb_c * 4 + (i & 3), y4 = mb_r * 4 + (i >> 2);
-            c->luma_mode4[y4 * c->luma_w4 + x4] = 2;
-        }
-    }
-    c->mb_is_i4x4[mb_r * c->mbs_w + mb_c] = (u8)is_i4x4;
-
-    mode_chroma = (int)br_get_ue(br);
-    if (mode_chroma > 3)
-        FAIL("MB(%d,%d): intra_chroma_pred_mode %d", mb_r, mb_c, mode_chroma);
-
-    if (is_i4x4) {
-        int codenum = (int)br_get_ue(br);
-        int cbp;
-        if (codenum < 0 || codenum >= 48)
-            FAIL("MB(%d,%d): coded_block_pattern codeNum %d", mb_r, mb_c, codenum);
-        /* Invert the encoder's table rather than carry a second one. */
-        cbp = -1;
-        for (i = 0; i < 48; i++)
-            if (cbp_intra_to_codenum[i] == codenum) { cbp = i; break; }
-        if (cbp < 0) FAIL("MB(%d,%d): no CBP for codeNum %d", mb_r, mb_c, codenum);
-        cbp_luma   = cbp & 0xF;
-        cbp_chroma = (cbp >> 4) & 3;
-    }
-
-    /* ---- QP ---- */
     {
-        int has_residual = is_i4x4 ? (cbp_luma || cbp_chroma) : 1;
-        if (has_residual) {
-            int delta = (int)br_get_se(br);
-            c->qp = ((c->qp + delta + 52 + 2 * 26) % 52);
-            if (c->qp < 0 || c->qp > 51)
-                FAIL("MB(%d,%d): QP %d out of range", mb_r, mb_c, c->qp);
+        mb_header_t h;
+        int x4b = mb_c * 4, y4b = mb_r * 4;
+        h.qp_in      = c->qp;
+        h.avail_top  = (mb_r > 0);
+        h.avail_left = (mb_c > 0);
+        for (i = 0; i < 4; i++) {
+            h.mode4_top[i]  = h.avail_top
+                            ? c->luma_mode4[(y4b - 1) * c->luma_w4 + x4b + i] : 2;
+            h.mode4_left[i] = h.avail_left
+                            ? c->luma_mode4[(y4b + i) * c->luma_w4 + x4b - 1] : 2;
         }
+        if (dec_mb_header(br, &h) != 0)
+            FAIL("MB(%d,%d): malformed macroblock header", mb_r, mb_c);
+
+        is_i4x4     = h.is_i4x4;
+        mode16      = h.mode16;
+        mode_chroma = h.mode_chroma;
+        cbp_luma    = h.cbp_luma;
+        cbp_chroma  = h.cbp_chroma;
+        c->qp       = h.qp_out;
+        for (i = 0; i < 16; i++) modes4[i] = h.modes4[i];
+
+        /* An I_16x16 macroblock predicts as DC for its neighbours' purposes. */
+        for (s = 0; s < 16; s++) {
+            int x4 = x4b + (s & 3), y4 = y4b + (s >> 2);
+            c->luma_mode4[y4 * c->luma_w4 + x4] =
+                (u8)(is_i4x4 ? modes4[s] : 2);
+        }
+        c->mb_is_i4x4[mb_r * c->mbs_w + mb_c] = (u8)is_i4x4;
     }
+
     qp_c = chroma_qp(c->qp, c->chroma_qp_offset);
 
     /* ---- luma ---- */
