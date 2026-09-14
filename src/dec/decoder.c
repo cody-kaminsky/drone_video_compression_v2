@@ -238,18 +238,131 @@ int dec_mb_header(bitreader_t *br, mb_header_t *h)
     return 0;
 }
 
+/* Every residual block of one macroblock, in bitstream order, and the
+ * neighbour total_coeff context the nC derivation needs. Split out of
+ * decode_mb for the same reason as dec_mb_header: so the VHDL block
+ * sequencer can be held to the routine the golden decoder itself uses.
+ *
+ * The split also matches the shape of the hardware. Parsing reads bits and
+ * nothing else; reconstruction reads neighbouring samples and writes the
+ * frame. Interleaving them, as this function's caller used to, hid the fact
+ * that the entropy layer never depends on a reconstructed sample.
+ *
+ * Neighbour counts come in and go out rather than being looked up, because a
+ * line buffer is what the hardware has: the row above and the column to the
+ * left, with everything inside the macroblock coming from blocks this
+ * routine has already decoded.
+ *
+ * Coefficients come out in zigzag order with the I_16x16 and chroma AC shift
+ * already applied, so every block is a full 16-coefficient vector whatever
+ * its type. */
+int dec_mb_residual(bitreader_t *br, mb_residual_t *r)
+{
+    int s, i, k, comp;
+    i16 zz[16];
+
+    memset(r->luma_dc, 0, sizeof r->luma_dc);
+    memset(r->luma, 0, sizeof r->luma);
+    memset(r->chroma_dc, 0, sizeof r->chroma_dc);
+    memset(r->chroma_ac, 0, sizeof r->chroma_ac);
+    memset(r->nc_out, 0, sizeof r->nc_out);
+    memset(r->ncu_out, 0, sizeof r->ncu_out);
+    memset(r->ncv_out, 0, sizeof r->ncv_out);
+
+    /* Luma DC: 16 Hadamard coefficients, present for every I_16x16
+     * macroblock whatever the coded_block_pattern says. nC comes from the
+     * neighbours of block 0. */
+    if (!r->is_i4x4) {
+        int nA = r->avail_left ? r->nc_left[0] : 0;
+        int nB = r->avail_top  ? r->nc_top[0]  : 0;
+        int nC = cavlc_compute_nC(nB, nA, r->avail_top, r->avail_left);
+        if (cavlc_decode_block(br, r->luma_dc, 16, BLK_LUMA_DC_16x16, nC) != 0)
+            FAIL("luma DC block malformed");
+    }
+
+    for (s = 0; s < 16; s++) {
+        int bcr = scan_br[s], bcc = scan_bc[s];
+        int pos = bcr * 4 + bcc;
+        int coded = (r->cbp_luma >> (s / 4)) & 1;
+        int n_coefs = r->is_i4x4 ? 16 : 15;
+        int total = 0;
+
+        memset(zz, 0, sizeof zz);
+        if (coded) {
+            int a_left = (bcc > 0) || r->avail_left;
+            int a_top  = (bcr > 0) || r->avail_top;
+            int nA = a_left ? ((bcc > 0) ? r->nc_out[pos - 1] : r->nc_left[bcr]) : 0;
+            int nB = a_top  ? ((bcr > 0) ? r->nc_out[pos - 4] : r->nc_top[bcc])  : 0;
+            int nC = cavlc_compute_nC(nB, nA, a_top, a_left);
+            if (cavlc_decode_block(br, zz, n_coefs,
+                                   r->is_i4x4 ? BLK_LUMA_FULL : BLK_LUMA_AC, nC) != 0)
+                FAIL("luma block %d malformed", s);
+            for (i = 0; i < n_coefs; i++) if (zz[i]) total++;
+        }
+        /* An uncoded block still contributes 0 to its neighbours' nC. */
+        r->nc_out[pos] = total;
+
+        /* I_16x16 AC blocks carry 15 coefficients starting at index 1. */
+        if (!r->is_i4x4) {
+            for (i = 15; i >= 1; i--) zz[i] = zz[i - 1];
+            zz[0] = 0;
+        }
+        memcpy(r->luma[pos], zz, sizeof zz);
+    }
+
+    /* Chroma DC: two 2x2 Hadamard blocks, present when cbp_chroma != 0.
+     * Their total_coeff feeds no neighbour: chroma DC has no nC. */
+    if (r->cbp_chroma) {
+        for (comp = 0; comp < 2; comp++)
+            if (cavlc_decode_block(br, r->chroma_dc[comp], 4, BLK_CHROMA_DC, -1) != 0)
+                FAIL("chroma DC block malformed");
+    }
+
+    for (comp = 0; comp < 2; comp++) {
+        const int *ntop  = comp ? r->ncv_top  : r->ncu_top;
+        const int *nleft = comp ? r->ncv_left : r->ncu_left;
+        int *nout = comp ? r->ncv_out : r->ncu_out;
+        for (i = 0; i < 4; i++) {
+            int bcr = i >> 1, bcc = i & 1;
+            int total = 0;
+
+            memset(zz, 0, sizeof zz);
+            if (r->cbp_chroma == 2) {
+                int a_left = (bcc > 0) || r->avail_left;
+                int a_top  = (bcr > 0) || r->avail_top;
+                int nA = a_left ? ((bcc > 0) ? nout[i - 1] : nleft[bcr]) : 0;
+                int nB = a_top  ? ((bcr > 0) ? nout[i - 2] : ntop[bcc])  : 0;
+                int nC = cavlc_compute_nC(nB, nA, a_top, a_left);
+                if (cavlc_decode_block(br, zz, 15, BLK_CHROMA_AC, nC) != 0)
+                    FAIL("chroma AC block %d malformed", comp * 4 + i);
+                for (k = 0; k < 15; k++) if (zz[k]) total++;
+            }
+            nout[i] = total;
+
+            for (k = 15; k >= 1; k--) zz[k] = zz[k - 1];
+            zz[0] = 0;
+            memcpy(r->chroma_ac[comp][i], zz, sizeof zz);
+        }
+    }
+
+    if (br->overflow) FAIL("residual ran past the end of the slice");
+    return 0;
+}
+
 static int decode_mb(dec_ctx_t *c, bitreader_t *br, int mb_r, int mb_c)
 {
-    int mb_type, s, i, k;
-    int is_i4x4, mode16 = 0, mode_chroma, cbp_luma, cbp_chroma;
+    int s, i, k;
+    int is_i4x4, mode16, mode_chroma, cbp_luma, cbp_chroma;
     int modes4[16];                      /* raster inside the macroblock */
     int x_mb = mb_c * 16, y_mb = mb_r * 16;
-    i16 zz[16];
+    int x4b = mb_c * 4, y4b = mb_r * 4;
+    int x2b = mb_c * 2, y2b = mb_r * 2;
     int qp_c;
+    mb_residual_t r;
 
+    /* ---- header ---- */
     {
         mb_header_t h;
-        int x4b = mb_c * 4, y4b = mb_r * 4;
         h.qp_in      = c->qp;
         h.avail_top  = (mb_r > 0);
         h.avail_left = (mb_c > 0);
@@ -271,113 +384,97 @@ static int decode_mb(dec_ctx_t *c, bitreader_t *br, int mb_r, int mb_c)
         for (i = 0; i < 16; i++) modes4[i] = h.modes4[i];
 
         /* An I_16x16 macroblock predicts as DC for its neighbours' purposes. */
-        for (s = 0; s < 16; s++) {
-            int x4 = x4b + (s & 3), y4 = y4b + (s >> 2);
-            c->luma_mode4[y4 * c->luma_w4 + x4] =
-                (u8)(is_i4x4 ? modes4[s] : 2);
-        }
+        for (i = 0; i < 16; i++)
+            c->luma_mode4[(y4b + i / 4) * c->luma_w4 + x4b + (i % 4)] =
+                (u8)(is_i4x4 ? modes4[i] : 2);
         c->mb_is_i4x4[mb_r * c->mbs_w + mb_c] = (u8)is_i4x4;
     }
-
     qp_c = chroma_qp(c->qp, c->chroma_qp_offset);
 
-    /* ---- luma ---- */
+    /* ---- residual ---- */
+    r.is_i4x4    = is_i4x4;
+    r.cbp_luma   = cbp_luma;
+    r.cbp_chroma = cbp_chroma;
+    r.avail_top  = (mb_r > 0);
+    r.avail_left = (mb_c > 0);
+    for (i = 0; i < 4; i++) {
+        r.nc_top[i]  = r.avail_top
+                     ? c->luma_nc[(y4b - 1) * c->luma_w4 + x4b + i] : 0;
+        r.nc_left[i] = r.avail_left
+                     ? c->luma_nc[(y4b + i) * c->luma_w4 + x4b - 1] : 0;
+    }
+    for (i = 0; i < 2; i++) {
+        r.ncu_top[i]  = r.avail_top
+                      ? c->chroma_u_nc[(y2b - 1) * c->chroma_w4 + x2b + i] : 0;
+        r.ncu_left[i] = r.avail_left
+                      ? c->chroma_u_nc[(y2b + i) * c->chroma_w4 + x2b - 1] : 0;
+        r.ncv_top[i]  = r.avail_top
+                      ? c->chroma_v_nc[(y2b - 1) * c->chroma_w4 + x2b + i] : 0;
+        r.ncv_left[i] = r.avail_left
+                      ? c->chroma_v_nc[(y2b + i) * c->chroma_w4 + x2b - 1] : 0;
+    }
+    if (dec_mb_residual(br, &r) != 0)
+        FAIL("MB(%d,%d): malformed residual", mb_r, mb_c);
+
+    for (i = 0; i < 16; i++)
+        c->luma_nc[(y4b + i / 4) * c->luma_w4 + x4b + (i % 4)] = (u8)r.nc_out[i];
+    for (i = 0; i < 4; i++) {
+        c->chroma_u_nc[(y2b + i / 2) * c->chroma_w4 + x2b + (i % 2)] = (u8)r.ncu_out[i];
+        c->chroma_v_nc[(y2b + i / 2) * c->chroma_w4 + x2b + (i % 2)] = (u8)r.ncv_out[i];
+    }
+
+    /* ---- luma reconstruction ---- */
     {
         i32 dc_coef[16];
-        i16 dc_lev[16];
-        int have_dc = 0;
 
         memset(dc_coef, 0, sizeof dc_coef);
-
         if (!is_i4x4) {
-            /* Luma DC: 16 Hadamard coefficients, always present. nC uses the
-             * block-0 neighbours. */
-            int x4 = mb_c * 4, y4 = mb_r * 4;
-            int nA = (x4 > 0) ? c->luma_nc[y4 * c->luma_w4 + x4 - 1] : 0;
-            int nB = (y4 > 0) ? c->luma_nc[(y4 - 1) * c->luma_w4 + x4] : 0;
-            int nC = cavlc_compute_nC(nB, nA, y4 > 0, x4 > 0);
+            i16 dc_lev[16];
             i32 tmp[16];
-            if (cavlc_decode_block(br, zz, 16, BLK_LUMA_DC_16x16, nC) != 0)
-                FAIL("MB(%d,%d): luma DC block malformed", mb_r, mb_c);
             memset(dc_lev, 0, sizeof dc_lev);
-            for (i = 0; i < 16; i++) dc_lev[zigzag4[i]] = zz[i];
+            for (i = 0; i < 16; i++) dc_lev[zigzag4[i]] = r.luma_dc[i];
             iquant_dc_4x4(dc_lev, tmp, c->qp);
             ihadamard4x4(tmp, dc_coef);
-            have_dc = 1;
         }
 
-        for (s = 0; s < 16; s++) {
-            int bcr = scan_br[s], bcc = scan_bc[s];
-            int x4 = mb_c * 4 + bcc, y4 = mb_r * 4 + bcr;
-            int x0 = x_mb + bcc * 4, y0 = y_mb + bcr * 4;
-            int quad = s / 4;
-            int coded = (cbp_luma >> quad) & 1;
-            int n_coefs = is_i4x4 ? 16 : 15;
-            int total = 0;
-            u8 pred[16];
-
-            memset(zz, 0, sizeof zz);
-            if (coded) {
-                int nA = (x4 > 0) ? c->luma_nc[y4 * c->luma_w4 + x4 - 1] : 0;
-                int nB = (y4 > 0) ? c->luma_nc[(y4 - 1) * c->luma_w4 + x4] : 0;
-                int nC = cavlc_compute_nC(nB, nA, y4 > 0, x4 > 0);
-                if (cavlc_decode_block(br, zz, n_coefs,
-                                       is_i4x4 ? BLK_LUMA_FULL : BLK_LUMA_AC, nC) != 0)
-                    FAIL("MB(%d,%d) blk %d: luma block malformed", mb_r, mb_c, s);
-                for (i = 0; i < n_coefs; i++) if (zz[i]) total++;
-            }
-            c->luma_nc[y4 * c->luma_w4 + x4] = (u8)total;
-
-            /* I_16x16 AC blocks carry 15 coefficients starting at index 1. */
-            if (!is_i4x4) {
-                for (i = 15; i >= 1; i--) zz[i] = zz[i - 1];
-                zz[0] = 0;
-            }
-
-            /* Prediction, then residual. For I_4x4 this must happen block by
-             * block: block s+1 predicts from block s's reconstruction. */
-            if (is_i4x4) {
-                u8 top[8], left[4], tl;
+        if (is_i4x4) {
+            /* Block by block, in scan order: block s+1 predicts from block
+             * s's reconstruction. */
+            for (s = 0; s < 16; s++) {
+                int bcr = scan_br[s], bcc = scan_bc[s];
+                int x0 = x_mb + bcc * 4, y0 = y_mb + bcr * 4;
+                u8 top[8], left[4], tl, pred[16];
                 int at, al, atl;
                 int atr = tr_avail_4x4(s, mb_r, mb_c, c->mbs_w);
                 gather_4x4(c, x0, y0, top, left, &tl, &at, &al, &atl, &atr);
                 predict_4x4(modes4[bcr * 4 + bcc], top, left, tl, at, al, atl, pred);
-                add_residual_4x4(zz, c->qp, 0, 0, pred, 4,
+                add_residual_4x4(r.luma[bcr * 4 + bcc], c->qp, 0, 0, pred, 4,
                                  &c->recon_y[y0 * c->width + x0], c->width);
-            } else {
-                /* I_16x16: predict the whole macroblock once, below. Stash
-                 * the residual by decoding it into the frame after the
-                 * prediction pass, so keep the levels for now. */
-                static i16 keep[16][16];
-                memcpy(keep[s], zz, sizeof zz);
-                if (s == 15) {
-                    u8 top16[16], left16[16], tl16, pred16[256];
-                    int at = (y_mb > 0), al = (x_mb > 0), atl = (x_mb > 0 && y_mb > 0);
-                    for (i = 0; i < 16; i++)
-                        top16[i] = at ? c->recon_y[(y_mb - 1) * c->width + x_mb + i] : 0;
-                    for (i = 0; i < 16; i++)
-                        left16[i] = al ? c->recon_y[(y_mb + i) * c->width + x_mb - 1] : 0;
-                    tl16 = atl ? c->recon_y[(y_mb - 1) * c->width + x_mb - 1] : 0;
-                    predict_16x16(mode16, top16, left16, tl16, at, al, atl, pred16);
+            }
+        } else {
+            u8 top16[16], left16[16], tl16, pred16[256];
+            int at = (y_mb > 0), al = (x_mb > 0), atl = (x_mb > 0 && y_mb > 0);
+            for (i = 0; i < 16; i++)
+                top16[i] = at ? c->recon_y[(y_mb - 1) * c->width + x_mb + i] : 0;
+            for (i = 0; i < 16; i++)
+                left16[i] = al ? c->recon_y[(y_mb + i) * c->width + x_mb - 1] : 0;
+            tl16 = atl ? c->recon_y[(y_mb - 1) * c->width + x_mb - 1] : 0;
+            predict_16x16(mode16, top16, left16, tl16, at, al, atl, pred16);
 
-                    for (k = 0; k < 16; k++) {
-                        int kbr = scan_br[k], kbc = scan_bc[k];
-                        int kx = x_mb + kbc * 4, ky = y_mb + kbr * 4;
-                        add_residual_4x4(keep[k], c->qp, 1,
-                                         have_dc ? dc_coef[kbr * 4 + kbc] : 0,
-                                         &pred16[(kbr * 4) * 16 + kbc * 4], 16,
-                                         &c->recon_y[ky * c->width + kx], c->width);
-                    }
-                }
+            for (k = 0; k < 16; k++) {
+                int kbr = k / 4, kbc = k % 4;
+                int kx = x_mb + kbc * 4, ky = y_mb + kbr * 4;
+                add_residual_4x4(r.luma[k], c->qp, 1, dc_coef[k],
+                                 &pred16[(kbr * 4) * 16 + kbc * 4], 16,
+                                 &c->recon_y[ky * c->width + kx], c->width);
             }
         }
     }
 
-    /* ---- chroma ---- */
+    /* ---- chroma reconstruction ---- */
     {
         u8 pred_u[64], pred_v[64];
         i32 dcu[4], dcv[4];
-        i16 dl[4];
         int comp;
         u8 top[8], left[8], tl;
         int at = (y_mb > 0), al = (x_mb > 0), atl = (x_mb > 0 && y_mb > 0);
@@ -397,14 +494,11 @@ static int decode_mb(dec_ctx_t *c, bitreader_t *br, int mb_r, int mb_c)
             predict_chroma_8x8(mode_chroma, top, left, tl, at, al, atl, pred);
         }
 
-        /* Chroma DC: two 2x2 Hadamard blocks, present when cbp_chroma != 0. */
         if (cbp_chroma) {
             for (comp = 0; comp < 2; comp++) {
-                i16 z4[4];
+                i16 dl[4];
                 i32 out[4];
-                if (cavlc_decode_block(br, z4, 4, BLK_CHROMA_DC, -1) != 0)
-                    FAIL("MB(%d,%d): chroma DC malformed", mb_r, mb_c);
-                for (i = 0; i < 4; i++) dl[i] = z4[i];
+                for (i = 0; i < 4; i++) dl[i] = r.chroma_dc[comp][i];
                 iquant_dc_2x2(dl, out, qp_c);
                 ihadamard2x2(out, comp ? dcv : dcu);
             }
@@ -412,32 +506,13 @@ static int decode_mb(dec_ctx_t *c, bitreader_t *br, int mb_r, int mb_c)
 
         for (comp = 0; comp < 2; comp++) {
             u8 *pred = comp ? pred_v : pred_u;
-            u8 *ncbuf = comp ? c->chroma_v_nc : c->chroma_u_nc;
             i32 *dc = comp ? dcv : dcu;
             for (i = 0; i < 4; i++) {
                 int bcr = i >> 1, bcc = i & 1;
-                int x4 = mb_c * 2 + bcc, y4 = mb_r * 2 + bcr;
-                int total = 0;
                 u8 tmp[16];
                 int r2, c2;
-
-                memset(zz, 0, sizeof zz);
-                if (cbp_chroma == 2) {
-                    int nA = (x4 > 0) ? ncbuf[y4 * c->chroma_w4 + x4 - 1] : 0;
-                    int nB = (y4 > 0) ? ncbuf[(y4 - 1) * c->chroma_w4 + x4] : 0;
-                    int nC = cavlc_compute_nC(nB, nA, y4 > 0, x4 > 0);
-                    if (cavlc_decode_block(br, zz, 15, BLK_CHROMA_AC, nC) != 0)
-                        FAIL("MB(%d,%d): chroma AC malformed", mb_r, mb_c);
-                    for (k = 0; k < 15; k++) if (zz[k]) total++;
-                }
-                ncbuf[y4 * c->chroma_w4 + x4] = (u8)total;
-
-                for (k = 15; k >= 1; k--) zz[k] = zz[k - 1];
-                zz[0] = 0;
-
-                add_residual_4x4(zz, qp_c, 1, dc[i],
+                add_residual_4x4(r.chroma_ac[comp][i], qp_c, 1, dc[i],
                                  &pred[(bcr * 4) * 8 + bcc * 4], 8, tmp, 4);
-
                 for (r2 = 0; r2 < 4; r2++)
                     for (c2 = 0; c2 < 4; c2++)
                         c->recon_uv[(yc + bcr * 4 + r2) * cw

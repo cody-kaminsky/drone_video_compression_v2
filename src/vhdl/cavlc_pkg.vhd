@@ -12,19 +12,27 @@ use ieee.numeric_std.all;
 package cavlc_pkg is
 
     --------------------------------------------------------------------
-    -- Block-type encoding (must match BLK_* enum in src/cavlc.h).
+    -- Block-type encoding. These numbers ARE the BLK_* enum in src/cavlc.h,
+    -- and the order below is that enum's order, not a tidier one.
     --
-    -- LUMA_DC_16x16  : 16-coef block, I_16x16 luma DC.
+    -- They used to disagree, harmlessly: the encode path carries block_type
+    -- through cavlc_dispatch and never indexes on it, discriminating on nC
+    -- and n_coefs instead, so nothing read the number. The decode path has no
+    -- such luck -- a sequencer picking a table by block type would have been
+    -- the first thing in the project to notice, and it would have noticed as
+    -- wrong coefficients rather than as an error.
+    --
     -- LUMA_AC        : 15-coef block, I_16x16 luma AC.
     -- LUMA_FULL      : 16-coef block, I_4x4 luma (DC and AC together).
-    -- CHROMA_DC      : 4-coef block, chroma DC. Uses chroma_dc table.
+    -- LUMA_DC_16x16  : 16-coef block, I_16x16 luma DC.
     -- CHROMA_AC      : 15-coef block, chroma AC.
+    -- CHROMA_DC      : 4-coef block, chroma DC. Uses chroma_dc table.
     --------------------------------------------------------------------
-    constant BLK_LUMA_DC_16x16 : integer := 0;
-    constant BLK_LUMA_AC       : integer := 1;
-    constant BLK_LUMA_FULL     : integer := 2;
-    constant BLK_CHROMA_DC     : integer := 3;
-    constant BLK_CHROMA_AC     : integer := 4;
+    constant BLK_LUMA_AC       : integer := 0;
+    constant BLK_LUMA_FULL     : integer := 1;
+    constant BLK_LUMA_DC_16x16 : integer := 2;
+    constant BLK_CHROMA_AC     : integer := 3;
+    constant BLK_CHROMA_DC     : integer := 4;
 
     subtype block_type_t is unsigned(2 downto 0);
 

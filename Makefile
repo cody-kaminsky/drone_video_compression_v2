@@ -44,7 +44,7 @@ BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 BIN_DEC := $(BUILD)/dcc_decoder
 
-.PHONY: dec dec_test bit_reader_vectors cavlc_dec_tables cavlc_dec_vectors mb_header_dec_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: dec dec_test bit_reader_vectors cavlc_dec_tables cavlc_dec_vectors mb_header_dec_vectors mb_residual_dec_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS) $(BIN_DEC)
 ref: $(BIN_REF)
@@ -320,4 +320,15 @@ mb_header_dec_vectors: $(BUILD)/mb_header_dec_vectors.txt
 $(BUILD)/gen_mb_header_dec_vectors: tools/gen_mb_header_dec_vectors.c $(SHARED_OBJS) $(BUILD)/dec/decoder.o $(BUILD)/dec/dec_nal.o | $(BUILD)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
 $(BUILD)/mb_header_dec_vectors.txt: $(BUILD)/gen_mb_header_dec_vectors
+	./$<
+
+# Golden vectors for the decode-side block sequencer. A whole macroblock's
+# residual, written with the encoder's block order and nC derivation and read
+# back with dec_mb_residual. Because every block's nC comes from its
+# neighbours' total_coeff, a round trip that holds is evidence about the nC
+# bookkeeping and not only about the bits.
+mb_residual_dec_vectors: $(BUILD)/mb_residual_dec_vectors.txt
+$(BUILD)/gen_mb_residual_dec_vectors: tools/gen_mb_residual_dec_vectors.c $(SHARED_OBJS) $(BUILD)/dec/decoder.o $(BUILD)/dec/dec_nal.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+$(BUILD)/mb_residual_dec_vectors.txt: $(BUILD)/gen_mb_residual_dec_vectors
 	./$<

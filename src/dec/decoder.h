@@ -48,6 +48,31 @@ typedef struct {
  * on stderr for syntax this decoder does not handle. */
 int dec_mb_header(bitreader_t *br, mb_header_t *h);
 
+/* Every residual block of one macroblock, in bitstream order, with the
+ * neighbour total_coeff context the nC derivation of spec 9.2.1.1 needs.
+ * Coefficients come out in zigzag order with the I_16x16 and chroma AC shift
+ * already applied, so every block is a full 16-coefficient vector. */
+typedef struct {
+    /* in */
+    int is_i4x4, cbp_luma, cbp_chroma;
+    int avail_top, avail_left;
+    int nc_top[4], nc_left[4];       /* luma, in 4x4 units */
+    int ncu_top[2], ncu_left[2];     /* chroma U */
+    int ncv_top[2], ncv_left[2];     /* chroma V */
+    /* out */
+    i16 luma_dc[16];                 /* I_16x16 only, zigzag */
+    i16 luma[16][16];                /* [raster block][zigzag coefficient] */
+    i16 chroma_dc[2][4];             /* [component][coefficient] */
+    i16 chroma_ac[2][4][16];         /* [component][raster block][zigzag] */
+    int nc_out[16];                  /* luma total_coeff, raster */
+    int ncu_out[4], ncv_out[4];
+} mb_residual_t;
+
+/* Parse one macroblock's residual blocks. Returns 0, or -1 with the reason on
+ * stderr. Reads bits and nothing else: the entropy layer never depends on a
+ * reconstructed sample. */
+int dec_mb_residual(bitreader_t *br, mb_residual_t *r);
+
 typedef struct {
     int width, height;
     int mbs_w, mbs_h;
