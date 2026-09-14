@@ -75,6 +75,26 @@ architecture sim of decoder_top_tb is
     -- here rather than being argued about.
     signal busy_cy : integer := 0;
 
+    -- Where the cycles go. Probed through the hierarchy rather than added
+    -- to the design's ports: this is a question about the design, not part
+    -- of it.
+    alias p_hstart is <<signal .decoder_top_tb.dut.h_start  : std_logic>>;
+    alias p_hdone  is <<signal .decoder_top_tb.dut.h_done   : std_logic>>;
+    alias p_rstart is <<signal .decoder_top_tb.dut.r_start  : std_logic>>;
+    alias p_rdone  is <<signal .decoder_top_tb.dut.r_done   : std_logic>>;
+    alias p_kdone  is <<signal .decoder_top_tb.dut.k_done   : std_logic>>;
+    alias p_bvalid is <<signal .decoder_top_tb.dut.r_bvalid : std_logic>>;
+    alias p_bready is <<signal .decoder_top_tb.dut.r_bready : std_logic>>;
+    signal cy_hdr, cy_res, cy_rectail, cy_res_wait_rec, cy_rec_wait_res : integer := 0;
+    -- Inside the sequencer: cycles its CAVLC engine is busy, cycles spent
+    -- on symbols (consumes), and cycles the sequencer itself spends between
+    -- blocks.
+    alias p_estart is <<signal .decoder_top_tb.dut.res.e_start : std_logic>>;
+    alias p_edone  is <<signal .decoder_top_tb.dut.res.e_done  : std_logic>>;
+    alias p_cons   is <<signal .decoder_top_tb.dut.r_cons      : std_logic>>;
+    signal cy_eng, n_cons, n_blk_coded, in_eng : integer := 0;
+    signal in_hdr, in_res, in_tail : boolean := false;
+
 begin
 
     clk <= not clk after CLK_PERIOD / 2;
@@ -121,6 +141,32 @@ begin
                     in_valid <= '0';
                 end if;
             end if;
+        end if;
+    end process;
+
+    prof_p : process(clk)
+    begin
+        if rising_edge(clk) then
+            if p_hstart = '1' then in_hdr <= true; end if;
+            if p_hdone  = '1' then in_hdr <= false; end if;
+            if p_rstart = '1' then in_res <= true; end if;
+            if p_rdone  = '1' then in_res <= false; in_tail <= true; end if;
+            if p_kdone  = '1' then in_tail <= false; end if;
+            if in_hdr  then cy_hdr     <= cy_hdr + 1; end if;
+            if in_res  then cy_res     <= cy_res + 1; end if;
+            if in_tail then cy_rectail <= cy_rectail + 1; end if;
+            -- A block offered and not taken: the sequencer waits on the
+            -- reconstruction. Taken-ready and nothing offered: the other way.
+            if p_bvalid = '1' and p_bready = '0' then
+                cy_res_wait_rec <= cy_res_wait_rec + 1;
+            end if;
+            if in_res and p_bvalid = '0' and p_bready = '1' then
+                cy_rec_wait_res <= cy_rec_wait_res + 1;
+            end if;
+            if p_estart = '1' then in_eng <= 1; n_blk_coded <= n_blk_coded + 1; end if;
+            if p_edone  = '1' then in_eng <= 0; end if;
+            if in_eng = 1 or p_estart = '1' then cy_eng <= cy_eng + 1; end if;
+            if p_cons = '1' then n_cons <= n_cons + 1; end if;
         end if;
     end process;
 
@@ -284,6 +330,22 @@ begin
                          & " per macroblock ("
                          & integer'image(starved)
                          & " of them with no payload byte offered)"
+                        severity note;
+                    report "  per macroblock: header " & integer'image(cy_hdr / (v_mbw * v_mbh))
+                         & ", residual+recon " & integer'image(cy_res / (v_mbw * v_mbh))
+                         & " (of which sequencer waiting on recon "
+                         & integer'image(cy_res_wait_rec / (v_mbw * v_mbh))
+                         & ", recon waiting on sequencer "
+                         & integer'image(cy_rec_wait_res / (v_mbw * v_mbh))
+                         & "), recon tail after last block "
+                         & integer'image(cy_rectail / (v_mbw * v_mbh))
+                         & ", other " & integer'image((busy_cy - cy_hdr - cy_res - cy_rectail) / (v_mbw * v_mbh))
+                        severity note;
+                    report "  CAVLC engine per macroblock: busy " & integer'image(cy_eng / (v_mbw * v_mbh))
+                         & " cycles over " & integer'image(n_blk_coded / (v_mbw * v_mbh))
+                         & " coded blocks, " & integer'image(n_cons / (v_mbw * v_mbh))
+                         & " symbols consumed; sequencer overhead "
+                         & integer'image((cy_res - cy_eng) / (v_mbw * v_mbh))
                         severity note;
                 end if;
             end if;

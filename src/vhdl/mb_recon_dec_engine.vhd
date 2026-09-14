@@ -15,22 +15,37 @@
 -- modes because the encoder reconstructs; transform_engine already has the
 -- three inverse transforms; recon_engine already folds the rounding, the
 -- shift and the clip. They are instantiated here with DIR = "inv" and
--- WITH_SSD = false, which drops the forward operand muxes and the distortion
--- adder tree the decoder has no use for.
+-- WITH_SSD = false.
+--
+-- Structure: a dataflow, not a sequence. Every block is issued into the
+-- dequantise -> inverse transform chain the cycle it is taken, and its
+-- prediction is issued separately; the two meet at the reconstruction step,
+-- residuals waiting in a small FIFO for their prediction. Each of the five
+-- engines is one block per cycle with a fixed latency, so this runs at the
+-- rate the entropy decoder can feed it. The first version of this block
+-- walked one block at a time through all four stages with a handshake at
+-- each, and cost more than the entropy decode it sat behind.
+--
+-- Three things constrain the flow, and each is a gate rather than a state:
+--
+--   A DC block's result is the DC of the AC blocks after it, so no block is
+--   taken while a DC block is in the chain. That is at most three short
+--   waits per macroblock.
+--
+--   An I_4x4 block predicts from the reconstruction of the block before it,
+--   so for those the prediction is not issued until every earlier block has
+--   been written. The residual chain runs ahead regardless; only the
+--   predict -> reconstruct -> write loop is serial, four cycles a block.
+--
+--   Predictions come out of whichever engine they went into, and the three
+--   engines have different latencies, so a prediction is not issued to a
+--   different engine than the last one until the last one's outputs have
+--   all been consumed. The block order makes that a single wait per
+--   macroblock, between the luma and the chroma.
 --
 -- The I_4x4 neighbour gather is lifted from mode_decide_engine's own
--- reconstruction path rather than rewritten, including the two rules that
--- are easy to get wrong: the above-right 4x4 exists only for scan positions
--- other than 3, 7, 11, 13 and 15, and when it does not exist the four
--- samples are replicated from the last one of the row above (spec 8.3.1.2.4)
--- rather than treated as unavailable.
---
--- Blocks are processed one at a time, each walking predict -> dequantise ->
--- inverse transform -> reconstruct before the next begins. I_4x4 forces that
--- serialisation anyway -- block s+1 predicts from block s's reconstruction --
--- and the entropy decode ahead of it is the slower half, so there is nothing
--- to gain here yet. If that changes, the I_16x16 and chroma paths have no
--- such dependency and can be pipelined without touching the interface.
+-- reconstruction path rather than rewritten, including the above-right rule
+-- and the sample replication of spec 8.3.1.2.4.
 --
 -- The reconstruction comes out as 24 blocks, Y raster 0..15 then U 0..3 then
 -- V 0..3, which is the stream line_buffer's commit path already consumes.
@@ -96,6 +111,8 @@ architecture rtl of mb_recon_dec_engine is
     constant ZIGZAG  : int16_t := (0,1,4,8,5,2,3,6,9,12,13,10,7,11,14,15);
     constant SCAN_BR : int16_t := (0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3);
     constant SCAN_BC : int16_t := (0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3);
+    -- Scan index of raster block k, the inverse of the two above.
+    constant RASTER_TO_SCAN : int16_t := (0,1,4,5, 2,3,6,7, 8,9,12,13, 10,11,14,15);
 
     -- The above-right 4x4 of a block, in the spec's scan, belongs to a block
     -- that has not been decoded yet at exactly these positions.
@@ -109,16 +126,32 @@ architecture rtl of mb_recon_dec_engine is
         return v(8 * k + 7 downto 8 * k);
     end function;
 
+    constant DEPTH : integer := 8;     -- blocks in flight, and the residual FIFO
+
     type c16_t  is array (0 to 15) of signed(31 downto 0);
     type blk_t  is array (0 to 15) of std_logic_vector(127 downto 0);
     type c4_t   is array (0 to 3)  of std_logic_vector(127 downto 0);
+    subtype res_t is std_logic_vector(16 * 20 - 1 downto 0);
+    type res_fifo_t is array (0 to DEPTH - 1) of res_t;
 
-    type state_t is (S_IDLE, S_TAKE,
-                     S_PRED_ISSUE, S_PRED_WAIT,
-                     S_Q_ISSUE, S_Q_WAIT,
-                     S_T_ISSUE, S_T_WAIT,
-                     S_R_ISSUE, S_R_WAIT,
-                     S_EMIT, S_DONE);
+    -- One non-DC block, as taken. Indexed by the block's ordinal among the
+    -- non-DC blocks, which is also its order through every pipeline here.
+    type desc_t is record
+        kind : unsigned(1 downto 0);
+        comp : std_logic;
+        pos  : unsigned(3 downto 0);
+    end record;
+    type desc_ring_t is array (0 to 15) of desc_t;
+
+    -- What is inside the dequantiser and the transform, in order.
+    type tag_t is record
+        is_dc : std_logic;
+        kind  : unsigned(1 downto 0);
+        comp  : std_logic;
+    end record;
+    type tag_ring_t is array (0 to 7) of tag_t;
+
+    type state_t is (S_IDLE, S_RUN, S_EMIT, S_DONE);
     signal st : state_t := S_IDLE;
 
     -- Job context
@@ -134,16 +167,27 @@ architecture rtl of mb_recon_dec_engine is
     signal tl_u, tl_v : std_logic_vector(7 downto 0) := (others => '0');
     signal a_top, a_left, a_tl, a_tr : std_logic := '0';
 
-    -- Current block
-    signal cur_kind : unsigned(1 downto 0) := (others => '0');
-    signal cur_comp : std_logic := '0';
-    signal cur_pos  : unsigned(3 downto 0) := (others => '0');
-    signal cur_s    : integer range 0 to 15 := 0;   -- scan index, luma only
-    signal nblk     : integer range 0 to 27 := 0;
-    signal lev      : c16_t := (others => (others => '0'));   -- raster levels
-    signal pred_q   : std_logic_vector(127 downto 0) := (others => '0');
-    signal coef_q   : c16_t := (others => (others => '0'));
-    signal res_q    : std_logic_vector(16 * 20 - 1 downto 0) := (others => '0');
+    -- Bookkeeping. Counts of non-DC blocks past each point, in order:
+    -- taken, prediction issued, prediction consumed (reconstruction issued),
+    -- reconstruction written. Rings are indexed by the low bits.
+    signal desc    : desc_ring_t := (others => (kind => "00", comp => '0', pos => "0000"));
+    signal n_all   : integer range 0 to 27 := 0;    -- taken, DC included
+    signal n_take  : unsigned(4 downto 0) := (others => '0');
+    signal n_pred  : unsigned(4 downto 0) := (others => '0');
+    signal n_pout  : unsigned(4 downto 0) := (others => '0');
+    signal n_rec   : unsigned(4 downto 0) := (others => '0');
+    signal n_qout  : unsigned(4 downto 0) := (others => '0');  -- past the DC override
+    signal dc_wait : std_logic := '0';
+    signal pred_kind_v : std_logic := '0';          -- a prediction has been issued
+    signal pred_kind   : unsigned(1 downto 0) := (others => '0');
+
+    signal qtag : tag_ring_t := (others => (is_dc => '0', kind => "00", comp => '0'));
+    signal ttag : tag_ring_t := (others => (is_dc => '0', kind => "00", comp => '0'));
+    signal q_wr, q_rd, t_wr, t_rd : unsigned(2 downto 0) := (others => '0');
+
+    signal rfifo : res_fifo_t;
+    signal r_wr, r_rd : unsigned(3 downto 0) := (others => '0');
+    signal r_count : unsigned(3 downto 0) := (others => '0');
 
     -- Results
     signal r4  : blk_t := (others => (others => '0'));
@@ -161,20 +205,24 @@ architecture rtl of mb_recon_dec_engine is
     signal q_valid : std_logic := '0';
     signal q_ready : std_logic;
     signal q_vo    : std_logic;
-    signal q_din, q_dout : c16_t;
+    signal q_din, q_dout : c16_t := (others => (others => '0'));
 
     -- transform_engine
     signal t_mode  : unsigned(2 downto 0) := (others => '0');
     signal t_valid : std_logic := '0';
     signal t_ready : std_logic;
     signal t_vo    : std_logic;
-    signal t_din, t_dout : c16_t;
+    signal t_din, t_dout : c16_t := (others => (others => '0'));
 
-    -- recon_engine
-    signal rc_valid : std_logic := '0';
+    -- recon_engine, driven combinationally from the join
+    signal rc_valid : std_logic;
     signal rc_ready : std_logic;
     signal rc_vo    : std_logic;
     signal rc_out   : std_logic_vector(127 downto 0);
+    signal rc_pred  : std_logic_vector(127 downto 0);
+    signal rc_res   : res_t;
+    signal pred_now : std_logic;
+    signal res_now  : std_logic;
 
     -- predictors
     signal p4_mode  : unsigned(3 downto 0) := (others => '0');
@@ -203,15 +251,33 @@ architecture rtl of mb_recon_dec_engine is
     signal b_idx   : unsigned(3 downto 0) := (others => '0');
     signal b_data  : std_logic_vector(127 downto 0) := (others => '0');
 
+    signal take_ok : std_logic;
+
 begin
 
     ready_o     <= '1' when st = S_IDLE else '0';
     done_o      <= '1' when st = S_DONE else '0';
-    blk_ready_o <= '1' when st = S_TAKE else '0';
     rec_valid_o <= b_valid;
     rec_plane_o <= b_plane;
     rec_idx_o   <= b_idx;
     rec_data_o  <= b_data;
+
+    -- A block can be taken when nothing DC is in the chain and there is room
+    -- for its residual to wait.
+    take_ok <= '1' when st = S_RUN and dc_wait = '0' and n_all < 27
+                    and (n_take - n_rec) < DEPTH else '0';
+    blk_ready_o <= take_ok;
+
+    ------------------------------------------------------------------
+    -- The join. A prediction is consumed the cycle it appears, provided its
+    -- residual is already waiting; otherwise the predictor is held. Only one
+    -- predictor has outputs in flight at a time, by construction.
+    ------------------------------------------------------------------
+    pred_now <= p4_vo or p16_vo or pc_vo;
+    res_now  <= '1' when r_count /= 0 else '0';
+    rc_valid <= pred_now and res_now;
+    rc_pred <= p4_pred when p4_vo = '1' else p16_pred when p16_vo = '1' else pc_pred;
+    rc_res  <= rfifo(to_integer(r_rd(2 downto 0)));
 
     ------------------------------------------------------------------
     quant : entity work.quant_engine
@@ -267,7 +333,7 @@ begin
     recon : entity work.recon_engine
         generic map (RES_W => 20, WITH_SSD => false)
         port map (clk => clk, rst_n => rst_n,
-                  pred_i => pred_q, res_i => res_q,
+                  pred_i => rc_pred, res_i => rc_res,
                   src_i => (others => '0'),
                   valid_i => rc_valid, ready_o => rc_ready,
                   recon_o => rc_out, ssd_o => open,
@@ -279,7 +345,7 @@ begin
                   tl_i => p4_tl, avail_top_i => p4_at, avail_left_i => p4_al,
                   avail_tl_i => p4_atl,
                   valid_i => p4_valid, ready_o => p4_ready,
-                  pred_o => p4_pred, valid_o => p4_vo, ready_i => '1');
+                  pred_o => p4_pred, valid_o => p4_vo, ready_i => res_now);
 
     p16 : entity work.predict_16x16_engine
         port map (clk => clk, rst_n => rst_n,
@@ -288,7 +354,7 @@ begin
                   avail_top_i => a_top, avail_left_i => a_left,
                   avail_tl_i => a_tl,
                   valid_i => p16_valid, ready_o => p16_ready,
-                  pred_o => p16_pred, valid_o => p16_vo, ready_i => '1');
+                  pred_o => p16_pred, valid_o => p16_vo, ready_i => res_now);
 
     pchroma : entity work.predict_chroma_engine
         port map (clk => clk, rst_n => rst_n,
@@ -297,36 +363,50 @@ begin
                   avail_top_i => a_top, avail_left_i => a_left,
                   avail_tl_i => a_tl,
                   valid_i => pc_valid, ready_o => pc_ready,
-                  pred_o => pc_pred, valid_o => pc_vo, ready_i => '1');
+                  pred_o => pc_pred, valid_o => pc_vo, ready_i => res_now);
 
     ------------------------------------------------------------------
     main_p : process(clk)
-        variable s, br, bc, pos, k : integer range 0 to 15;
+        variable s, br, bc, pos : integer range 0 to 15;
+        variable e     : integer range 0 to 24;
         variable topv  : std_logic_vector(63 downto 0);
         variable leftv : std_logic_vector(31 downto 0);
         variable tlv   : std_logic_vector(7 downto 0);
         variable at, al, atl : std_logic;
-        variable rb    : std_logic_vector(127 downto 0);
+        variable d     : desc_t;
+        variable tg    : tag_t;
+        variable can_issue : boolean;
+        variable eng_free  : boolean;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
                 st       <= S_IDLE;
                 q_valid  <= '0';
                 t_valid  <= '0';
-                rc_valid <= '0';
                 p4_valid <= '0';
                 p16_valid<= '0';
                 pc_valid <= '0';
                 b_valid  <= '0';
-                nblk     <= 0;
+                n_all    <= 0;
+                n_take   <= (others => '0');
+                n_pred   <= (others => '0');
+                n_pout   <= (others => '0');
+                n_rec    <= (others => '0');
+                n_qout   <= (others => '0');
+                q_wr <= (others => '0'); q_rd <= (others => '0');
+                t_wr <= (others => '0'); t_rd <= (others => '0');
+                r_wr <= (others => '0'); r_rd <= (others => '0');
+                r_count  <= (others => '0');
+                dc_wait  <= '0';
+                pred_kind_v <= '0';
                 emit_i   <= 0;
             else
-                q_valid  <= '0';
-                t_valid  <= '0';
-                rc_valid <= '0';
-                p4_valid <= '0';
-                p16_valid<= '0';
-                pc_valid <= '0';
+                -- Registered issues last one cycle unless held below.
+                q_valid <= '0';
+                t_valid <= '0';
+                if p4_ready  = '1' then p4_valid  <= '0'; end if;
+                if p16_ready = '1' then p16_valid <= '0'; end if;
+                if pc_ready  = '1' then pc_valid  <= '0'; end if;
 
                 case st is
 
@@ -345,57 +425,154 @@ begin
                         top_v   <= top_v_i;  left_v <= left_v_i; tl_v <= tl_v_i;
                         a_top   <= avail_top_i;  a_left <= avail_left_i;
                         a_tl    <= avail_tl_i;   a_tr   <= avail_tr_i;
-                        nblk    <= 0;
+                        n_all   <= 0;
+                        n_take  <= (others => '0');
+                        n_pred  <= (others => '0');
+                        n_pout  <= (others => '0');
+                        n_rec   <= (others => '0');
+                        n_qout  <= (others => '0');
+                        q_wr <= (others => '0'); q_rd <= (others => '0');
+                        t_wr <= (others => '0'); t_rd <= (others => '0');
+                        r_wr <= (others => '0'); r_rd <= (others => '0');
+                        r_count <= (others => '0');
+                        dc_wait <= '0';
+                        pred_kind_v <= '0';
                         emit_i  <= 0;
-                        st      <= S_TAKE;
+                        st      <= S_RUN;
                     end if;
 
                 ----------------------------------------------------------
-                -- Take one block and put its coefficients into raster order.
-                when S_TAKE =>
-                    if blk_valid_i = '1' then
-                        cur_kind <= blk_kind_i;
-                        cur_comp <= blk_comp_i;
-                        cur_pos  <= blk_pos_i;
-                        -- Zigzag to raster -- except for a chroma DC block,
+                when S_RUN =>
+                    ------------------------------------------------------
+                    -- 1. Take a block: straight into the dequantiser.
+                    ------------------------------------------------------
+                    if blk_valid_i = '1' and take_ok = '1' then
+                        -- Zigzag to raster, except for a chroma DC block
                         -- whose four coefficients are already in order and
-                        -- must land in lanes 0..3. Permuting them sends
-                        -- coefficients 2 and 3 to lanes 4 and 8, which the 2x2
-                        -- Hadamard never reads: the block then reconstructs
-                        -- flat and slightly wrong, and only when one of those
-                        -- two is nonzero.
+                        -- must land in lanes 0..3.
                         for k in 0 to 15 loop
                             if blk_kind_i = 2 then
-                                lev(k) <= resize(signed(
+                                q_din(k) <= resize(signed(
                                     blk_coefs_i(k * 16 + 15 downto k * 16)), 32);
                             else
-                                lev(ZIGZAG(k)) <= resize(signed(
+                                q_din(ZIGZAG(k)) <= resize(signed(
                                     blk_coefs_i(k * 16 + 15 downto k * 16)), 32);
                             end if;
                         end loop;
-                        -- Luma blocks arrive in scan order; the scan index is
-                        -- what the above-right rule is stated in terms of.
-                        if nblk >= 1 and nblk <= 16 then
-                            cur_s <= nblk - 1;
+                        if blk_kind_i = 0 then
+                            q_mode <= to_unsigned(3, 3); q_qp <= qp_y;
+                        elsif blk_kind_i = 2 then
+                            q_mode <= to_unsigned(5, 3); q_qp <= qp_c;
+                        elsif blk_kind_i = 1 then
+                            q_mode <= to_unsigned(1, 3); q_qp <= qp_y;
                         else
-                            cur_s <= 0;
+                            q_mode <= to_unsigned(1, 3); q_qp <= qp_c;
                         end if;
-                        if blk_kind_i = 1 or blk_kind_i = 3 then
-                            st <= S_PRED_ISSUE;
+                        q_valid <= '1';
+
+                        tg.is_dc := '0';
+                        if blk_kind_i = 0 or blk_kind_i = 2 then tg.is_dc := '1'; end if;
+                        tg.kind := blk_kind_i;
+                        tg.comp := blk_comp_i;
+                        qtag(to_integer(q_wr)) <= tg;
+                        q_wr <= q_wr + 1;
+
+                        if tg.is_dc = '1' then
+                            dc_wait <= '1';
                         else
-                            st <= S_Q_ISSUE;     -- a DC block has no prediction
+                            desc(to_integer(n_take(3 downto 0))) <=
+                                (kind => blk_kind_i, comp => blk_comp_i, pos => blk_pos_i);
+                            n_take <= n_take + 1;
+                        end if;
+                        n_all <= n_all + 1;
+                    end if;
+
+                    ------------------------------------------------------
+                    -- 2. Dequantiser out, transform in, with the DC of an
+                    --    I_16x16 luma or a chroma block substituted from the
+                    --    Hadamard plane.
+                    ------------------------------------------------------
+                    if q_vo = '1' then
+                        tg := qtag(to_integer(q_rd));
+                        q_rd <= q_rd + 1;
+                        for k in 0 to 15 loop t_din(k) <= q_dout(k); end loop;
+                        if tg.is_dc = '1' then
+                            if tg.kind = 0 then t_mode <= to_unsigned(3, 3);
+                            else                t_mode <= to_unsigned(5, 3);
+                            end if;
+                        else
+                            t_mode <= to_unsigned(1, 3);
+                            d := desc(to_integer(n_qout(3 downto 0)));
+                            if d.kind = 1 and i4 = '0' then
+                                t_din(0) <= dcy(to_integer(d.pos));
+                            elsif d.kind = 3 then
+                                if d.comp = '0' then t_din(0) <= dcu(to_integer(d.pos));
+                                else                 t_din(0) <= dcv(to_integer(d.pos));
+                                end if;
+                            end if;
+                            n_qout <= n_qout + 1;
+                        end if;
+                        t_valid <= '1';
+                        ttag(to_integer(t_wr)) <= tg;
+                        t_wr <= t_wr + 1;
+                    end if;
+
+                    ------------------------------------------------------
+                    -- 3. Transform out: a DC plane is captured, a residual
+                    --    waits for its prediction.
+                    ------------------------------------------------------
+                    if t_vo = '1' then
+                        tg := ttag(to_integer(t_rd));
+                        t_rd <= t_rd + 1;
+                        if tg.is_dc = '1' then
+                            if tg.kind = 0 then
+                                for k in 0 to 15 loop dcy(k) <= t_dout(k); end loop;
+                            else
+                                for k in 0 to 3 loop
+                                    if tg.comp = '0' then dcu(k) <= t_dout(k);
+                                    else                  dcv(k) <= t_dout(k);
+                                    end if;
+                                end loop;
+                            end if;
+                            dc_wait <= '0';
+                        else
+                            for k in 0 to 15 loop
+                                rfifo(to_integer(r_wr(2 downto 0)))
+                                    (20 * k + 19 downto 20 * k) <=
+                                    std_logic_vector(t_dout(k)(19 downto 0));
+                            end loop;
+                            r_wr <= r_wr + 1;
                         end if;
                     end if;
 
-                ----------------------------------------------------------
-                when S_PRED_ISSUE =>
-                    if cur_kind = 1 then
-                        s   := cur_s;
-                        br  := SCAN_BR(s);
-                        bc  := SCAN_BC(s);
-                        if i4 = '1' then
-                            -- Neighbour gather, the same one the encoder's
-                            -- reconstruction path uses.
+                    ------------------------------------------------------
+                    -- 4. Issue a prediction for the next taken block, when
+                    --    its engine is free and the gates allow.
+                    ------------------------------------------------------
+                    d := desc(to_integer(n_pred(3 downto 0)));
+                    can_issue := n_pred /= n_take;
+                    -- Not to a different engine while another has work out.
+                    if pred_kind_v = '1' and d.kind /= pred_kind and n_pred /= n_pout then
+                        can_issue := false;
+                    end if;
+                    -- I_4x4 luma predicts from the block before it.
+                    if d.kind = 1 and i4 = '1' and n_pred /= n_rec then
+                        can_issue := false;
+                    end if;
+                    if d.kind = 1 and i4 = '1' then
+                        eng_free := (p4_valid = '0' or p4_ready = '1');
+                    elsif d.kind = 1 then
+                        eng_free := (p16_valid = '0' or p16_ready = '1');
+                    else
+                        eng_free := (pc_valid = '0' or pc_ready = '1');
+                    end if;
+
+                    if can_issue and eng_free then
+                        pos := to_integer(d.pos);
+                        if d.kind = 1 and i4 = '1' then
+                            s  := RASTER_TO_SCAN(pos);
+                            br := SCAN_BR(s);
+                            bc := SCAN_BC(s);
                             at := '1'; al := '1';
                             if br = 0 then at := a_top;  end if;
                             if bc = 0 then al := a_left; end if;
@@ -404,7 +581,6 @@ begin
                             elsif bc > 0 then atl := a_top;
                             else atl := a_tl;
                             end if;
-
                             if br > 0 then
                                 topv(31 downto 0) := r4((br - 1) * 4 + bc)(127 downto 96);
                             else
@@ -444,8 +620,6 @@ begin
                             else
                                 tlv := tl_y;
                             end if;
-
-                            pos := br * 4 + bc;
                             p4_mode  <= unsigned(modes4(4 * pos + 3 downto 4 * pos));
                             p4_top   <= topv;
                             p4_left  <= leftv;
@@ -454,155 +628,89 @@ begin
                             p4_al    <= al;
                             p4_atl   <= atl;
                             p4_valid <= '1';
-                        else
-                            p16_blk   <= cur_pos;
+                        elsif d.kind = 1 then
+                            p16_blk   <= d.pos;
                             p16_valid <= '1';
-                        end if;
-                    else
-                        pc_blk <= cur_pos(1 downto 0);
-                        if cur_comp = '0' then
-                            pc_top <= top_u; pc_left <= left_u; pc_tl <= tl_u;
                         else
-                            pc_top <= top_v; pc_left <= left_v; pc_tl <= tl_v;
-                        end if;
-                        pc_valid <= '1';
-                    end if;
-                    st <= S_PRED_WAIT;
-
-                ----------------------------------------------------------
-                when S_PRED_WAIT =>
-                    if cur_kind = 1 and i4 = '1' then
-                        if p4_vo = '1' then
-                            pred_q <= p4_pred;  st <= S_Q_ISSUE;
-                        end if;
-                    elsif cur_kind = 1 then
-                        if p16_vo = '1' then
-                            pred_q <= p16_pred; st <= S_Q_ISSUE;
-                        end if;
-                    else
-                        if pc_vo = '1' then
-                            pred_q <= pc_pred;  st <= S_Q_ISSUE;
-                        end if;
-                    end if;
-
-                ----------------------------------------------------------
-                -- Dequantise. A DC block uses its own inverse mode and the
-                -- 2x2 one only looks at lanes 0..3.
-                when S_Q_ISSUE =>
-                    for k in 0 to 15 loop q_din(k) <= lev(k); end loop;
-                    if cur_kind = 0 then
-                        q_mode <= to_unsigned(3, 3); q_qp <= qp_y;
-                    elsif cur_kind = 2 then
-                        q_mode <= to_unsigned(5, 3); q_qp <= qp_c;
-                    elsif cur_kind = 1 then
-                        q_mode <= to_unsigned(1, 3); q_qp <= qp_y;
-                    else
-                        q_mode <= to_unsigned(1, 3); q_qp <= qp_c;
-                    end if;
-                    q_valid <= '1';
-                    st <= S_Q_WAIT;
-
-                when S_Q_WAIT =>
-                    if q_vo = '1' then
-                        for k in 0 to 15 loop coef_q(k) <= q_dout(k); end loop;
-                        -- The DC of an I_16x16 luma block or a chroma block
-                        -- comes from the Hadamard plane, not from this
-                        -- block's own coefficient 0.
-                        if cur_kind = 1 and i4 = '0' then
-                            coef_q(0) <= dcy(to_integer(cur_pos));
-                        elsif cur_kind = 3 then
-                            if cur_comp = '0' then
-                                coef_q(0) <= dcu(to_integer(cur_pos));
+                            pc_blk <= d.pos(1 downto 0);
+                            if d.comp = '0' then
+                                pc_top <= top_u; pc_left <= left_u; pc_tl <= tl_u;
                             else
-                                coef_q(0) <= dcv(to_integer(cur_pos));
+                                pc_top <= top_v; pc_left <= left_v; pc_tl <= tl_v;
                             end if;
+                            pc_valid <= '1';
                         end if;
-                        st <= S_T_ISSUE;
+                        pred_kind   <= d.kind;
+                        pred_kind_v <= '1';
+                        n_pred      <= n_pred + 1;
                     end if;
 
-                ----------------------------------------------------------
-                when S_T_ISSUE =>
-                    for k in 0 to 15 loop t_din(k) <= coef_q(k); end loop;
-                    if cur_kind = 0 then
-                        t_mode <= to_unsigned(3, 3);     -- ihadamard4x4
-                    elsif cur_kind = 2 then
-                        t_mode <= to_unsigned(5, 3);     -- ihadamard2x2
-                    else
-                        t_mode <= to_unsigned(1, 3);     -- idct4x4
+                    ------------------------------------------------------
+                    -- 5. The join fired (combinational above): retire the
+                    --    residual and count the prediction as consumed.
+                    ------------------------------------------------------
+                    if rc_valid = '1' then
+                        r_rd   <= r_rd + 1;
+                        n_pout <= n_pout + 1;
                     end if;
-                    t_valid <= '1';
-                    st <= S_T_WAIT;
-
-                when S_T_WAIT =>
-                    if t_vo = '1' then
-                        if cur_kind = 0 then
-                            for k in 0 to 15 loop dcy(k) <= t_dout(k); end loop;
-                            st <= S_TAKE;
-                            nblk <= nblk + 1;
-                        elsif cur_kind = 2 then
-                            for k in 0 to 3 loop
-                                if cur_comp = '0' then dcu(k) <= t_dout(k);
-                                else                   dcv(k) <= t_dout(k);
-                                end if;
-                            end loop;
-                            st <= S_TAKE;
-                            nblk <= nblk + 1;
-                        else
-                            for k in 0 to 15 loop
-                                res_q(20 * k + 19 downto 20 * k) <=
-                                    std_logic_vector(t_dout(k)(19 downto 0));
-                            end loop;
-                            st <= S_R_ISSUE;
-                        end if;
+                    -- One in from the transform, one out to the join, or
+                    -- both, or neither.
+                    if (t_vo = '1' and ttag(to_integer(t_rd)).is_dc = '0')
+                       and rc_valid = '0' then
+                        r_count <= r_count + 1;
+                    elsif not (t_vo = '1' and ttag(to_integer(t_rd)).is_dc = '0')
+                          and rc_valid = '1' then
+                        r_count <= r_count - 1;
                     end if;
 
-                ----------------------------------------------------------
-                when S_R_ISSUE =>
-                    rc_valid <= '1';
-                    st <= S_R_WAIT;
-
-                when S_R_WAIT =>
+                    ------------------------------------------------------
+                    -- 6. Reconstruction out: write it where it belongs.
+                    ------------------------------------------------------
                     if rc_vo = '1' then
-                        if cur_kind = 1 then
-                            r4(to_integer(cur_pos)) <= rc_out;
-                        elsif cur_comp = '0' then
-                            rcu(to_integer(cur_pos(1 downto 0))) <= rc_out;
+                        d := desc(to_integer(n_rec(3 downto 0)));
+                        if d.kind = 1 then
+                            r4(to_integer(d.pos)) <= rc_out;
+                        elsif d.comp = '0' then
+                            rcu(to_integer(d.pos(1 downto 0))) <= rc_out;
                         else
-                            rcv(to_integer(cur_pos(1 downto 0))) <= rc_out;
+                            rcv(to_integer(d.pos(1 downto 0))) <= rc_out;
                         end if;
-                        if nblk = 26 then
-                            st <= S_EMIT;
-                        else
-                            nblk <= nblk + 1;
-                            st   <= S_TAKE;
-                        end if;
+                        n_rec <= n_rec + 1;
+                    end if;
+
+                    if n_all = 27 and n_rec = 24 then
+                        st <= S_EMIT;
                     end if;
 
                 ----------------------------------------------------------
-                -- Y raster 0..15, U 0..3, V 0..3: the order line_buffer's
-                -- commit path already consumes.
+                -- Y raster 0..15, U 0..3, V 0..3, one per cycle: the order
+                -- line_buffer's commit path already consumes.
+                ----------------------------------------------------------
                 when S_EMIT =>
-                    if b_valid = '0' then
-                        if emit_i < 16 then
-                            b_plane <= to_unsigned(0, 2);
-                            b_idx   <= to_unsigned(emit_i, 4);
-                            b_data  <= r4(emit_i);
-                        elsif emit_i < 20 then
-                            b_plane <= to_unsigned(1, 2);
-                            b_idx   <= to_unsigned(emit_i - 16, 4);
-                            b_data  <= rcu(emit_i - 16);
-                        else
-                            b_plane <= to_unsigned(2, 2);
-                            b_idx   <= to_unsigned(emit_i - 20, 4);
-                            b_data  <= rcv(emit_i - 20);
-                        end if;
-                        b_valid <= '1';
-                    elsif rec_ready_i = '1' then
-                        b_valid <= '0';
-                        if emit_i = 23 then
+                    -- Valid stays up between blocks; the data advances on
+                    -- ready. Dropping valid between blocks made this two
+                    -- cycles a block, 24 cycles a macroblock for nothing.
+                    if b_valid = '0' or rec_ready_i = '1' then
+                        if b_valid = '1' and emit_i = 23 then
+                            b_valid <= '0';
                             st <= S_DONE;
                         else
-                            emit_i <= emit_i + 1;
+                            if b_valid = '0' then e := 0; else e := emit_i + 1; end if;
+                            emit_i <= e;
+                            if e < 16 then
+                                b_plane <= to_unsigned(0, 2);
+                                b_idx   <= to_unsigned(e, 4);
+                                b_data  <= r4(e);
+                            elsif e < 20 then
+                                b_plane <= to_unsigned(1, 2);
+                                b_idx   <= to_unsigned(e - 16, 4);
+                                b_data  <= rcu(e - 16);
+                            else
+                                b_plane <= to_unsigned(2, 2);
+                                b_idx   <= to_unsigned(e - 20, 4);
+                                b_data  <= rcv(e - 20);
+                            end if;
+                            b_valid <= '1';
                         end if;
                     end if;
 

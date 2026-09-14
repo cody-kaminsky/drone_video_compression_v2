@@ -172,6 +172,7 @@ begin
         variable e_ncu, e_ncv : integer_vector(0 to 3);
         variable i, j, nvec, bad, blk : integer := 0;
         variable wrong : boolean;
+        variable tagbad : boolean;
         variable base  : integer;
         variable expc  : integer;
         variable got   : integer;
@@ -247,25 +248,27 @@ begin
                         -- The tag as well as the payload: a consumer routes
                         -- on kind, component and position, so a block that is
                         -- right but mislabelled lands in the wrong place.
+                        tagbad := false;
                         if blk = 0 then
-                            if to_integer(bkind) /= 0 then wrong := true; end if;
+                            if to_integer(bkind) /= 0 then tagbad := true; end if;
                             base := -1;
                         elsif blk <= 16 then
-                            if to_integer(bkind) /= 1 then wrong := true; end if;
+                            if to_integer(bkind) /= 1 then tagbad := true; end if;
                             base := to_integer(bpos) * 16;
                         elsif blk <= 18 then
-                            if to_integer(bkind) /= 2 then wrong := true; end if;
-                            if (blk = 18) /= (bcomp = '1') then wrong := true; end if;
+                            if to_integer(bkind) /= 2 then tagbad := true; end if;
+                            if (blk = 18) /= (bcomp = '1') then tagbad := true; end if;
                             base := -2;
                         else
-                            if to_integer(bkind) /= 3 then wrong := true; end if;
-                            if (blk >= 23) /= (bcomp = '1') then wrong := true; end if;
+                            if to_integer(bkind) /= 3 then tagbad := true; end if;
+                            if (blk >= 23) /= (bcomp = '1') then tagbad := true; end if;
                             if to_integer(bpos) /= (blk - 19) mod 4 then
-                                wrong := true;
+                                tagbad := true;
                             end if;
                             base := -3;
                         end if;
-                        if wrong and bad < 10 then
+                        if tagbad then wrong := true; end if;
+                        if tagbad and bad < 10 then
                             report "vector " & integer'image(nvec)
                                  & " block " & integer'image(blk)
                                  & ": wrong tag (kind "

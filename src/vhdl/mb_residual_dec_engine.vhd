@@ -89,7 +89,7 @@ end entity;
 
 architecture rtl of mb_residual_dec_engine is
 
-    type state_t is (S_IDLE, S_SETUP, S_WAIT, S_EMIT, S_DONE);
+    type state_t is (S_IDLE, S_SETUP, S_WAIT, S_FLUSH, S_DONE);
     signal st : state_t := S_IDLE;
 
     type i16_tab is array (0 to 15) of integer range 0 to 3;
@@ -138,6 +138,15 @@ architecture rtl of mb_residual_dec_engine is
     signal err_q  : std_logic := '0';
     signal errc_q : unsigned(3 downto 0) := (others => '0');
 
+    -- The block the engine is working on, so it can be presented when the
+    -- engine finishes even though the NEXT block's setup has by then
+    -- overwritten the engine's inputs.
+    signal cur_kind : unsigned(1 downto 0) := (others => '0');
+    signal cur_comp : std_logic := '0';
+    signal cur_pos  : unsigned(3 downto 0) := (others => '0');
+    -- The engine finished but the consumer had not taken the previous block.
+    signal pend     : std_logic := '0';
+
     -- nC from the two neighbours, spec 9.2.1.1.
     function calc_nc(nb, na : integer; a_top, a_left : boolean) return integer is
     begin
@@ -183,27 +192,140 @@ begin
     end generate;
 
     main_p : process(clk)
-        variable s      : integer range 0 to 15;
-        variable br, bc : integer range 0 to 3;
-        variable pos    : integer range 0 to 15;
-        variable na, nb : integer range 0 to 31;
-        variable a_top  : boolean;
-        variable a_left : boolean;
+        variable l      : lnc_arr;
+        variable cu, cv : cnc_arr;
+        variable k      : unsigned(1 downto 0);
+        variable c      : std_logic;
+        variable ps     : unsigned(3 downto 0);
+        variable ncv    : signed(7 downto 0);
+        variable bt     : block_type_t;
+        variable ncf    : unsigned(4 downto 0);
         variable coded  : boolean;
-        variable ci     : integer range 0 to 3;
-        variable comp   : integer range 0 to 1;
-        variable shifted : std_logic_vector(255 downto 0);
+        variable free   : boolean;
+        variable nxt    : integer range 0 to 27;
+
+        -- Everything about block number s of the 27: its tag, the engine's
+        -- job for it, and whether the coded_block_pattern says it is in the
+        -- stream at all. nC comes from the arrays passed in, which lets the
+        -- caller bypass a count the arrays do not hold yet.
+        procedure setup(s : in integer; l : in lnc_arr; cu, cv : in cnc_arr;
+                        k : out unsigned(1 downto 0); c : out std_logic;
+                        ps : out unsigned(3 downto 0); ncv : out signed(7 downto 0);
+                        bt : out block_type_t; ncf : out unsigned(4 downto 0);
+                        coded : out boolean) is
+            variable si, br, bc, pos : integer range 0 to 15;
+            variable na, nb : integer range 0 to 31;
+            variable a_top, a_left : boolean;
+            variable ci   : integer range 0 to 3;
+            variable comp : integer range 0 to 1;
+        begin
+            na := 0; nb := 0; a_top := false; a_left := false;
+            c := '0'; ps := (others => '0');
+            if s = 0 then
+                -- Luma DC, present for every I_16x16 macroblock whatever the
+                -- coded_block_pattern says. nC from the neighbours of block 0.
+                k := "00"; bt := to_unsigned(BLK_LUMA_DC_16x16, 3);
+                ncf := to_unsigned(16, 5);
+                a_top := (atop = '1'); a_left := (aleft = '1');
+                if a_top  then nb := slice5(nct, 0); end if;
+                if a_left then na := slice5(ncl, 0); end if;
+                coded := (i4 = '0');
+            elsif s <= 16 then
+                si := s - 1; br := SCAN_BR(si); bc := SCAN_BC(si);
+                pos := br * 4 + bc;
+                k := "01"; ps := to_unsigned(pos, 4);
+                if i4 = '1' then
+                    bt := to_unsigned(BLK_LUMA_FULL, 3); ncf := to_unsigned(16, 5);
+                else
+                    bt := to_unsigned(BLK_LUMA_AC, 3);   ncf := to_unsigned(15, 5);
+                end if;
+                a_left := (bc > 0) or (aleft = '1');
+                a_top  := (br > 0) or (atop = '1');
+                if a_left then
+                    if bc > 0 then na := to_integer(l(pos - 1));
+                    else            na := slice5(ncl, br);
+                    end if;
+                end if;
+                if a_top then
+                    if br > 0 then nb := to_integer(l(pos - 4));
+                    else            nb := slice5(nct, bc);
+                    end if;
+                end if;
+                coded := (cbp_l(si / 4) = '1');
+            elsif s <= 18 then
+                -- Chroma DC has no nC of its own and feeds no neighbour.
+                k := "10"; if s = 18 then c := '1'; end if;
+                bt := to_unsigned(BLK_CHROMA_DC, 3); ncf := to_unsigned(4, 5);
+                coded := (cbp_c /= 0);
+            else
+                if s <= 22 then comp := 0; ci := s - 19;
+                else            comp := 1; ci := s - 23;
+                end if;
+                br := ci / 2; bc := ci mod 2;
+                k := "11"; if comp = 1 then c := '1'; end if;
+                ps := to_unsigned(ci, 4);
+                bt := to_unsigned(BLK_CHROMA_AC, 3); ncf := to_unsigned(15, 5);
+                a_left := (bc > 0) or (aleft = '1');
+                a_top  := (br > 0) or (atop = '1');
+                if a_left then
+                    if bc > 0 then
+                        if comp = 0 then na := to_integer(cu(ci - 1));
+                        else             na := to_integer(cv(ci - 1));
+                        end if;
+                    else
+                        if comp = 0 then na := slice5(ncul, br);
+                        else             na := slice5(ncvl, br);
+                        end if;
+                    end if;
+                end if;
+                if a_top then
+                    if br > 0 then
+                        if comp = 0 then nb := to_integer(cu(ci - 2));
+                        else             nb := to_integer(cv(ci - 2));
+                        end if;
+                    else
+                        if comp = 0 then nb := slice5(ncut, bc);
+                        else             nb := slice5(ncvt, bc);
+                        end if;
+                    end if;
+                end if;
+                coded := (cbp_c = 2);
+            end if;
+            if s = 17 or s = 18 then
+                ncv := to_signed(-1, 8);
+            else
+                ncv := to_signed(calc_nc(nb, na, a_top, a_left), 8);
+            end if;
+        end procedure;
+
+        -- Record a finished block's count where its neighbours will look.
+        procedure store(k : in unsigned(1 downto 0); c : in std_logic;
+                        ps : in unsigned(3 downto 0); t : in unsigned(4 downto 0)) is
+        begin
+            if k = "01" then
+                lnc(to_integer(ps)) <= t;
+            elsif k = "11" then
+                if c = '0' then cncu(to_integer(ps(1 downto 0))) <= t;
+                else            cncv(to_integer(ps(1 downto 0))) <= t;
+                end if;
+            end if;
+        end procedure;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
                 st      <= S_IDLE;
                 e_start <= '0';
                 b_valid <= '0';
+                pend    <= '0';
                 err_q   <= '0';
                 errc_q  <= (others => '0');
                 seq     <= 0;
             else
                 e_start <= '0';
+                -- The consumer takes the presented block at this edge, or
+                -- there is none: either way a new one can be presented now.
+                free := (b_valid = '0') or (blk_ready_i = '1');
+                if b_valid = '1' and blk_ready_i = '1' then b_valid <= '0'; end if;
 
                 case st is
 
@@ -223,169 +345,98 @@ begin
                         cncv   <= (others => (others => '0'));
                         err_q  <= '0';
                         errc_q <= (others => '0');
+                        pend   <= '0';
                         seq    <= 0;
                         st     <= S_SETUP;
                     end if;
 
                 ----------------------------------------------------------
-                -- Work out this block's type, size and nC, then either start
-                -- the engine or emit zeros.
+                -- Set up block `seq` from the counts as stored. A coded block
+                -- goes to the engine; an uncoded one is presented as zeros
+                -- right here, one per cycle, and still contributes its 0.
                 when S_SETUP =>
-                    coded := false;
-                    na := 0; nb := 0; a_top := false; a_left := false;
-                    b_comp <= '0';
-                    b_pos  <= (others => '0');
-
-                    if seq = 0 then
-                        -- Luma DC, present for every I_16x16 macroblock
-                        -- whatever the coded_block_pattern says. nC comes from
-                        -- the neighbours of block 0.
-                        b_kind  <= to_unsigned(0, 2);
-                        e_btype <= to_unsigned(BLK_LUMA_DC_16x16, 3);
-                        e_ncoef <= to_unsigned(16, 5);
-                        a_top   := (atop = '1');
-                        a_left  := (aleft = '1');
-                        if a_top  then nb := slice5(nct, 0); end if;
-                        if a_left then na := slice5(ncl, 0); end if;
-                        coded := (i4 = '0');
-
-                    elsif seq <= 16 then
-                        s   := seq - 1;
-                        br  := SCAN_BR(s);
-                        bc  := SCAN_BC(s);
-                        pos := br * 4 + bc;
-                        b_kind <= to_unsigned(1, 2);
-                        b_pos  <= to_unsigned(pos, 4);
-                        if i4 = '1' then
-                            e_btype <= to_unsigned(BLK_LUMA_FULL, 3);
-                            e_ncoef <= to_unsigned(16, 5);
-                        else
-                            e_btype <= to_unsigned(BLK_LUMA_AC, 3);
-                            e_ncoef <= to_unsigned(15, 5);
-                        end if;
-                        a_left := (bc > 0) or (aleft = '1');
-                        a_top  := (br > 0) or (atop = '1');
-                        if a_left then
-                            if bc > 0 then na := to_integer(lnc(pos - 1));
-                            else            na := slice5(ncl, br);
-                            end if;
-                        end if;
-                        if a_top then
-                            if br > 0 then nb := to_integer(lnc(pos - 4));
-                            else            nb := slice5(nct, bc);
-                            end if;
-                        end if;
-                        coded := (cbp_l(s / 4) = '1');
-
-                    elsif seq <= 18 then
-                        -- Chroma DC has no nC of its own and feeds no
-                        -- neighbour: its total_coeff is never stored.
-                        b_kind  <= to_unsigned(2, 2);
-                        if seq = 18 then b_comp <= '1'; else b_comp <= '0'; end if;
-                        e_btype <= to_unsigned(BLK_CHROMA_DC, 3);
-                        e_ncoef <= to_unsigned(4, 5);
-                        coded   := (cbp_c /= 0);
-
-                    else
-                        if seq <= 22 then
-                            comp := 0; ci := seq - 19;
-                        else
-                            comp := 1; ci := seq - 23;
-                        end if;
-                        br := ci / 2;
-                        bc := ci mod 2;
-                        b_kind  <= to_unsigned(3, 2);
-                        if comp = 1 then b_comp <= '1'; else b_comp <= '0'; end if;
-                        b_pos   <= to_unsigned(ci, 4);
-                        e_btype <= to_unsigned(BLK_CHROMA_AC, 3);
-                        e_ncoef <= to_unsigned(15, 5);
-                        a_left := (bc > 0) or (aleft = '1');
-                        a_top  := (br > 0) or (atop = '1');
-                        if a_left then
-                            if bc > 0 then
-                                if comp = 0 then na := to_integer(cncu(ci - 1));
-                                else             na := to_integer(cncv(ci - 1));
-                                end if;
-                            else
-                                if comp = 0 then na := slice5(ncul, br);
-                                else             na := slice5(ncvl, br);
-                                end if;
-                            end if;
-                        end if;
-                        if a_top then
-                            if br > 0 then
-                                if comp = 0 then nb := to_integer(cncu(ci - 2));
-                                else             nb := to_integer(cncv(ci - 2));
-                                end if;
-                            else
-                                if comp = 0 then nb := slice5(ncut, bc);
-                                else             nb := slice5(ncvt, bc);
-                                end if;
-                            end if;
-                        end if;
-                        coded := (cbp_c = 2);
-                    end if;
-
-                    if seq >= 17 and seq <= 18 then
-                        e_nc <= to_signed(-1, 8);      -- chroma DC table
-                    else
-                        e_nc <= to_signed(calc_nc(nb, na, a_top, a_left), 8);
-                    end if;
-
+                    setup(seq, lnc, cncu, cncv, k, c, ps, ncv, bt, ncf, coded);
                     if coded then
-                        e_start <= '1';
-                        st      <= S_WAIT;
-                    else
+                        e_nc <= ncv; e_btype <= bt; e_ncoef <= ncf;
+                        e_start  <= '1';
+                        cur_kind <= k; cur_comp <= c; cur_pos <= ps;
+                        st <= S_WAIT;
+                    elsif free then
+                        b_kind <= k; b_comp <= c; b_pos <= ps;
                         b_total <= (others => '0');
                         b_coefs <= (others => '0');
                         b_valid <= '1';
-                        st      <= S_EMIT;
-                    end if;
-
-                ----------------------------------------------------------
-                when S_WAIT =>
-                    if e_done = '1' then
-                        if e_err = '1' then
-                            err_q  <= '1';
-                            errc_q <= e_errc;
-                            st     <= S_DONE;
-                        else
-                            -- I_16x16 luma AC and chroma AC carry 15
-                            -- coefficients that start at zigzag index 1.
-                            if (seq >= 1 and seq <= 16 and i4 = '0')
-                               or seq >= 19 then
-                                shifted := e_coefs(239 downto 0) & x"0000";
-                            else
-                                shifted := e_coefs;
-                            end if;
-                            b_coefs <= shifted;
-                            b_total <= e_total;
-                            b_valid <= '1';
-                            st      <= S_EMIT;
-                        end if;
-                    end if;
-
-                ----------------------------------------------------------
-                when S_EMIT =>
-                    if blk_ready_i = '1' then
-                        b_valid <= '0';
-                        -- An uncoded block still contributes its 0.
-                        if seq >= 1 and seq <= 16 then
-                            lnc(to_integer(b_pos)) <= b_total;
-                        elsif seq >= 19 and seq <= 22 then
-                            cncu(to_integer(b_pos)) <= b_total;
-                        elsif seq >= 23 then
-                            cncv(to_integer(b_pos)) <= b_total;
-                        end if;
+                        store(k, c, ps, (others => '0'));
                         if seq = 26 then
-                            st <= S_DONE;
+                            st <= S_FLUSH;
                         else
                             seq <= seq + 1;
-                            st  <= S_SETUP;
                         end if;
                     end if;
 
                 ----------------------------------------------------------
+                -- The engine has the block. When it finishes, present the
+                -- result and, in the same cycle, set up the next block with
+                -- this one's count bypassed into the neighbour arithmetic,
+                -- so a coded block follows a coded block with one idle cycle
+                -- rather than three.
+                when S_WAIT =>
+                    if (e_done = '1' or pend = '1') and e_err = '1' then
+                        err_q  <= '1';
+                        errc_q <= e_errc;
+                        pend   <= '0';
+                        st     <= S_DONE;
+                    elsif (e_done = '1' or pend = '1') and free then
+                        pend <= '0';
+                        b_kind <= cur_kind; b_comp <= cur_comp; b_pos <= cur_pos;
+                        b_total <= e_total;
+                        -- I_16x16 luma AC and chroma AC carry 15 coefficients
+                        -- that start at zigzag index 1.
+                        if (cur_kind = "01" and i4 = '0') or cur_kind = "11" then
+                            b_coefs <= e_coefs(239 downto 0) & x"0000";
+                        else
+                            b_coefs <= e_coefs;
+                        end if;
+                        b_valid <= '1';
+                        store(cur_kind, cur_comp, cur_pos, e_total);
+                        if seq = 26 then
+                            st <= S_FLUSH;
+                        else
+                            nxt := seq + 1;
+                            l := lnc; cu := cncu; cv := cncv;
+                            if cur_kind = "01" then
+                                l(to_integer(cur_pos)) := e_total;
+                            elsif cur_kind = "11" then
+                                if cur_comp = '0' then cu(to_integer(cur_pos(1 downto 0))) := e_total;
+                                else                   cv(to_integer(cur_pos(1 downto 0))) := e_total;
+                                end if;
+                            end if;
+                            setup(nxt, l, cu, cv, k, c, ps, ncv, bt, ncf, coded);
+                            seq <= nxt;
+                            if coded then
+                                e_nc <= ncv; e_btype <= bt; e_ncoef <= ncf;
+                                e_start  <= '1';
+                                cur_kind <= k; cur_comp <= c; cur_pos <= ps;
+                            else
+                                st <= S_SETUP;
+                            end if;
+                        end if;
+                    elsif e_done = '1' then
+                        -- Finished, but the previous block is still waiting
+                        -- to be taken. The engine's outputs hold until its
+                        -- next start, so remember and present when free.
+                        pend <= '1';
+                    end if;
+
+                ----------------------------------------------------------
+                -- done_o means every block has been TAKEN, not merely
+                -- presented: the caller reads the counts at done and the
+                -- consumer may still be holding the last block off.
+                when S_FLUSH =>
+                    if b_valid = '0' or blk_ready_i = '1' then
+                        st <= S_DONE;
+                    end if;
+
                 when S_DONE =>
                     st <= S_IDLE;
 
