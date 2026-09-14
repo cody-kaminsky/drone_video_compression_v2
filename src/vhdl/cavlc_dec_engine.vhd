@@ -73,8 +73,23 @@ end entity;
 
 architecture rtl of cavlc_dec_engine is
 
+    -- The magnitude at which the level suffix widens, spec 9.2.2: 3 << (n-1)
+    -- for suffix_length n. Written out as constants rather than computed,
+    -- because computing it puts a variable shift and a multiply in series
+    -- with the level arithmetic that produces the magnitude being compared,
+    -- and that chain was the last path over 5 ns at 200 MHz. Built by the
+    -- same expression it replaces so the two cannot disagree.
+    type suf_thr_t is array (1 to 6) of integer range 0 to 127;
+    function mk_suf_thresh return suf_thr_t is
+        variable r : suf_thr_t;
+    begin
+        for i in 1 to 6 loop r(i) := 3 * 2 ** (i - 1); end loop;
+        return r;
+    end function;
+    constant SUF_THRESH : suf_thr_t := mk_suf_thresh;
+
     type state_t is (S_IDLE, S_TOKEN, S_T1, S_LEVEL_PFX, S_LEVEL_SFX,
-                     S_TZ, S_RUN, S_PLACE, S_DONE);
+                     S_TZ, S_RUN, S_PLACE_INIT, S_PLACE, S_DONE);
     signal st : state_t := S_IDLE;
 
     -- Job
@@ -100,6 +115,16 @@ architecture rtl of cavlc_dec_engine is
     signal lvl_prefix : unsigned(5 downto 0) := (others => '0');
 
     signal coefs_q : std_logic_vector(16 * 16 - 1 downto 0) := (others => '0');
+
+    -- Scatter cursor. The placement walks backwards from the last nonzero
+    -- position, one coefficient per cycle. Doing all sixteen in one cycle is
+    -- the obvious coding and it costs 105 ns of logic: each position is
+    -- computed from the one before it, so it synthesises as a 16-deep chain
+    -- of dependent subtractions feeding sixteen variable writes into a
+    -- 256-bit register. Spreading it costs at most sixteen cycles against the
+    -- sixty or more the block's entropy decode already takes.
+    signal pl_i   : integer range 0 to 15 := 0;
+    signal pl_pos : integer range -32 to 31 := 0;
     signal err_q   : std_logic := '0';
     signal errc_q  : unsigned(3 downto 0) := (others => '0');
 
@@ -130,34 +155,59 @@ architecture rtl of cavlc_dec_engine is
         return 32;
     end function;
 
-    -- The KEY_BITS bits that follow the leading-zero run, including the 1.
-    function key_of(v : unsigned(31 downto 0); z : integer) return integer is
-        variable sh : unsigned(31 downto 0);
+    -- The same count, but only over the bits a table code can occupy. No
+    -- CAVLC code in these tables runs past MAX_LZ leading zeros, so searching
+    -- all 32 bits builds a priority encoder twice the size it needs to be.
+    -- Beyond the range the answer is MAX_LZ, which is where the tables
+    -- already replicate their all-zero codes.
+    function count_lzk(v : unsigned(31 downto 0)) return integer is
     begin
-        if z > 31 - KEY_BITS then return 0; end if;
-        sh := shift_left(v, z);
-        return to_integer(sh(31 downto 32 - KEY_BITS));
+        for i in 31 downto 31 - MAX_LZ loop
+            if v(i) = '1' then return 31 - i; end if;
+        end loop;
+        return MAX_LZ;
     end function;
 
-    -- coeff_token sub-table from nC, mirroring the encoder's selector.
-    function ct_lookup(n : signed(7 downto 0); z : integer; k : integer)
+    -- One table lookup, with the row selected AFTER the read rather than
+    -- before it. Each row's key is a fixed slice of the window, so all
+    -- MAX_LZ + 1 rows can be read at once from constant addresses and the
+    -- leading-zero count only has to pick among the answers. Forming the key
+    -- first and then addressing the table puts the priority encoder, the
+    -- slice select and the table in series, and that chain was the last path
+    -- over 5 ns at 200 MHz.
+    function lookup(t : dec_tab_t; v : unsigned(31 downto 0); z : integer)
         return dec_entry_t is
+        variable e : dec_entry_t := (0, 0);
+    begin
+        for i in 0 to MAX_LZ loop
+            if z = i then
+                e := t(i, to_integer(v(31 - i downto 31 - i - KEY_BITS + 1)));
+            end if;
+        end loop;
+        return e;
+    end function;
+
+
+
+    -- coeff_token sub-table from nC, mirroring the encoder's selector.
+    function ct_lookup(n : signed(7 downto 0); v : unsigned(31 downto 0);
+                       z : integer) return dec_entry_t is
     begin
         if n < 0 then
-            return DEC_COEFF_TOKEN_CHROMA_DC(z, k);
+            return lookup(DEC_COEFF_TOKEN_CHROMA_DC, v, z);
         elsif n < 2 then
-            return DEC_COEFF_TOKEN_NC01(z, k);
+            return lookup(DEC_COEFF_TOKEN_NC01, v, z);
         elsif n < 4 then
-            return DEC_COEFF_TOKEN_NC23(z, k);
+            return lookup(DEC_COEFF_TOKEN_NC23, v, z);
         else
-            return DEC_COEFF_TOKEN_NC47(z, k);
+            return lookup(DEC_COEFF_TOKEN_NC47, v, z);
         end if;
     end function;
 
 begin
 
     lz  <= count_lz(peek_i);
-    lzk <= count_lz(peek_i) when count_lz(peek_i) < MAX_LZ else MAX_LZ;
+    lzk <= count_lzk(peek_i);
 
     ready_o       <= '1' when st = S_IDLE else '0';
     done_o        <= '1' when st = S_DONE else '0';
@@ -168,14 +218,14 @@ begin
 
     main_p : process(clk)
         variable e        : dec_entry_t;
-        variable k        : integer;
-        variable lc       : integer;     -- level_code
-        variable absl     : integer;
-        variable sgn      : integer;
-        variable pos      : integer;
-        variable i        : integer;
-        variable nc8      : integer;
-        variable want     : integer;
+        -- All bounded. An unbounded integer here is a 32-bit datapath, and
+        -- these sit between the bit reader and a register.
+        variable k        : integer range 0 to 63;
+        variable lc       : integer range 0 to 8191;   -- level_code
+        variable absl     : integer range 0 to 4096;
+        variable i        : integer range 0 to 15;
+        variable nc8      : integer range -128 to 127;
+        variable want     : integer range 0 to 32;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
@@ -226,7 +276,7 @@ begin
                                 t1          <= (others => '0');
                                 consume_o   <= '1'; settling <= '1';
                                 consume_n_o <= to_unsigned(6, 6);
-                                st          <= S_PLACE;
+                                st          <= S_PLACE_INIT;
                             elsif k / 4 + 1 > to_integer(n_coefs) then
                                 err_q <= '1'; errc_q <= x"8"; st <= S_DONE;
                             else
@@ -237,7 +287,7 @@ begin
                                 st          <= S_T1;
                             end if;
                         else
-                            e := ct_lookup(nc, lzk, key_of(peek_i, lzk));
+                            e := ct_lookup(nc, peek_i, lzk);
                             if e.len = 0 then
                                 err_q <= '1'; errc_q <= x"2"; st <= S_DONE;
                             elsif e.sym / 4 > to_integer(n_coefs) then
@@ -253,7 +303,7 @@ begin
                                 consume_o   <= '1'; settling <= '1';
                                 consume_n_o <= to_unsigned(e.len, 6);
                                 if e.sym / 4 = 0 then
-                                    st <= S_PLACE;     -- no coefficients
+                                    st <= S_PLACE_INIT;   -- no coefficients
                                 else
                                     st <= S_T1;
                                 end if;
@@ -344,16 +394,25 @@ begin
                         if first_nt1 = '1' and t1 < 3 then lc := lc + 2; end if;
                         first_nt1 <= '0';
 
+                        -- Magnitude and sign, not magnitude times sign: a
+                        -- variable integer sign of -1 or 1 multiplying a
+                        -- 13-bit magnitude synthesises as a real multiplier,
+                        -- eight carry chains deep, and it sat on the critical
+                        -- path at 200 MHz. The low bit of level_code IS the
+                        -- sign, so this is a conditional negate.
                         absl := lc / 2 + 1;
-                        if (lc mod 2) = 1 then sgn := -1; else sgn := 1; end if;
-                        levels(to_integer(idx)) <= to_signed(sgn * absl, 16);
+                        if (lc mod 2) = 1 then
+                            levels(to_integer(idx)) <= -to_signed(absl, 16);
+                        else
+                            levels(to_integer(idx)) <= to_signed(absl, 16);
+                        end if;
 
                         -- Widen the suffix as magnitudes grow, spec 9.2.2.
                         if suffix_len = 0 then
                             suffix_len <= to_unsigned(1, 3);
                             if absl > 3 then suffix_len <= to_unsigned(2, 3); end if;
                         elsif suffix_len < 6 and
-                              absl > (3 * 2 ** (to_integer(suffix_len) - 1)) then
+                              absl > SUF_THRESH(to_integer(suffix_len)) then
                             suffix_len <= suffix_len + 1;
                         end if;
 
@@ -391,11 +450,11 @@ begin
                             -- the first thing in the project to break on that
                             -- disagreement. n_coefs = 4 is unambiguous.
                             if n_coefs = to_unsigned(4, 5) then
-                                e := DEC_TOTAL_ZEROS_CHROMA_DC(
-                                        to_integer(total_coeff) - 1)(lzk, key_of(peek_i, lzk));
+                                e := lookup(DEC_TOTAL_ZEROS_CHROMA_DC(
+                                        to_integer(total_coeff) - 1), peek_i, lzk);
                             else
-                                e := DEC_TOTAL_ZEROS_4x4(
-                                        to_integer(total_coeff) - 1)(lzk, key_of(peek_i, lzk));
+                                e := lookup(DEC_TOTAL_ZEROS_4x4(
+                                        to_integer(total_coeff) - 1), peek_i, lzk);
                             end if;
                             if e.len = 0 then
                                 err_q <= '1'; errc_q <= x"5"; st <= S_DONE;
@@ -417,16 +476,16 @@ begin
                     if avail_i = '1' then
                         if idx + 1 >= total_coeff then
                             runs(to_integer(total_coeff) - 1) <= zeros_left;
-                            st <= S_PLACE;
+                            st <= S_PLACE_INIT;
                         elsif zeros_left = 0 then
                             runs(to_integer(idx)) <= (others => '0');
                             idx <= idx + 1;
                         else
                             if zeros_left > 6 then
-                                e := DEC_RUN_BEFORE(6)(lzk, key_of(peek_i, lzk));
+                                e := lookup(DEC_RUN_BEFORE(6), peek_i, lzk);
                             else
-                                e := DEC_RUN_BEFORE(to_integer(zeros_left) - 1)
-                                        (lzk, key_of(peek_i, lzk));
+                                e := lookup(DEC_RUN_BEFORE(
+                                        to_integer(zeros_left) - 1), peek_i, lzk);
                             end if;
                             if e.len = 0 then
                                 err_q <= '1'; errc_q <= x"7"; st <= S_DONE;
@@ -442,20 +501,29 @@ begin
 
                 ----------------------------------------------------------
                 -- Scatter the levels into zigzag positions. Encoded order is
-                -- highest frequency first, so walk backwards from the last
-                -- nonzero position.
-                when S_PLACE =>
-                    if total_coeff > 0 then
-                        pos := to_integer(total_coeff) + to_integer(tz) - 1;
-                        for i in 0 to 15 loop
-                            if i < to_integer(total_coeff) and pos >= 0 and pos < 16 then
-                                coefs_q(pos * 16 + 15 downto pos * 16) <=
-                                    std_logic_vector(levels(i));
-                                pos := pos - to_integer(runs(i)) - 1;
-                            end if;
-                        end loop;
+                -- highest frequency first, so the walk runs backwards from the
+                -- last nonzero position, one coefficient per cycle.
+                when S_PLACE_INIT =>
+                    pl_i   <= 0;
+                    pl_pos <= to_integer(total_coeff) + to_integer(tz) - 1;
+                    if total_coeff = 0 then
+                        st <= S_DONE;
+                    else
+                        st <= S_PLACE;
                     end if;
-                    st <= S_DONE;
+
+                when S_PLACE =>
+                    if pl_i < to_integer(total_coeff)
+                       and pl_pos >= 0 and pl_pos < 16 then
+                        coefs_q(pl_pos * 16 + 15 downto pl_pos * 16) <=
+                            std_logic_vector(levels(pl_i));
+                        pl_pos <= pl_pos - to_integer(runs(pl_i)) - 1;
+                    end if;
+                    if pl_i = 15 or pl_i + 1 >= to_integer(total_coeff) then
+                        st <= S_DONE;
+                    else
+                        pl_i <= pl_i + 1;
+                    end if;
 
                 ----------------------------------------------------------
                 when S_DONE =>

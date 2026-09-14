@@ -81,9 +81,23 @@ end entity;
 
 architecture rtl of mb_header_dec_engine is
 
-    constant MAX_K : integer := 15;     -- longest Exp-Golomb prefix accepted
+    -- Longest Exp-Golomb prefix this syntax can carry. Every header element
+    -- here is bounded: mb_type at most 24, intra_chroma_pred_mode at most 3,
+    -- coded_block_pattern codeNum at most 47, and mb_qp_delta at most 51 once
+    -- se(v) is mapped, so codeNum never exceeds 62 and the prefix never
+    -- exceeds five zeros. Anything longer is a malformed stream, reported
+    -- rather than decoded.
+    --
+    -- The bound is worth stating in the code rather than left implicit,
+    -- because it is what makes the decode cheap: only the top six bits of the
+    -- window are searched for the terminating one, and the value is a select
+    -- among six fixed bit-slices instead of a 32-bit barrel shift. Searching
+    -- all 32 bits and shifting by an arbitrary amount was the critical path
+    -- of the whole decoder at 200 MHz.
+    constant MAX_K : integer := 5;
 
-    type state_t is (S_IDLE, S_MBTYPE, S_MODES, S_CHROMA, S_CBP, S_QPD, S_DONE);
+    type state_t is (S_IDLE, S_MBTYPE, S_MODES, S_CHROMA, S_CBP, S_CBP_MAP,
+                     S_QPD, S_DONE);
     signal st : state_t := S_IDLE;
 
     type u48_tab is array (0 to 47) of integer range 0 to 47;
@@ -111,6 +125,35 @@ architecture rtl of mb_header_dec_engine is
     constant SCAN_BR : i16_tab := (0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3);
     constant SCAN_BC : i16_tab := (0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3);
 
+    -- mb_type - 1 packs the I_16x16 luma mode, the chroma pattern and a
+    -- single luma-pattern bit. Unpacking it with mod 4, /4 mod 3 and /12
+    -- reads well and synthesises as dividers sitting between the bit reader
+    -- and a register. The same three answers as 24-entry constants cost
+    -- almost nothing, and are built here rather than typed out so they cannot
+    -- disagree with the arithmetic they replace.
+    type mbt24_t is array (0 to 23) of integer range 0 to 3;
+    function mk_mode16 return mbt24_t is
+        variable r : mbt24_t;
+    begin
+        for i in 0 to 23 loop r(i) := i mod 4; end loop;
+        return r;
+    end function;
+    function mk_cbpc return mbt24_t is
+        variable r : mbt24_t;
+    begin
+        for i in 0 to 23 loop r(i) := (i / 4) mod 3; end loop;
+        return r;
+    end function;
+    function mk_cbpl return mbt24_t is
+        variable r : mbt24_t;
+    begin
+        for i in 0 to 23 loop r(i) := i / 12; end loop;
+        return r;
+    end function;
+    constant MBT_MODE16 : mbt24_t := mk_mode16;
+    constant MBT_CBPC   : mbt24_t := mk_cbpc;
+    constant MBT_CBPL   : mbt24_t := mk_cbpl;
+
     -- Job context
     signal qp_in   : unsigned(5 downto 0) := (others => '0');
     signal m4top   : std_logic_vector(15 downto 0) := (others => '0');
@@ -125,6 +168,13 @@ architecture rtl of mb_header_dec_engine is
     signal cbp_l   : unsigned(3 downto 0) := (others => '0');
     signal cbp_c   : unsigned(1 downto 0) := (others => '0');
     signal has_res : std_logic := '0';
+    -- coded_block_pattern arrives as a codeNum and has to be mapped back
+    -- through a 48-entry table. Reading the Exp-Golomb value and doing that
+    -- lookup in one cycle put the whole chain -- priority encoder, value
+    -- select, table, register -- on one path, and it was the critical path of
+    -- the decoder at 200 MHz. The codeNum is registered here and mapped on
+    -- the next cycle, which costs one cycle per macroblock.
+    signal cbp_code : integer range 0 to 63 := 0;
     signal qp_q    : unsigned(5 downto 0) := (others => '0');
     signal nbits   : unsigned(7 downto 0) := (others => '0');
     signal err_q   : std_logic := '0';
@@ -142,22 +192,31 @@ architecture rtl of mb_header_dec_engine is
     -- the first is parsed from stale bits.
     signal settling : std_logic := '0';
 
-    -- Leading zeros of the peek window, which is the Exp-Golomb prefix length.
+    -- Exp-Golomb prefix length: leading zeros before the terminating one,
+    -- searched only over the bits a legal prefix can occupy. MAX_K + 1 means
+    -- no terminating one in range, which is a malformed stream.
     function count_lz(v : unsigned(31 downto 0)) return integer is
     begin
-        for i in 31 downto 0 loop
+        for i in 31 downto 31 - MAX_K loop
             if v(i) = '1' then return 31 - i; end if;
         end loop;
-        return 32;
+        return MAX_K + 1;
     end function;
 
-    -- ue(v) given its prefix length: k zeros, a 1, then k suffix bits.
+    -- ue(v) given its prefix length: k zeros, a 1, then k suffix bits at
+    -- (30 - k) downto (31 - 2k). Written as a select among fixed slices
+    -- rather than a shift, because k is bounded.
     function ue_of(v : unsigned(31 downto 0); k : integer) return integer is
-        variable sh : unsigned(31 downto 0);
     begin
-        if k = 0 then return 0; end if;
-        sh := shift_left(v, k + 1);
-        return 2 ** k - 1 + to_integer(sh(31 downto 32 - k));
+        case k is
+            when 0 => return 0;
+            when 1 => return  1 + to_integer(v(29 downto 29));
+            when 2 => return  3 + to_integer(v(28 downto 27));
+            when 3 => return  7 + to_integer(v(27 downto 25));
+            when 4 => return 15 + to_integer(v(26 downto 23));
+            when 5 => return 31 + to_integer(v(25 downto 21));
+            when others => return 0;
+        end case;
     end function;
 
     function mode_of(v : std_logic_vector; k : integer) return integer is
@@ -165,7 +224,7 @@ architecture rtl of mb_header_dec_engine is
         return to_integer(unsigned(v(4 * k + 3 downto 4 * k)));
     end function;
 
-    signal lz : integer range 0 to 32;
+    signal lz : integer range 0 to MAX_K + 1;
 
 begin
 
@@ -194,8 +253,11 @@ begin
     end generate;
 
     main_p : process(clk)
-        variable k      : integer range 0 to 32;
-        variable v      : integer;
+        variable k      : integer range 0 to MAX_K + 1;
+        -- Bounded, and it matters: an unbounded integer makes the divisions
+        -- in the mb_type decode 32-bit ones. Every value here is a codeNum
+        -- this syntax can actually carry, so 6 bits is the whole range.
+        variable v      : integer range 0 to 63;
         variable s      : integer range 0 to 15;
         variable br, bc : integer range 0 to 3;
         variable mt, ml : integer range 0 to 15;
@@ -266,9 +328,9 @@ begin
                                 i4  <= '0';
                                 -- mb_type - 1 packs mode, cbp_chroma and the
                                 -- single luma bit.
-                                m16 <= to_unsigned((v - 1) mod 4, 2);
-                                cbp_c <= to_unsigned(((v - 1) / 4) mod 3, 2);
-                                if (v - 1) / 12 /= 0 then
+                                m16 <= to_unsigned(MBT_MODE16(v - 1), 2);
+                                cbp_c <= to_unsigned(MBT_CBPC(v - 1), 2);
+                                if MBT_CBPL(v - 1) /= 0 then
                                     cbp_l <= to_unsigned(15, 4);
                                 else
                                     cbp_l <= (others => '0');
@@ -365,18 +427,24 @@ begin
                             if v > 47 then
                                 err_q <= '1'; errc_q <= x"4"; st <= S_DONE;
                             else
-                                cbp_l <= to_unsigned(CODENUM_CBP(v) mod 16, 4);
-                                cbp_c <= to_unsigned(CODENUM_CBP(v) / 16, 2);
-                                used  := 2 * k + 1;
-                                if CODENUM_CBP(v) = 0 then
-                                    has_res <= '0';
-                                    st <= S_DONE;
-                                else
-                                    has_res <= '1';
-                                    st <= S_QPD;
-                                end if;
+                                cbp_code <= v;
+                                used     := 2 * k + 1;
+                                st       <= S_CBP_MAP;
                             end if;
                         end if;
+                    end if;
+
+                ----------------------------------------------------------
+                -- codeNum to coded_block_pattern, on its own cycle.
+                when S_CBP_MAP =>
+                    cbp_l <= to_unsigned(CODENUM_CBP(cbp_code) mod 16, 4);
+                    cbp_c <= to_unsigned(CODENUM_CBP(cbp_code) / 16, 2);
+                    if CODENUM_CBP(cbp_code) = 0 then
+                        has_res <= '0';
+                        st <= S_DONE;
+                    else
+                        has_res <= '1';
+                        st <= S_QPD;
                     end if;
 
                 ----------------------------------------------------------

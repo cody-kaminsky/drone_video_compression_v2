@@ -71,6 +71,9 @@ architecture sim of decoder_top_tb is
 
     signal lfsr : unsigned(15 downto 0) := x"F00D";
     signal starved : integer := 0;
+    -- Cycles the decoder was busy, so the cost of a timing change shows up
+    -- here rather than being argued about.
+    signal busy_cy : integer := 0;
 
 begin
 
@@ -124,8 +127,9 @@ begin
     starve_p : process(clk)
     begin
         if rising_edge(clk) then
-            if rst_n = '1' and busy = '1' and in_valid = '0' then
-                starved <= starved + 1;
+            if rst_n = '1' and busy = '1' then
+                busy_cy <= busy_cy + 1;
+                if in_valid = '0' then starved <= starved + 1; end if;
             end if;
         end if;
     end process;
@@ -274,9 +278,12 @@ begin
                         severity error;
                 else
                     report "PASS - decoder_top: " & integer'image(v_mbw * v_mbh)
-                         & " macroblocks reconstructed sample-exact, "
+                         & " macroblocks reconstructed sample-exact in "
+                         & integer'image(busy_cy) & " cycles, "
+                         & integer'image(busy_cy / (v_mbw * v_mbh))
+                         & " per macroblock ("
                          & integer'image(starved)
-                         & " cycles with no payload byte offered"
+                         & " of them with no payload byte offered)"
                         severity note;
                 end if;
             end if;
