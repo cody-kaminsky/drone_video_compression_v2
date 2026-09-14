@@ -44,7 +44,7 @@ BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 BIN_DEC := $(BUILD)/dcc_decoder
 
-.PHONY: dec dec_test impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: dec dec_test bit_reader_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS) $(BIN_DEC)
 ref: $(BIN_REF)
@@ -282,3 +282,16 @@ dec_test: $(BIN_REF) $(BIN_DEC) tools/frames/old_town_cross_480x272.png
 	@ffmpeg -y -loglevel error -i $(BUILD)/dt.264 -f rawvideo -pix_fmt nv12 $(BUILD)/dt_ff.yuv
 	@cmp $(BUILD)/dt_dec.yuv $(BUILD)/dt_ff.yuv 	  && echo "PASS: decoder reconstruction == ffmpeg" 	  || (echo "FAIL: decoder differs from ffmpeg" && exit 1)
 	@for qp in 10 18 23 26 34 46 51; do 	   $(BIN_REF) $(BUILD)/dt.yuv 480 272 $$qp $(BUILD)/q_enc.yuv $(BUILD)/q.264 > /dev/null; 	   $(BIN_DEC) $(BUILD)/q.264 $(BUILD)/q_dec.yuv > /dev/null; 	   cmp -s $(BUILD)/q_enc.yuv $(BUILD)/q_dec.yuv 	     && echo "PASS: QP $$qp byte-exact" 	     || (echo "FAIL: QP $$qp differs" && exit 1); 	 done
+
+$(BUILD)/gen_bit_reader_vectors: tools/gen_bit_reader_vectors.c $(BUILD)/bitstream.o | $(BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
+
+# Golden vectors for the VHDL bit_reader, from the C bitreader_t the decoder
+# already uses. Also feeds a real slice payload so the block sees the byte
+# statistics it will actually meet.
+bit_reader_vectors: $(BUILD)/bit_reader_vectors.txt
+$(BUILD)/bit_reader_vectors.txt: $(BUILD)/gen_bit_reader_vectors $(BIN_REF)
+	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png 	        -pix_fmt nv12 -f rawvideo $(BUILD)/dt.yuv
+	@DCC_DUMP_SLICE=$(BUILD)/brv_payload.txt $(BIN_REF) $(BUILD)/dt.yuv 480 272 26 > /dev/null
+	@python -c "import sys; d=bytes(int(x) for x in open('$(BUILD)/brv_payload.txt').read().split()); open('$(BUILD)/brv_payload.bin','wb').write(d)"
+	./$< $(BUILD)/brv_payload.bin
