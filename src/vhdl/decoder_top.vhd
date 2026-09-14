@@ -331,29 +331,36 @@ begin
                             byte_of(k_rdata, 7)  & byte_of(k_rdata, 3);
                     end if;
                 else
-                    -- U occupies the low half of the chroma buses, V the high.
+                    -- The chroma buses are NV12-interleaved, not split into a
+                    -- U half and a V half: each of the eight positions takes
+                    -- 16 bits, U in the low byte and V in the high one. Same
+                    -- packing the encoder commits, and the same packing
+                    -- line_buffer hands back as left_u / left_v.
                     if idx >= 2 then
-                        if k_rplane = 1 then
-                            cm_uv_bot((idx - 2) * 32 + 31 downto (idx - 2) * 32) <=
-                                k_rdata(127 downto 96);
-                        else
-                            cm_uv_bot(64 + (idx - 2) * 32 + 31
-                                      downto 64 + (idx - 2) * 32) <=
-                                k_rdata(127 downto 96);
-                        end if;
+                        for j in 0 to 3 loop
+                            if k_rplane = 1 then
+                                cm_uv_bot(16 * ((idx - 2) * 4 + j) + 7
+                                          downto 16 * ((idx - 2) * 4 + j)) <=
+                                    byte_of(k_rdata, 12 + j);
+                            else
+                                cm_uv_bot(16 * ((idx - 2) * 4 + j) + 15
+                                          downto 16 * ((idx - 2) * 4 + j) + 8) <=
+                                    byte_of(k_rdata, 12 + j);
+                            end if;
+                        end loop;
                     end if;
                     if (idx mod 2) = 1 then
-                        if k_rplane = 1 then
-                            cm_uv_right((idx / 2) * 32 + 31
-                                        downto (idx / 2) * 32) <=
-                                byte_of(k_rdata, 15) & byte_of(k_rdata, 11) &
-                                byte_of(k_rdata, 7)  & byte_of(k_rdata, 3);
-                        else
-                            cm_uv_right(64 + (idx / 2) * 32 + 31
-                                        downto 64 + (idx / 2) * 32) <=
-                                byte_of(k_rdata, 15) & byte_of(k_rdata, 11) &
-                                byte_of(k_rdata, 7)  & byte_of(k_rdata, 3);
-                        end if;
+                        for j in 0 to 3 loop
+                            if k_rplane = 1 then
+                                cm_uv_right(16 * ((idx / 2) * 4 + j) + 7
+                                            downto 16 * ((idx / 2) * 4 + j)) <=
+                                    byte_of(k_rdata, 4 * j + 3);
+                            else
+                                cm_uv_right(16 * ((idx / 2) * 4 + j) + 15
+                                            downto 16 * ((idx / 2) * 4 + j) + 8) <=
+                                    byte_of(k_rdata, 4 * j + 3);
+                            end if;
+                        end loop;
                     end if;
                 end if;
             end if;

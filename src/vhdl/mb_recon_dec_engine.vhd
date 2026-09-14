@@ -357,9 +357,21 @@ begin
                         cur_kind <= blk_kind_i;
                         cur_comp <= blk_comp_i;
                         cur_pos  <= blk_pos_i;
+                        -- Zigzag to raster -- except for a chroma DC block,
+                        -- whose four coefficients are already in order and
+                        -- must land in lanes 0..3. Permuting them sends
+                        -- coefficients 2 and 3 to lanes 4 and 8, which the 2x2
+                        -- Hadamard never reads: the block then reconstructs
+                        -- flat and slightly wrong, and only when one of those
+                        -- two is nonzero.
                         for k in 0 to 15 loop
-                            lev(ZIGZAG(k)) <= resize(signed(
-                                blk_coefs_i(k * 16 + 15 downto k * 16)), 32);
+                            if blk_kind_i = 2 then
+                                lev(k) <= resize(signed(
+                                    blk_coefs_i(k * 16 + 15 downto k * 16)), 32);
+                            else
+                                lev(ZIGZAG(k)) <= resize(signed(
+                                    blk_coefs_i(k * 16 + 15 downto k * 16)), 32);
+                            end if;
                         end loop;
                         -- Luma blocks arrive in scan order; the scan index is
                         -- what the above-right rule is stated in terms of.

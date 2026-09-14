@@ -44,7 +44,7 @@ BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 BIN_DEC := $(BUILD)/dcc_decoder
 
-.PHONY: dec dec_test bit_reader_vectors cavlc_dec_tables cavlc_dec_vectors mb_header_dec_vectors mb_residual_dec_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: dec dec_test bit_reader_vectors cavlc_dec_tables cavlc_dec_vectors mb_header_dec_vectors mb_residual_dec_vectors decoder_frame_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS) $(BIN_DEC)
 ref: $(BIN_REF)
@@ -332,3 +332,21 @@ $(BUILD)/gen_mb_residual_dec_vectors: tools/gen_mb_residual_dec_vectors.c $(SHAR
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^ $(LDLIBS)
 $(BUILD)/mb_residual_dec_vectors.txt: $(BUILD)/gen_mb_residual_dec_vectors
 	./$<
+
+# A whole frame for decoder_top. The payload is the encoder's own
+# DCC_DUMP_SLICE output, byte for byte what mb_pipeline_controller emits; the
+# expectation is the C decoder's reconstruction of that same stream, which
+# dec_test already shows byte-exact against the encoder and against ffmpeg.
+# Written per 4x4 block so a failure names the first block that differs: in
+# an intra frame one wrong sample propagates into everything that predicts
+# from it, and the visible damage starts far from the cause.
+# QP sweeps the vector set over the space the decoder actually meets: a low
+# QP fills blocks with the long level codes and the escape prefixes, a high
+# one empties them so almost every coded_block_pattern bit is zero.
+DFV_QP ?= 26
+decoder_frame_vectors: $(BUILD)/decoder_frame_vectors.txt
+$(BUILD)/decoder_frame_vectors.txt: $(BIN_REF) $(BIN_DEC) tools/gen_decoder_frame_vectors.py tools/frames/old_town_cross_480x272.png
+	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png -pix_fmt nv12 -f rawvideo $(BUILD)/dfv.yuv
+	@DCC_DUMP_SLICE=$(BUILD)/dfv_payload.txt $(BIN_REF) $(BUILD)/dfv.yuv 480 272 $(DFV_QP) $(BUILD)/dfv_recon.yuv $(BUILD)/dfv.264 > /dev/null
+	@$(BIN_DEC) $(BUILD)/dfv.264 $(BUILD)/dfv_dec.yuv > /dev/null
+	python tools/gen_decoder_frame_vectors.py 480 272 $(DFV_QP) $(BUILD)/dfv_payload.txt $(BUILD)/dfv_dec.yuv $@
