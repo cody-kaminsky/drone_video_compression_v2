@@ -78,12 +78,22 @@ def build(entries, label):
         # Every key whose top tail_len bits equal tail resolves to this symbol.
         span = 1 << (KEY_BITS - tail_len)
         base = tail * span
-        for j in range(span):
-            prev = tab[lz][base + j]
-            if prev[1] != 0 and prev != (sym, length):
-                raise SystemExit("%s: key (lz=%d,%d) claimed by two codes"
-                                 % (label, lz, base + j))
-            tab[lz][base + j] = (sym, length)
+        # A code that is ALL zeros has no terminating 1, so a window that
+        # matches it can carry on into the next symbol's zeros and present a
+        # leading-zero count larger than the code's own. Such a code is a
+        # prefix of any longer zero run, so in a prefix-free table it is the
+        # only code with that many leading zeros or more: replicate it up the
+        # rows so any longer run still resolves to it. Without this, every
+        # block whose last run_before is the one-bit "0" fails, and it fails
+        # at the very end of the block where the cause is least visible.
+        rows = range(lz, MAX_LZ + 1) if tail_len == 0 else (lz,)
+        for row in rows:
+            for j in range(span):
+                prev = tab[row][base + j]
+                if prev[1] != 0 and prev != (sym, length):
+                    raise SystemExit("%s: key (lz=%d,%d) claimed by two codes"
+                                     % (label, row, base + j))
+                tab[row][base + j] = (sym, length)
     return tab
 
 
