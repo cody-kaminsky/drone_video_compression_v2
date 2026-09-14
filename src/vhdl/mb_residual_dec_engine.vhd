@@ -76,12 +76,14 @@ entity mb_residual_dec_engine is
         done_o       : out std_logic;
         err_o        : out std_logic;
         err_code_o   : out unsigned(3 downto 0);
-        nc_bot_o     : out unsigned(19 downto 0);
-        nc_right_o   : out unsigned(19 downto 0);
-        ncu_bot_o    : out unsigned(9 downto 0);
-        ncu_right_o  : out unsigned(9 downto 0);
-        ncv_bot_o    : out unsigned(9 downto 0);
-        ncv_right_o  : out unsigned(9 downto 0)
+        -- total_coeff of every block in the macroblock, packed exactly as
+        -- line_buffer's commit ports expect: raster order, entry k at
+        -- (5k+4 downto 5k). The line buffer derives the row and column the
+        -- neighbours need, so handing it the edges separately would be a
+        -- second chance to pack them wrongly.
+        nc_y_o       : out std_logic_vector(79 downto 0);
+        nc_u_o       : out std_logic_vector(19 downto 0);
+        nc_v_o       : out std_logic_vector(19 downto 0)
     );
 end entity;
 
@@ -172,15 +174,13 @@ begin
     blk_total_o <= b_total;
     blk_coefs_o <= b_coefs;
 
-    -- The macroblock's bottom row and right column, for the caller's line
-    -- buffer. Luma blocks are indexed raster, so the bottom row is 12..15 by
-    -- column and the right column is 3,7,11,15 by row.
-    nc_bot_o   <= lnc(15) & lnc(14) & lnc(13) & lnc(12);
-    nc_right_o <= lnc(15) & lnc(11) & lnc(7)  & lnc(3);
-    ncu_bot_o  <= cncu(3) & cncu(2);
-    ncu_right_o<= cncu(3) & cncu(1);
-    ncv_bot_o  <= cncv(3) & cncv(2);
-    ncv_right_o<= cncv(3) & cncv(1);
+    g_nc : for i in 0 to 15 generate
+        nc_y_o(5 * i + 4 downto 5 * i) <= std_logic_vector(lnc(i));
+    end generate;
+    g_ncc : for i in 0 to 3 generate
+        nc_u_o(5 * i + 4 downto 5 * i) <= std_logic_vector(cncu(i));
+        nc_v_o(5 * i + 4 downto 5 * i) <= std_logic_vector(cncv(i));
+    end generate;
 
     main_p : process(clk)
         variable s      : integer range 0 to 15;

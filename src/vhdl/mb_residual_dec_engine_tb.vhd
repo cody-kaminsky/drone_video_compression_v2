@@ -69,9 +69,9 @@ architecture sim of mb_residual_dec_engine_tb is
     signal done_o : std_logic;
     signal err_o  : std_logic;
     signal errc_o : unsigned(3 downto 0);
-    signal ncbot, ncright   : unsigned(19 downto 0);
-    signal ncubot, ncuright : unsigned(9 downto 0);
-    signal ncvbot, ncvright : unsigned(9 downto 0);
+    signal ncy_o : std_logic_vector(79 downto 0);
+    signal ncu_o : std_logic_vector(19 downto 0);
+    signal ncv_o : std_logic_vector(19 downto 0);
 
     type byte_arr is array (0 to 2047) of integer;
     shared variable vbytes : byte_arr;
@@ -110,9 +110,7 @@ begin
                   blk_pos_o => bpos, blk_total_o => btotal,
                   blk_coefs_o => bcoefs,
                   done_o => done_o, err_o => err_o, err_code_o => errc_o,
-                  nc_bot_o => ncbot, nc_right_o => ncright,
-                  ncu_bot_o => ncubot, ncu_right_o => ncuright,
-                  ncv_bot_o => ncvbot, ncv_right_o => ncvright);
+                  nc_y_o => ncy_o, nc_u_o => ncu_o, nc_v_o => ncv_o);
 
     ----------------------------------------------------------------------
     feed_p : process(clk)
@@ -369,32 +367,32 @@ begin
                                  & " blocks, expected 27" severity error;
                         end if;
                     end if;
-                    -- The macroblock's edge counts, which the next macroblock
-                    -- and the next row read.
-                    for i in 0 to 3 loop
-                        if to_integer(ncbot(5 * i + 4 downto 5 * i)) /= e_nc(12 + i)
-                           or to_integer(ncright(5 * i + 4 downto 5 * i))
-                              /= e_nc(i * 4 + 3) then
+                    -- The counts the macroblock hands on, in the packing
+                    -- line_buffer's commit ports expect.
+                    for i in 0 to 15 loop
+                        if to_integer(unsigned(ncy_o(5 * i + 4 downto 5 * i)))
+                           /= e_nc(i) then
                             wrong := true;
                             if bad < 10 then
                                 report "vector " & integer'image(nvec)
-                                     & ": luma edge nC " & integer'image(i)
-                                     & " wrong" severity error;
+                                     & ": luma nC " & integer'image(i)
+                                     & " expected " & integer'image(e_nc(i))
+                                     & " got " & integer'image(to_integer(
+                                           unsigned(ncy_o(5*i+4 downto 5*i))))
+                                    severity error;
                             end if;
                             exit;
                         end if;
                     end loop;
-                    for i in 0 to 1 loop
-                        if to_integer(ncubot(5 * i + 4 downto 5 * i)) /= e_ncu(2 + i)
-                           or to_integer(ncuright(5 * i + 4 downto 5 * i))
-                              /= e_ncu(i * 2 + 1)
-                           or to_integer(ncvbot(5 * i + 4 downto 5 * i)) /= e_ncv(2 + i)
-                           or to_integer(ncvright(5 * i + 4 downto 5 * i))
-                              /= e_ncv(i * 2 + 1) then
+                    for i in 0 to 3 loop
+                        if to_integer(unsigned(ncu_o(5 * i + 4 downto 5 * i)))
+                           /= e_ncu(i)
+                           or to_integer(unsigned(ncv_o(5 * i + 4 downto 5 * i)))
+                              /= e_ncv(i) then
                             wrong := true;
                             if bad < 10 then
                                 report "vector " & integer'image(nvec)
-                                     & ": chroma edge nC " & integer'image(i)
+                                     & ": chroma nC " & integer'image(i)
                                      & " wrong" severity error;
                             end if;
                             exit;
