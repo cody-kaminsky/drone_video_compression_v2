@@ -42,11 +42,13 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
+BIN_DEC := $(BUILD)/dcc_decoder
 
-.PHONY: impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: dec dec_test impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
-all: $(BIN_REF) $(BIN_HLS)
+all: $(BIN_REF) $(BIN_HLS) $(BIN_DEC)
 ref: $(BIN_REF)
+dec: $(BIN_DEC)
 hls: $(BIN_HLS)
 vectors: $(BUILD)/gen_cavlc_vectors
 bit_packer_vectors: $(BUILD)/bit_packer_vectors_in.txt
@@ -250,3 +252,33 @@ SEQOUT  ?= $(BUILD)/seq_board
 
 board_seq: $(BIN_REF) $(BUILD)/gen_stream_frame
 	python tools/gen_board_sequence.py $(SEQ) $(W) $(H) $(QP) 	    --frames $(FRAMES) --repeats $(REPEATS) --out $(SEQOUT)
+
+# --------------------------------------------------------------- decoder ---
+# A decoder matched to this encoder: Baseline, intra only, CAVLC, no deblock.
+# It reuses the encoder's own prediction, inverse transform, dequant and CAVLC
+# block decode, so it tests the bitstream layer rather than the kernels. For
+# kernel-level confirmation there is still ffmpeg, which shares no code.
+DEC_DIR  := $(SRC_DIR)/dec
+DEC_SRCS := $(DEC_DIR)/decoder.c $(DEC_DIR)/dec_nal.c $(DEC_DIR)/main.c
+DEC_OBJS := $(patsubst $(DEC_DIR)/%.c,$(BUILD)/dec/%.o,$(DEC_SRCS))
+
+$(BIN_DEC): $(SHARED_OBJS) $(DEC_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+$(BUILD)/dec/%.o: $(DEC_DIR)/%.c | $(BUILD)/dec
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -I$(DEC_DIR) -c -o $@ $<
+
+$(BUILD)/dec:
+	@mkdir -p $(BUILD)/dec
+
+# Encode a frame, decode it back, and require the decoder's reconstruction to
+# equal the encoder's byte for byte. Then do the same through ffmpeg, which
+# shares no code with either.
+dec_test: $(BIN_REF) $(BIN_DEC) tools/frames/old_town_cross_480x272.png
+	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png 	        -pix_fmt nv12 -f rawvideo $(BUILD)/dt.yuv
+	$(BIN_REF) $(BUILD)/dt.yuv 480 272 26 $(BUILD)/dt_enc_recon.yuv $(BUILD)/dt.264 > /dev/null
+	$(BIN_DEC) $(BUILD)/dt.264 $(BUILD)/dt_dec.yuv
+	@cmp $(BUILD)/dt_enc_recon.yuv $(BUILD)/dt_dec.yuv 	  && echo "PASS: decoder reconstruction == encoder reconstruction" 	  || (echo "FAIL: decoder differs from the encoder" && exit 1)
+	@ffmpeg -y -loglevel error -i $(BUILD)/dt.264 -f rawvideo -pix_fmt nv12 $(BUILD)/dt_ff.yuv
+	@cmp $(BUILD)/dt_dec.yuv $(BUILD)/dt_ff.yuv 	  && echo "PASS: decoder reconstruction == ffmpeg" 	  || (echo "FAIL: decoder differs from ffmpeg" && exit 1)
+	@for qp in 10 18 23 26 34 46 51; do 	   $(BIN_REF) $(BUILD)/dt.yuv 480 272 $$qp $(BUILD)/q_enc.yuv $(BUILD)/q.264 > /dev/null; 	   $(BIN_DEC) $(BUILD)/q.264 $(BUILD)/q_dec.yuv > /dev/null; 	   cmp -s $(BUILD)/q_enc.yuv $(BUILD)/q_dec.yuv 	     && echo "PASS: QP $$qp byte-exact" 	     || (echo "FAIL: QP $$qp differs" && exit 1); 	 done
