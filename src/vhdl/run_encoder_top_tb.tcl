@@ -3,7 +3,7 @@
 foreach f {cavlc_pkg cavlc_tables cavlc_vlc_rom coeff_token_encoder bit_packer cavlc_engine
            cavlc_dispatch transform_engine quant_engine predict_4x4_engine predict_16x16_engine
            predict_chroma_engine cavlc_cost_engine_ll recon_engine mode_decide_engine
-           line_buffer mb_header_engine mb_pipeline_controller frame_io encoder_top encoder_top_tb} {
+           line_buffer mb_header_engine rc_mb_engine mb_pipeline_controller frame_io encoder_top encoder_top_tb} {
     xvhdl --2008 src/vhdl/$f.vhd
 }
 exec xelab encoder_top_tb -snapshot encoder_top_snap -debug typical

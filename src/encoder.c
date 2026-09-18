@@ -109,6 +109,34 @@ static int ilog2_x6(double r)             /* round(6 * log2(r)) */
     return (int)(v > 0 ? v + 0.5 : v - 0.5);
 }
 
+/* Hardware model of the per-MB QP step (rc_mb == 3): the integer arithmetic
+ * of rc_mb_engine.vhd, bit for bit.
+ *   round(6 log2(spent / expect)) as a threshold count: RC_T12[j] =
+ *   round(4096 * 2^((j - 15.5) / 6)) for j = 0..31, A = -16 + #{j : spent
+ *   * 4096 >= expect * RC_T12[j]} (A = 0 at spent == expect, 6 at 2x).
+ *   trunc(4 (spent - expect) / target) as |4e| / target capped at 15. */
+static const u32 RC_T12[32] = {
+    683, 767, 861, 967, 1085, 1218, 1367, 1534, 1722, 1933, 2170, 2435, 2734, 3069, 3444, 3866,
+    4340, 4871, 5468, 6137, 6889, 7732, 8679, 9742, 10935, 12274, 13777, 15464, 17358, 19484, 21870, 24548 };
+
+static int rc_hw_log2x6(u32 spent, u32 expect)
+{
+    int a = -16;
+    for (int j = 0; j < 32; j++)
+        if (((uint64_t)spent << 12) >= (uint64_t)expect * RC_T12[j]) a = j - 15; else break;
+    return a;
+}
+
+static int rc_hw_div4(int64_t e, u32 target)
+{
+    uint64_t m = (uint64_t)(e < 0 ? -e : e) * 4;
+    uint64_t b = target ? m / target : 15;
+    if (b > 15) b = 15;
+    return e < 0 ? -(int)b : (int)b;
+}
+
+static int dump_idx = 0;                  /* frame index for the *_SEQ dumps */
+
 /* ===== local helpers ===== */
 
 static int clip_u8(int x)
@@ -1897,7 +1925,9 @@ static int encode_mb_p(const u8 *src_y,  int stride_y,
         if (ps) { if (w->is_skip) ps->mbs_skip++; else ps->mbs_inter++; }
     }
     dk->qp = (u8)(emits_delta ? qp_y : *qp_prev);
+    /* mb_qp_delta is in [-26, 25] (7.4.5); the decoder adds it mod 52 */
     int qp_delta = qp_y - *qp_prev;
+    if (qp_delta > 25) qp_delta -= 52; else if (qp_delta < -26) qp_delta += 52;
     if (emits_delta) *qp_prev = qp_y;
 
     copy_out_mb_luma(recon_y, recon_stride_y, mb_r, mb_c, w->recon_y);
@@ -1988,7 +2018,7 @@ int encode_frame_h264(int width, int height, int qp,
                       u8 *bs_out, int bs_max_size, int frame_num,
                       encode_stats_t *stats)
 {
-    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1, 0, 30, 0, 51, 4, 1, 1, 1 };
+    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1, 0, 30, 0, 51, 4, 1, 1, 1, 0 };
     return encode_frame_h264_ext(width, height, qp, src_y, stride_y, src_uv, stride_uv,
                                  recon_y_out, recon_stride_y, recon_uv_out, recon_stride_uv,
                                  bs_out, bs_max_size, &cfg, stats, NULL);
@@ -2087,6 +2117,36 @@ int encode_frame_h264_ext(int width, int height, int qp,
         for (int i = 0; i < rc.prev_mbs; i++) rc_w_total += arena_mb_bits[i];
     }
     qp = qp_frame;
+    if (cfg->rc_reset) dump_idx = 0;
+
+    /* Hardware model (rc_mb == 3): what the host computes once per frame and
+     * writes to the kernel's RC registers. The map weights are the previous
+     * frame's per-MB bits saturated to 16 bits (what the kernel stores), or 1
+     * per MB when there is no usable map; scale = target * 2^16 / w_total. */
+    int      hw_lag = cfg->rc_lag > 0 ? cfg->rc_lag : 2;
+    int      hw_map = (rc_on && cfg->rc_mb == 3 && rc.prev_mbs == mb_count);
+    uint64_t hw_wtotal = 0;
+    u32      hw_scale = 0;
+    if (rc_on && cfg->rc_mb == 3) {
+        if (hw_map) for (int i = 0; i < mb_count; i++) hw_wtotal += arena_mb_bits[i] > 65535 ? 65535 : arena_mb_bits[i];
+        else hw_wtotal = mb_count;
+        if (hw_wtotal == 0) hw_wtotal = 1;
+        uint64_t s = ((uint64_t)frame_target << 16) / hw_wtotal;
+        hw_scale = s > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)s;
+    }
+    /* DCC_DUMP_RC=<path>: append the per-frame register values the host
+     * writes to the kernel -- qp_frame target scale(hex) qp_min qp_max
+     * map_valid lag en -- for the AXI testbench to replay. */
+    if (rc_on) {
+        const char *rp = getenv("DCC_DUMP_RC");
+        if (rp) {
+            FILE *rf = fopen(rp, "a");
+            if (rf) { fprintf(rf, "%d %ld %08X %d %d %d %d %d\n", qp_frame, frame_target, hw_scale,
+                              cfg->rc_qp_min, cfg->rc_qp_max, hw_map, hw_lag, cfg->rc_mb == 3); fclose(rf); }
+        }
+    }
+    FILE *mbqp_f = NULL;
+    { const char *mp = getenv("DCC_DUMP_MBQP"); if (mp) mbqp_f = fopen(mp, "a"); }
 
     /* === Slice RBSP === */
     bitstream_t bs;
@@ -2164,12 +2224,35 @@ int encode_frame_h264_ext(int width, int height, int qp,
     int qp_mb = qp;
     long qp_sum = 0; int qp_lo = qp, qp_hi = qp;
     double w_cum = 0;
+    u32 hw_spent = 0; uint64_t hw_acc = 0;
     for (int r = 0; r < mbs_h; r++) {
         for (int c = 0; c < mbs_w; c++) {
             int i = r * mbs_w + c;
             long bits_before = bs.byte_pos * 8L + bs.n_in_cur;
             /* ---- MB QP from the spend so far vs the expected spend ---- */
-            if (rc_on && cfg->rc_mb && i > 0) {
+            if (rc_on && cfg->rc_mb == 3) {
+                /* Hardware model: the kernel knows the bits of MB k only once
+                 * the merger has emitted it, which is hw_lag MBs behind the
+                 * decision, so MB i is stepped on the bits through MB i-1-lag
+                 * and the map weights through the same MB. */
+                if (i > hw_lag) {
+                    int k = i - 1 - hw_lag;
+                    u32 wk = hw_map ? (arena_mb_bits[k] > 65535 ? 65535 : arena_mb_bits[k]) : 1;
+                    hw_spent += arena_mb_bits_cur[k];
+                    hw_acc   += (uint64_t)wk * hw_scale;
+                    uint64_t expect64 = hw_acc >> 16;
+                    u32 expect = expect64 > 0xFFFFFFFFu ? 0xFFFFFFFFu : (u32)expect64;
+                    int adj = 0;
+                    if ((uint64_t)expect * 100 > (uint64_t)frame_target && hw_spent > 0)
+                        adj = rc_hw_log2x6(hw_spent, expect)
+                            + rc_hw_div4((int64_t)hw_spent - (int64_t)expect, (u32)frame_target);
+                    int qp_target = qp_frame + adj;
+                    if (qp_target < cfg->rc_qp_min) qp_target = cfg->rc_qp_min;
+                    if (qp_target > cfg->rc_qp_max) qp_target = cfg->rc_qp_max;
+                    if (qp_target > qp_mb) qp_mb++; else if (qp_target < qp_mb) qp_mb--;
+                }
+                if (mbqp_f) fprintf(mbqp_f, "%d %d %d\n", dump_idx, i, qp_mb);
+            } else if (rc_on && cfg->rc_mb && i > 0) {
                 long spent = bits_before - payload_start_bit;
                 double expect;
                 if (rc.prev_mbs == mb_count && rc_w_total > 0 && cfg->rc_mb == 1) expect = (double)frame_target * (w_cum / rc_w_total);
@@ -2237,6 +2320,10 @@ int encode_frame_h264_ext(int width, int height, int qp,
      * per line. */
     {
         const char *dp = getenv("DCC_DUMP_SLICE");
+        const char *dps = getenv("DCC_DUMP_SLICE_SEQ");   /* <prefix><frame>.txt, one per frame */
+        char dpath[512];
+        if (!dp && dps) { snprintf(dpath, sizeof dpath, "%s%d.txt", dps, dump_idx); dp = dpath; }
+        if (mbqp_f) fclose(mbqp_f);
         if (dp) {
             FILE *df = fopen(dp, "w");
             int end_bit = bs.byte_pos * 8 + bs.n_in_cur;
@@ -2297,5 +2384,6 @@ int encode_frame_h264_ext(int width, int height, int qp,
         stats->bpp       = 0.0;
     }
 
+    dump_idx++;
     return 0;
 }

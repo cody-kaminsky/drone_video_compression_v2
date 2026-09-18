@@ -2,10 +2,12 @@
 """Write the frame_io input stream for an NV12 frame: per MB row, 16 luma
 lines then 8 chroma lines, 4 bytes per beat, one beat per line as an
 8-digit hex 32-bit little-endian word (byte 0 in bits 7:0).
-Usage: gen_frame_stream.py <in.yuv> <width> <height> <out.txt>"""
+Usage: gen_frame_stream.py <in.yuv> <width> <height> <out.txt> [frame]"""
 import sys
 path, w, h, out = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-data = open(path, "rb").read()
+frame = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+fsz = w * h * 3 // 2
+data = open(path, "rb").read()[frame * fsz : (frame + 1) * fsz]
 y = data[: w * h]
 uv = data[w * h : w * h + w * (h // 2)]
 with open(out, "w") as f:

@@ -43,7 +43,7 @@ HLS_OBJS := $(patsubst $(HLS_DIR)/%.c,$(BUILD)/hls/%.o,$(HLS_SRCS))
 BIN_REF := $(BUILD)/dcc_encoder
 BIN_HLS := $(BUILD)/dcc_hls
 
-.PHONY: impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
+.PHONY: rc_vectors impl_ooc host_test ip ip_check zybo board_vectors board_seq_tools board_seq all ref hls clean test vectors bit_packer_vectors transform_vectors quant_vectors predict_vectors cavlc_cost_vectors recon_vectors line_buffer_vectors mb_header_vectors dispatch_vectors mode_decide_vectors pipeline_vectors
 
 all: $(BIN_REF) $(BIN_HLS)
 ref: $(BIN_REF)
@@ -196,7 +196,7 @@ host_test: $(BUILD)/test_assemble $(BIN_REF) tools/frames/old_town_cross_480x272
 	@ffmpeg -y -loglevel error -i tools/frames/old_town_cross_480x272.png \
 	        -pix_fmt nv12 -f rawvideo $(BUILD)/md_frame.yuv
 	@DCC_DUMP_SLICE=$(BUILD)/ht_payload.txt $(BIN_REF) $(BUILD)/md_frame.yuv 480 272 26 \
-	        $(BUILD)/ht_recon.yuv $(BUILD)/ht_ref.264 > /dev/null
+	        $(BUILD)/ht_recon.yuv $(BUILD)/ht_ref.264 --no-deblock > /dev/null
 	@python tools/gen_frame_stream.py $(BUILD)/md_frame.yuv 480 272 $(BUILD)/ht_stream.txt > /dev/null
 	./$(BUILD)/test_assemble $(BUILD)/md_frame.yuv 480 272 26 \
 	        $(BUILD)/ht_payload.txt $(BUILD)/ht_stream.txt $(BUILD)/ht_ref.264
@@ -250,3 +250,18 @@ SEQOUT  ?= $(BUILD)/seq_board
 
 board_seq: $(BIN_REF) $(BUILD)/gen_stream_frame
 	python tools/gen_board_sequence.py $(SEQ) $(W) $(H) $(QP) 	    --frames $(FRAMES) --repeats $(REPEATS) --out $(SEQOUT)
+
+# ------------------------------------------------------- rate control ---
+# Vectors for encoder_axi_top_rc_tb: RC_SEQ is a raw NV12 file (foreman CIF,
+# 352x288, is what the numbers in docs/rate-control-rtl.md were taken on);
+# rc_vectors writes build/rc_hw (per-MB QP in the kernel) and build/rc_off
+# (frame QP only, the same frames). Copy one config.txt to build/rc_tb/ and
+# run src/vhdl/run_encoder_axi_top_rc_tb.tcl.
+RC_SEQ ?= build/rc_src.yuv
+RC_W   ?= 352
+RC_H   ?= 288
+RC_N   ?= 3
+RC_OPTS ?= --bitrate 3000000 --qp-min 16 --qp-max 40
+rc_vectors: $(BIN_REF) tools/gen_rc_vectors.sh
+	bash tools/gen_rc_vectors.sh $(RC_SEQ) $(RC_W) $(RC_H) $(RC_N) $(BUILD)/rc_hw hw $(RC_OPTS)
+	bash tools/gen_rc_vectors.sh $(RC_SEQ) $(RC_W) $(RC_H) $(RC_N) $(BUILD)/rc_off off $(RC_OPTS)

@@ -50,6 +50,7 @@ entity mb_pipeline_controller is
         N_ENGINES   : positive := 1;
         PKT_DEPTH   : positive := 32;
         ORDER_DEPTH : positive := 64;
+        MAX_MBS     : positive := 8192;
         DEBUG       : boolean  := false
     );
     port (
@@ -62,6 +63,15 @@ entity mb_pipeline_controller is
         qp_i          : in  unsigned(5 downto 0);
         busy_o        : out std_logic;
         frame_done_o  : out std_logic;
+        -- per-MB rate control (rc_mb_engine); the defaults give one QP per frame
+        rc_en_i        : in  std_logic := '0';
+        rc_map_valid_i : in  std_logic := '0';
+        rc_qp_min_i    : in  unsigned(5 downto 0) := (others => '0');
+        rc_qp_max_i    : in  unsigned(5 downto 0) := (others => '1');
+        rc_target_i    : in  unsigned(31 downto 0) := (others => '0');
+        rc_scale_i     : in  unsigned(31 downto 0) := (others => '0');
+        rc_lag_i       : in  unsigned(3 downto 0) := to_unsigned(2, 4);
+        rc_wtotal_o    : out unsigned(31 downto 0);
         -- source MB stream (24 x 128-bit words per MB, raster MB order)
         src_valid_i   : in  std_logic;
         src_ready_o   : out std_logic;
@@ -175,6 +185,17 @@ architecture rtl of mb_pipeline_controller is
     signal cbpc_q : unsigned(1 downto 0) := (others => '0');
 
     ------------------------------------------------------------------
+    -- per-MB QP
+    ------------------------------------------------------------------
+    signal qp_frame_q : unsigned(5 downto 0) := (others => '0');   -- the slice QP
+    signal cur_qp     : unsigned(5 downto 0) := (others => '0');   -- QP of the MB being decided
+    signal d_qp       : unsigned(5 downto 0) := (others => '0');   -- QP of the MB being emitted
+    signal rc_qp      : unsigned(5 downto 0);
+    signal rc_qp_valid, rc_take : std_logic := '0';
+    signal dp_push_valid, dp_mb_end : std_logic;
+    signal dp_push_len : unsigned(5 downto 0);
+
+    ------------------------------------------------------------------
     -- dispatcher
     ------------------------------------------------------------------
     signal dp_valid, dp_ready, dp_flushed : std_logic;
@@ -194,7 +215,7 @@ architecture rtl of mb_pipeline_controller is
     type st_t is (S_IDLE, S_WAIT_BANK, S_ROW, S_FETCH, S_FETCH_WAIT, S_START, S_SRC_PRE, S_SRC, S_WAIT_MD,
                   S_WAIT_REC, S_STOP, S_FLUSH, S_FLUSH_WAIT);
     signal st : st_t := S_IDLE;
-    type est_t is (E_IDLE, E_HDR, E_HDR_WAIT, E_LEVELS, E_LEVEL_BUILD, E_LEVEL_PUSH);
+    type est_t is (E_IDLE, E_HDR, E_HDR_WAIT, E_LEVELS, E_LEVEL_BUILD, E_LEVEL_PUSH, E_MARK);
     signal est : est_t := E_IDLE;
     signal em_start : std_logic := '0';
     signal frame_done_q : std_logic := '0';
@@ -265,6 +286,7 @@ begin
                   luma_nz_i => d_lnz, chroma_dc_nz_i => d_cdc, chroma_ac_nz_i => d_cac,
                   mode4_top_i => d_m4_top, mode4_left_i => d_m4_left,
                   avail_top_i => d_at, avail_left_i => d_al,
+                  frame_start_i => lb_frame_start, slice_qp_i => qp_frame_q, qp_i => d_qp,
                   fbits_o => hd_fbits, flen_o => hd_flen, fvalid_o => hd_fvalid, fready_i => hd_fready,
                   done_o => hd_done, hdr_bits_o => open, cbp_luma_o => hd_cbpl, cbp_chroma_o => hd_cbpc,
                   has_residual_o => hd_hasres);
@@ -274,7 +296,17 @@ begin
         port map (clk => clk, rst_n => rst_n, in_valid => dp_valid, in_ready => dp_ready, in_kind => dp_kind,
                   in_fbits => dp_fbits, in_flen => dp_flen, in_pkt => dp_pkt,
                   out_valid => out_valid, out_ready => out_ready, out_data => out_data, out_last => out_last,
-                  flushed_o => dp_flushed);
+                  flushed_o => dp_flushed,
+                  push_valid_o => dp_push_valid, push_len_o => dp_push_len, mb_end_o => dp_mb_end);
+
+    rc : entity work.rc_mb_engine
+        generic map (MAX_MBS => MAX_MBS)
+        port map (clk => clk, rst_n => rst_n, frame_start_i => lb_frame_start,
+                  en_i => rc_en_i, map_valid_i => rc_map_valid_i, qp_frame_i => qp_frame_q,
+                  qp_min_i => rc_qp_min_i, qp_max_i => rc_qp_max_i, target_i => rc_target_i,
+                  scale_i => rc_scale_i, lag_i => rc_lag_i,
+                  push_valid_i => dp_push_valid, push_len_i => dp_push_len, mb_end_i => dp_mb_end,
+                  take_i => rc_take, qp_o => rc_qp, qp_valid_o => rc_qp_valid, wtotal_o => rc_wtotal_o);
 
     ------------------------------------------------------------------
     -- Source double buffer: fill one bank from the input stream while
@@ -379,6 +411,9 @@ begin
         elsif est = E_LEVEL_PUSH then
             dp_valid <= pk_emit;
             dp_kind  <= "01";
+        elsif est = E_MARK then
+            dp_valid <= '1';
+            dp_kind  <= "11";
         elsif st = S_STOP and est = E_IDLE and em_start = '0' then
             dp_valid <= '1';
             dp_fbits <= x"01";
@@ -400,12 +435,12 @@ begin
             st <= S_IDLE; frame_done_q <= '0';
             lb_frame_start <= '0'; lb_row_start <= '0'; lb_fetch_valid <= '0'; lb_commit_valid <= '0';
             md_start <= '0'; md_word <= 24; use_bank <= '0'; md_done_f <= '0'; em_start <= '0';
-            rec_done <= '0'; rec_cnt <= 0;
+            rec_done <= '0'; rec_cnt <= 0; rc_take <= '0';
         elsif rising_edge(clk) then
             frame_done_q <= '0';
             lb_frame_start <= '0'; lb_row_start <= '0';
             lb_commit_valid <= '0';
-            md_start <= '0'; em_start <= '0';
+            md_start <= '0'; em_start <= '0'; rc_take <= '0';
             if md_done = '1' then md_done_f <= '1'; end if;
 
             -- reconstruction stream bookkeeping (independent of the state)
@@ -417,6 +452,7 @@ begin
                 when S_IDLE =>
                     if frame_start_i = '1' then
                         mbs_w <= mbs_w_i; mbs_h <= mbs_h_i;
+                        qp_frame_q <= qp_i;
                         qp_y <= qp_i; qp_c <= to_unsigned(QPC_TAB(to_integer(qp_i)), 6);
                         mb_r <= (others => '0'); mb_c <= (others => '0');
                         use_bank <= '0'; rec_done <= '0'; rec_cnt <= 0; md_done_f <= '0';
@@ -436,8 +472,12 @@ begin
                     if lb_nb_valid = '1' then st <= S_START; end if;
                 when S_START =>
                     -- the decider must be idle; its reconstruction stream is out
-                    -- (we committed it) though its level stream may still run
-                    if md_busy = '0' then
+                    -- (we committed it) though its level stream may still run.
+                    -- The MB's QP comes from the rate control (the frame QP
+                    -- when it is off); the wait for it is the lag stall.
+                    if md_busy = '0' and rc_qp_valid = '1' then
+                        qp_y <= rc_qp; qp_c <= to_unsigned(QPC_TAB(to_integer(rc_qp)), 6);
+                        cur_qp <= rc_qp; rc_take <= '1';
                         md_start <= '1'; md_word <= 0;
                         rec_done <= '0'; rec_cnt <= 0; md_done_f <= '0';
                         st <= S_SRC_PRE;
@@ -460,6 +500,7 @@ begin
                         d_is4 <= md_is4; d_mode16 <= md_mode16; d_modes4 <= md_modes4; d_modec <= md_modec;
                         d_lnz <= md_lnz; d_cdc <= md_cdc_nz; d_cac <= md_cac_nz;
                         d_tcy <= md_tcy; d_tcu <= md_tcu; d_tcv <= md_tcv;
+                        d_qp <= cur_qp;
                         d_m4_top <= nb_m4_top; d_m4_left <= nb_m4_left; d_at <= nb_at; d_al <= nb_al;
                         d_ncy_top <= nb_ncy_top; d_ncy_left <= nb_ncy_left;
                         d_ncu_top <= nb_ncu_top; d_ncu_left <= nb_ncu_left;
@@ -616,11 +657,31 @@ begin
                     end if;
                     if pk_emit = '0' or dp_ready = '1' then
                         pk_emit <= '0';
-                        if lvl_cnt = 27 or (d_is4 = '1' and lvl_cnt = 26) then est <= E_IDLE; else est <= E_LEVELS; end if;
+                        if lvl_cnt = 27 or (d_is4 = '1' and lvl_cnt = 26) then est <= E_MARK; else est <= E_LEVELS; end if;
                     end if;
+                when E_MARK =>
+                    -- end-of-MB marker behind the last packet, so the merger
+                    -- can report the bits of this MB to the rate control
+                    if dp_ready = '1' then est <= E_IDLE; end if;
             end case;
         end if;
     end process;
+
+    -- synthesis translate_off
+    -- The lag stall: cycles the front sequencer is ready to start a MB
+    -- (decider idle) but has no QP for it yet, per frame.
+    rcstall_p : process(clk)
+        variable n : natural := 0;
+    begin
+        if rising_edge(clk) then
+            if st = S_START and md_busy = '0' and rc_qp_valid = '0' then n := n + 1; end if;
+            if frame_done_q = '1' then
+                report "RCSTALL " & integer'image(n) & " cycles waiting for a MB QP this frame" severity note;
+                n := 0;
+            end if;
+        end if;
+    end process;
+    -- synthesis translate_on
 
     busy_o       <= '0' when st = S_IDLE else '1';
     frame_done_o <= frame_done_q;

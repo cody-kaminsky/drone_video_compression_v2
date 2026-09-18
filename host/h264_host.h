@@ -27,6 +27,32 @@ static inline uint32_t h264_config_word(int width, int height, int qp)
     return (mbs_w & 0xFFu) | ((mbs_h & 0xFFu) << 8) | (((uint32_t)qp & 0x3Fu) << 16);
 }
 
+/* ------------------------------------------------- per-MB rate control ---
+ * Kernel 1.3 (VERSION 0x00010003) adds the per-MB QP correction of the C
+ * reference's rc_mb == 3 (src/encoder.c, docs/rate-control-rtl.md). The host
+ * keeps the frame-level controller (bucket, frame model) and writes these
+ * before START; with RC_EN clear the kernel is 1.2 again. RC_WTOTAL after a
+ * frame is the next frame's w_total; scale = target * 2^16 / w_total, or
+ * target * 2^16 / mb_count with MAP_VALID clear (first frame, or after a
+ * size change). CONFIG.qp is the frame QP as before. */
+#define DCC_H264_REG_RC_CTRL    0x24u   /* [0] RC_EN [1] MAP_VALID [13:8] qp_min [21:16] qp_max [27:24] lag */
+#define DCC_H264_REG_RC_TARGET  0x28u   /* frame target, bits */
+#define DCC_H264_REG_RC_SCALE   0x2Cu   /* target * 2^16 / w_total */
+#define DCC_H264_REG_RC_WTOTAL  0x30u   /* R: sum of the last frame's MB bits (16-bit saturated per MB) */
+#define DCC_H264_RC_LAG_DEFAULT 2       /* the pipeline depth; 1 stalls, 3 gains nothing */
+
+static inline uint32_t h264_rc_ctrl_word(int enable, int map_valid, int qp_min, int qp_max, int lag)
+{
+    return (enable ? 1u : 0u) | (map_valid ? 2u : 0u) | (((uint32_t)qp_min & 0x3Fu) << 8)
+         | (((uint32_t)qp_max & 0x3Fu) << 16) | (((uint32_t)lag & 0xFu) << 24);
+}
+
+static inline uint32_t h264_rc_scale(uint32_t target_bits, uint32_t w_total)
+{
+    uint64_t s = ((uint64_t)target_bits << 16) / (w_total ? w_total : 1u);
+    return s > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)s;
+}
+
 /* ------------------------------------------------------- input ordering ---
  * The kernel reads a frame as, per macroblock row, 16 luma lines then 8
  * interleaved-chroma lines, each the full frame width. Both runs are

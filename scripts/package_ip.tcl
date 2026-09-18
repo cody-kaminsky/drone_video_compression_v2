@@ -26,7 +26,7 @@ set srcs {
     cavlc_engine cavlc_dispatch transform_engine quant_engine
     predict_4x4_engine predict_16x16_engine predict_chroma_engine
     cavlc_cost_engine_ll recon_engine mode_decide_engine line_buffer
-    mb_header_engine mb_pipeline_controller frame_io encoder_top
+    mb_header_engine rc_mb_engine mb_pipeline_controller frame_io encoder_top
     encoder_axi_top
 }
 

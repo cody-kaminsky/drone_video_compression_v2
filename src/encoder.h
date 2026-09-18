@@ -117,7 +117,13 @@ typedef struct {
                             2: per-MB correction against a straight-line
                             expectation (no per-MB bit map from the previous
                             frame), the cheapest form the RTL could carry.
+                            3: the hardware model -- the correction of 1 in
+                            the integer arithmetic of rc_mb_engine.vhd, on
+                            the bits through MB i-1-rc_lag (the kernel only
+                            knows an MB's bits once it has been emitted).
                             Only read when rc_bps > 0. */
+    int rc_lag;          /* rc_mb == 3: MBs between decision and bit count;
+                            0 selects the kernel default of 2 */
 } encode_cfg_t;
 
 typedef struct {

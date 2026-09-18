@@ -30,6 +30,9 @@
  *                     stays 0, which is all the RTL kernel can do today)
  *   --rc-mb-linear    per-MB correction against a straight-line expectation
  *                     instead of the previous frame's per-MB bit map
+ *   --rc-hw           the hardware model: per-MB correction in the integer
+ *                     arithmetic of the RTL, on the bits through MB i-1-L
+ *   --rc-lag L        that lag (default 2, the kernel pipeline depth)
  *
  * Stdout:
  *   STAT key: value lines per frame and totals, suitable for parsing.
@@ -67,6 +70,7 @@ int main(int argc, char **argv)
     int strict = 1, deblock = 1;
     long bitrate = 0; int fps = 30, qp_min = 22, qp_max = 32, rc_buffer = 4;
     int rc_mb = 1;
+    int rc_lag = 0;
     int npos = 0;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc)            max_frames = atoi(argv[++i]);
@@ -84,6 +88,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--rc-buffer") && i + 1 < argc)    rc_buffer = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rc-frame-only"))               rc_mb = 0;
         else if (!strcmp(argv[i], "--rc-mb-linear"))                rc_mb = 2;
+        else if (!strcmp(argv[i], "--rc-hw"))                       rc_mb = 3;
+        else if (!strcmp(argv[i], "--rc-lag") && i + 1 < argc)       rc_lag = atoi(argv[++i]);
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); return 1; }
         else if (npos == 0) { recon_path = argv[i]; npos++; }
         else if (npos == 1) { bs_path = argv[i]; npos++; }
@@ -139,6 +145,7 @@ int main(int argc, char **argv)
         cfg.rc_bucket_frames = rc_buffer; cfg.rc_reset = (fi == 0);
         cfg.rc_gop = intra_only ? 1 : (gop > 0 ? gop : nframes);
         cfg.rc_mb = rc_mb;
+        cfg.rc_lag = rc_lag;
 
         encode_stats_t stats;
         encode_pstats_t ps = {0};

@@ -16,6 +16,11 @@
 --   kind 1  BLOCK : a level packet -- queued for engine (round-robin).
 --   kind 2  FLUSH : byte-align and terminate the stream (end of slice);
 --                   flushed_o pulses when the last byte has been taken.
+--   kind 3  MARK  : end of a macroblock -- carries nothing; mb_end_o pulses
+--                   when the merger reaches it, i.e. once every bit of the
+--                   MB has entered the output packer. With push_valid_o /
+--                   push_len_o (a field or byte entering that packer) the
+--                   rate control counts the bits of each MB exactly.
 --
 -- Per engine there is a PKT_DEPTH-deep packet FIFO (the coefficient FIFO,
 -- distributed RAM, levels stored at 13 bits); every packet is sent with
@@ -61,7 +66,11 @@ entity cavlc_dispatch is
         out_ready : in  std_logic;
         out_data  : out unsigned(7 downto 0);
         out_last  : out std_logic;
-        flushed_o : out std_logic
+        flushed_o : out std_logic;
+        -- bit accounting (see kind 3)
+        push_valid_o : out std_logic;
+        push_len_o   : out unsigned(5 downto 0);
+        mb_end_o     : out std_logic
     );
 end entity;
 
@@ -146,8 +155,9 @@ architecture rtl of cavlc_dispatch is
     signal op_flushed: std_logic;
 
     -- merger
-    type mstate_t is (S_POP, S_FIELD, S_BLOCK, S_FLUSH, S_FLUSH_WAIT);
+    type mstate_t is (S_POP, S_FIELD, S_BLOCK, S_FLUSH, S_FLUSH_WAIT, S_MARK);
     signal mstate : mstate_t := S_POP;
+    signal mb_end_q : std_logic := '0';
     signal cur_e  : integer range 0 to N_ENGINES - 1 := 0;
     signal cur_bits : unsigned(7 downto 0);
     signal cur_len  : unsigned(5 downto 0);
@@ -314,6 +324,8 @@ begin
                 end if;
             when S_FLUSH_WAIT =>
                 if op_flushed = '1' then ord_pop <= '1'; end if;
+            when S_MARK =>
+                ord_pop <= '1';
             when others => null;
         end case;
     end process;
@@ -322,10 +334,11 @@ begin
     begin
         if rst_n = '0' then
             mstate <= S_POP; op_flush <= '0'; flushed_q <= '0'; cur_e <= 0;
-            hold_valid <= '0'; blk_done <= '0';
+            hold_valid <= '0'; blk_done <= '0'; mb_end_q <= '0';
         elsif rising_edge(clk) then
             op_flush  <= '0';
             flushed_q <= '0';
+            mb_end_q  <= '0';
             case mstate is
                 when S_POP =>
                     if ord_cnt > 0 then
@@ -335,9 +348,13 @@ begin
                         case ord_head(1 downto 0) is
                             when "00"   => mstate <= S_FIELD;
                             when "01"   => mstate <= S_BLOCK;
-                            when others => mstate <= S_FLUSH;
+                            when "10"   => mstate <= S_FLUSH;
+                            when others => mstate <= S_MARK;
                         end case;
                     end if;
+                when S_MARK =>
+                    mb_end_q <= '1';
+                    mstate   <= S_POP;
                 when S_FIELD =>
                     if op_ready = '1' then mstate <= S_POP; end if;
                 when S_BLOCK =>
@@ -390,5 +407,9 @@ begin
         );
 
     flushed_o <= flushed_q;
+
+    push_valid_o <= op_valid and op_ready;
+    push_len_o   <= op_len;
+    mb_end_o     <= mb_end_q;
 
 end architecture;

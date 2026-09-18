@@ -17,6 +17,7 @@ entity encoder_top is
     generic (
         MAX_W     : positive := 1920;
         N_ENGINES : positive := 1;
+        MAX_MBS   : positive := 8192;
         DEBUG     : boolean  := false
     );
     port (
@@ -29,6 +30,15 @@ entity encoder_top is
         qp_i          : in  unsigned(5 downto 0);
         busy_o        : out std_logic;
         frame_done_o  : out std_logic;
+        -- per-MB rate control; the defaults give one QP per frame
+        rc_en_i        : in  std_logic := '0';
+        rc_map_valid_i : in  std_logic := '0';
+        rc_qp_min_i    : in  unsigned(5 downto 0) := (others => '0');
+        rc_qp_max_i    : in  unsigned(5 downto 0) := (others => '1');
+        rc_target_i    : in  unsigned(31 downto 0) := (others => '0');
+        rc_scale_i     : in  unsigned(31 downto 0) := (others => '0');
+        rc_lag_i       : in  unsigned(3 downto 0) := to_unsigned(2, 4);
+        rc_wtotal_o    : out unsigned(31 downto 0);
         -- pixel input
         s_valid_i     : in  std_logic;
         s_ready_o     : out std_logic;
@@ -59,9 +69,13 @@ begin
                   o_keep_o => o_keep_o, o_last_o => o_last_o);
 
     ctl : entity work.mb_pipeline_controller
-        generic map (MAX_MB_COLS => MAX_W / 16, N_ENGINES => N_ENGINES, PKT_DEPTH => 32, ORDER_DEPTH => 64, DEBUG => DEBUG)
+        generic map (MAX_MB_COLS => MAX_W / 16, N_ENGINES => N_ENGINES, PKT_DEPTH => 32, ORDER_DEPTH => 64,
+                     MAX_MBS => MAX_MBS, DEBUG => DEBUG)
         port map (clk => clk, rst_n => rst_n, frame_start_i => frame_start_i, mbs_w_i => mbs_w_i,
                   mbs_h_i => mbs_h_i, qp_i => qp_i, busy_o => busy_o, frame_done_o => frame_done_o,
+                  rc_en_i => rc_en_i, rc_map_valid_i => rc_map_valid_i, rc_qp_min_i => rc_qp_min_i,
+                  rc_qp_max_i => rc_qp_max_i, rc_target_i => rc_target_i, rc_scale_i => rc_scale_i,
+                  rc_lag_i => rc_lag_i, rc_wtotal_o => rc_wtotal_o,
                   src_valid_i => m_valid, src_ready_o => m_ready, src_data_i => m_data,
                   out_valid => b_valid, out_ready => b_ready, out_data => b_data, out_last => b_last);
 

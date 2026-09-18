@@ -13,9 +13,13 @@
 --   I_16x16 : mb_type ue(1 + mode + 4*cbp_chroma + 12*cbp_luma);
 --             intra_chroma_pred_mode ue(v); mb_qp_delta se(0).
 --
--- QP is fixed per frame, so mb_qp_delta is always 0 ('1'). Exp-Golomb
--- codes are emitted as one field: value v+1 with length 2*bits(v+1)-1;
--- the bit_packer treats the missing high bits as the leading zeros.
+-- mb_qp_delta = qp_i - QP_Y,PRED, wrapped into [-26, 25] (7.4.5), where
+-- QP_Y,PRED is the slice QP (slice_qp_i at frame_start_i) and then the QP of
+-- the last MB that transmitted a delta -- an MB without residual carries
+-- the predicted QP forward unchanged. With one QP per frame every delta is
+-- 0 ('1'). Exp-Golomb codes are emitted as one field: value v+1 with
+-- length 2*bits(v+1)-1; the bit_packer treats the missing high bits as the
+-- leading zeros.
 --
 -- predIntra4x4PredMode (spec 8.3.1.1) uses the in-MB modes for inner
 -- blocks and the line buffer's top/left modes at the MB edge; if either
@@ -49,6 +53,10 @@ entity mb_header_engine is
         mode4_left_i  : in  std_logic_vector(15 downto 0);   -- 4 x 4 bits (br)
         avail_top_i   : in  std_logic;
         avail_left_i  : in  std_logic;
+        -- QP: slice QP at the frame start, then the MB's QP with each start
+        frame_start_i : in  std_logic := '0';
+        slice_qp_i    : in  unsigned(5 downto 0) := (others => '0');
+        qp_i          : in  unsigned(5 downto 0) := (others => '0');
         -- field stream
         fbits_o       : out unsigned(15 downto 0);
         flen_o        : out unsigned(5 downto 0);
@@ -94,6 +102,13 @@ architecture rtl of mb_header_engine is
         len  := to_unsigned(2 * nb - 1, 6);
     end procedure;
 
+    -- Exp-Golomb se(v): codeNum = 2v-1 for v > 0, -2v otherwise
+    procedure se_field(v : in integer range -26 to 25;
+                       bits : out unsigned(15 downto 0); len : out unsigned(5 downto 0)) is
+    begin
+        if v > 0 then ue_field(2 * v - 1, bits, len); else ue_field(-2 * v, bits, len); end if;
+    end procedure;
+
     function mode_of(v : std_logic_vector; k : integer) return integer is
     begin
         return to_integer(unsigned(v(4*k+3 downto 4*k)));
@@ -123,6 +138,8 @@ architecture rtl of mb_header_engine is
     signal fvalid_q  : std_logic := '0';
     signal done_q    : std_logic := '0';
     signal nbits     : unsigned(7 downto 0) := (others => '0');
+    signal qp_prev   : unsigned(5 downto 0) := (others => '0');   -- QP_Y,PRED
+    signal dq        : integer range -26 to 25 := 0;              -- this MB's mb_qp_delta
 
 begin
 
@@ -148,6 +165,7 @@ begin
         variable last    : boolean;
         variable can     : boolean;
         variable mbtype  : integer range 0 to 63;
+        variable d       : integer range -63 to 63;
     begin
         if rst_n = '0' then
             busy <= '0'; fvalid_q <= '0'; done_q <= '0'; step <= 0;
@@ -155,6 +173,7 @@ begin
             done_q <= '0';
             can := (fvalid_q = '0') or (fready_i = '1');
             if fready_i = '1' then fvalid_q <= '0'; end if;
+            if frame_start_i = '1' then qp_prev <= slice_qp_i; end if;
 
             if busy = '0' then
                 if start_i = '1' then
@@ -172,6 +191,12 @@ begin
                     else cc := "00";
                     end if;
                     cbp_l <= cl; cbp_c <= cc;
+                    -- the delta is transmitted for I_16x16 always, for I_4x4
+                    -- only with residual; QP_Y,PRED moves only then
+                    d := to_integer(qp_i) - to_integer(qp_prev);
+                    if d > 25 then d := d - 52; elsif d < -26 then d := d + 52; end if;
+                    dq <= d;
+                    if is_i4x4_i = '0' or cl /= 0 or cc /= 0 then qp_prev <= qp_i; end if;
                     i4 <= is_i4x4_i; m16 <= mode16_i;
                     for s in 0 to 15 loop
                         sr(s) <= unsigned(modes4_i(4 * (SCAN_BR(s) * 4 + SCAN_BC(s)) + 3 downto 4 * (SCAN_BR(s) * 4 + SCAN_BC(s))));
@@ -228,7 +253,7 @@ begin
                         ue_field(CBP_CODENUM(to_integer(cbp_c & cbp_l)), fb, fl);
                         if cbp_l = 0 and cbp_c = 0 then last := true; end if;
                     else
-                        fb := to_unsigned(1, 16); fl := to_unsigned(1, 6);          -- mb_qp_delta se(0)
+                        se_field(dq, fb, fl);                                       -- mb_qp_delta se(v)
                         last := true;
                     end if;
                 else
@@ -238,7 +263,7 @@ begin
                     elsif step = 1 then
                         ue_field(to_integer(mchroma), fb, fl);
                     else
-                        fb := to_unsigned(1, 16); fl := to_unsigned(1, 6);          -- mb_qp_delta se(0)
+                        se_field(dq, fb, fl);                                       -- mb_qp_delta se(v)
                         last := true;
                     end if;
                 end if;
