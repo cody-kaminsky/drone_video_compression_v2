@@ -1,0 +1,116 @@
+# run_board.tcl — program the PL, boot the PS, load the app and the test
+# sequence, and run. The whole L5 flow in one command, with no IDE involved.
+#
+#   xsdb scripts/run_board.tcl [seq_dir [elf [bitstream [xsa]]]]
+#
+# Defaults to the 480x272 sequence, which is the one to try first.
+# For 1080p:
+#   xsdb scripts/run_board.tcl <root>/build/seq_board_1080
+#
+# Why this exists. Driving the board from the IDE means a run configuration
+# whose "Program FPGA" setting decides whether the PL is reconfigured, and PL
+# configuration survives an ELF download and a PS reset. Get it wrong and new
+# software runs against a bitstream from hours ago, reporting nothing unusual.
+# This script always programs, so the question cannot arise.
+#
+# Order matters and is not obvious:
+#   1. rst -system clears everything, PL configuration included, so it has to
+#      come before the bitstream rather than after.
+#   2. ps7_init is what releases the DDR controller from reset. Until it runs,
+#      every write to DDR fails with "the controller is held in reset" -- which
+#      is what a download of the ELF to 0x100000 hits.
+#   3. ps7_init is only defined once loadhw has read the hardware handoff.
+# Nothing here is wrapped in catch: a failure in any of it makes everything
+# after it meaningless, so it should stop rather than carry on quietly.
+#
+# Watch the UART at 115200 8N1 for the results.
+
+proc arg {i default} {
+    global argv
+    if {[llength $argv] > $i} { return [lindex $argv $i] }
+    return $default
+}
+
+# Absolute: xsdb does not start in the project root, so a relative default
+# would resolve against wherever the shell happened to be.
+set root "C:/Users/kamin/OneDrive/Documents/drone_video_compression_v2"
+set proj "C:/Users/kamin/Vivado_Projects/zybo_encoder_test"
+
+set seq  [arg 0 "$root/build/seq_board_480"]
+set elf  [arg 1 "$proj/dcc_14/build/dcc_14.elf"]
+set bit  [arg 2 "$proj/dcc_plat/export/dcc_plat/hw/dcc_enc.bit"]
+set xsa  [arg 3 "$proj/dcc_plat/hw/dcc_enc.xsa"]
+
+foreach {what path} [list bitstream $bit ELF $elf "sequence dir" $seq XSA $xsa] {
+    if {![file exists $path]} {
+        puts "ERROR: no $what at $path"
+        exit 1
+    }
+}
+if {![file exists [file join $seq addrs.tcl]]} {
+    puts "ERROR: $seq has no addrs.tcl -- regenerate it with tools/gen_board_sequence.py"
+    exit 1
+}
+
+proc stamp {path} {
+    return "[file size $path] bytes, [clock format [file mtime $path] -format {%H:%M:%S}]"
+}
+puts "bitstream : $bit"
+puts "            [stamp $bit]"
+puts "ELF       : $elf"
+puts "            [stamp $elf]"
+puts "sequence  : $seq"
+puts ""
+
+connect
+
+# ---- 1. system reset (this also clears PL configuration) --------------------
+targets -set -filter {name =~ "APU*"}
+rst -system
+after 2000
+puts "system reset"
+
+# ---- 2. configure the PL ----------------------------------------------------
+targets -set -filter {name =~ "xc7z*"}
+fpga -file $bit
+puts "PL configured"
+
+# ---- 3. bring the PS up, which is what releases the DDR controller ----------
+targets -set -filter {name =~ "ARM*#0"}
+loadhw -hw $xsa -mem-ranges [list {0x40000000 0xbfffffff}] -regs
+
+# loadhw does not define ps7_init in the system-device-tree platform flow, so
+# source the generated Tcl directly. It is what actually releases the DDR
+# controller; without it every write to DDR fails.
+set ps7tcl "$proj/dcc_plat/export/dcc_plat/hw/ps7_init.tcl"
+if {![file exists $ps7tcl]} {
+    puts "ERROR: no ps7_init.tcl at $ps7tcl"
+    exit 1
+}
+source $ps7tcl
+configparams force-mem-access 1
+ps7_init
+ps7_post_config
+configparams force-mem-access 0
+puts "PS initialised, DDR up"
+
+# ps7_init leaves the A9 global timer stopped -- it ends by writing 0 to the
+# control register at 0xF8F00208. That is why the application has been
+# reporting "timer NOT RUNNING" and why every millisecond figure it prints has
+# been meaningless. The same file provides the proc to start it.
+perf_reset_and_start_timer
+puts "global timer started" 
+
+# ---- 4. application ---------------------------------------------------------
+dow $elf
+puts "ELF downloaded"
+
+# ---- 5. test data -----------------------------------------------------------
+# Same addresses as host/dcc_memmap.h. The manifest goes last on purpose: its
+# magic is what tells the application the rest of the data really arrived, so a
+# load that dies halfway leaves it waiting rather than running on garbage.
+source [file join $seq addrs.tcl]
+puts "sequence loaded"
+
+con
+puts "running -- watch the UART at 115200"

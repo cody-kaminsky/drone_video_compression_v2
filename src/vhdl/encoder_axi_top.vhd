@@ -18,14 +18,25 @@
 --                    bit 1 SOFT_RESET  reset the kernel (16 cycles)
 --                 RW bit 8 IRQ_EN
 --   0x04 CONFIG   RW [7:0] mbs_w  [15:8] mbs_h  [21:16] qp   (latched at START)
---   0x08 STATUS   R  bit 0 BUSY  bit 1 DONE (sticky)  bit 2 s_axis_tready
+--   0x08 STATUS   R  bit 0 BUSY  bit 1 DONE (sticky; set once the frame
+--                    has been EMITTED, not merely once the kernel stopped --
+--                    the two differ under input backpressure)  bit 2 s_axis_tready
 --                    bit 3 m_axis_tvalid
 --   0x0C DONE_CLR W  write 1 clears DONE (and the interrupt)
 --   0x10 FRAMES   R  frames completed since reset
 --   0x14 CYCLES   R  aclk cycles of the last frame, START to frame done
 --   0x18 BYTES    R  payload bytes of the last frame
 --   0x1C ID       R  0x48323634 ("H264")
---   0x20 VERSION  R  0x00010000
+--   0x20 VERSION  R  0x00010002
+--        1.2 adds: DONE waits for the output to drain, so BYTES is
+--        right and a host may start the next frame on DONE.
+--        1.0 = original. 1.1 = the output-path fixes: bit_packer
+--        HOLD_LAST (tlast on a payload that is a whole number of
+--        bytes), the merger block-trim latch (4 bits inserted under
+--        output stalls), and bytes_last no longer dropping the final
+--        beat. Bump this on any change software can observe: PL
+--        configuration survives an ELF reload, so without a version
+--        there is no way to tell which bitstream is really loaded.
 --
 -- The slice header, SPS/PPS and NAL framing are done by the host around
 -- the payload, exactly as the C reference splits them (src/nal.c).
@@ -98,6 +109,12 @@ architecture rtl of encoder_axi_top is
     signal bytes_run     : unsigned(31 downto 0) := (others => '0');
     signal bytes_last    : unsigned(31 downto 0) := (others => '0');
     signal counting      : std_logic := '0';
+    -- The kernel can finish while its last output beat is still in flight,
+    -- so "kernel done" and "frame emitted" are two different events. DONE
+    -- waits for both: a host that starts the next frame on DONE would
+    -- otherwise do so with a beat still pending.
+    signal kdone_q       : std_logic := '0';   -- kernel reported done
+    signal drained_q     : std_logic := '0';   -- tlast beat handshaken
     signal frame_active  : std_logic := '0';   -- START seen, frame not yet done: pixels accepted
 
     -- kernel
@@ -187,6 +204,8 @@ begin
     axi_p : process(aclk)
         variable wr : boolean;
         variable a : std_logic_vector(5 downto 0);
+        variable bytes_tot : unsigned(31 downto 0);
+        variable beat, lastbeat : boolean;
     begin
         if rising_edge(aclk) then
             if rst_sync(1) = '0' then
@@ -195,6 +214,7 @@ begin
                 irq_en <= '0'; start_pulse <= '0'; done_flag <= '0';
                 frames <= (others => '0'); cyc_run <= (others => '0'); cyc_last <= (others => '0');
                 bytes_run <= (others => '0'); bytes_last <= (others => '0'); counting <= '0';
+                kdone_q <= '0'; drained_q <= '0';
                 frame_active <= '0';
                 mbs_w_q <= (others => '0'); mbs_h_q <= (others => '0'); qp_q <= (others => '0');
             else
@@ -217,6 +237,7 @@ begin
                                 start_pulse <= '1';
                                 mbs_w_q <= cfg_w; mbs_h_q <= cfg_h; qp_q <= cfg_qp;
                                 cyc_run <= (others => '0'); bytes_run <= (others => '0'); counting <= '1';
+                                kdone_q <= '0'; drained_q <= '0';
                                 frame_active <= '1';
                             end if;
                             if s_axi_wstrb(1) = '1' then irq_en <= s_axi_wdata(8); end if;
@@ -244,24 +265,55 @@ begin
                         when "000101" => rdata_q <= std_logic_vector(cyc_last);
                         when "000110" => rdata_q <= std_logic_vector(bytes_last);
                         when "000111" => rdata_q <= x"48323634";
-                        when "001000" => rdata_q <= x"00010000";
+                        when "001000" => rdata_q <= x"00010002";
                         when others   => rdata_q <= (others => '0');
                     end case;
                 end if;
                 if rvalid_q = '1' and s_axi_rready = '1' then rvalid_q <= '0'; end if;
 
-                -- frame bookkeeping
+                -- frame bookkeeping.
+                --
+                -- bytes_run and bytes_last are both signals, so an assignment
+                -- to bytes_run here is not visible to a read of it in the same
+                -- process. When the frame's final beat handshakes on the very
+                -- cycle k_done arrives -- which is exactly when it is most
+                -- likely to -- a plain `bytes_last <= bytes_run` captures the
+                -- count from before that beat and reports one beat short.
+                -- Compute the total once and use it for both.
                 if counting = '1' then cyc_run <= cyc_run + 1; end if;
-                if k_o_valid = '1' and m_axis_tready = '1' then
-                    bytes_run <= bytes_run + keep_count(k_o_keep);
+                -- Assign bytes_run only on a handshake. START clears it in the
+                -- register-write section above, and the last assignment in a
+                -- process wins, so an unconditional assignment here would
+                -- silently defeat that clear and accumulate across frames.
+                beat     := (k_o_valid = '1' and m_axis_tready = '1');
+                lastbeat := beat and (k_o_last = '1');
+
+                bytes_tot := bytes_run;
+                if beat then
+                    bytes_tot := bytes_tot + keep_count(k_o_keep);
+                    bytes_run <= bytes_tot;
                 end if;
+                if lastbeat then drained_q <= '1'; end if;
+
                 if k_done = '1' then
-                    done_flag <= '1';
-                    frames <= frames + 1;
-                    cyc_last <= cyc_run + 1;
-                    bytes_last <= bytes_run;
-                    counting <= '0';
+                    kdone_q      <= '1';
+                    cyc_last     <= cyc_run + 1;
+                    counting     <= '0';
                     frame_active <= '0';
+                end if;
+
+                -- DONE means the frame has been emitted, not merely that the
+                -- kernel stopped. Under input backpressure k_done arrives
+                -- before the final beat has handshaken, so capturing here
+                -- rather than at k_done is what makes BYTES right.
+                if done_flag = '0'
+                   and (kdone_q = '1' or k_done = '1')
+                   and (drained_q = '1' or lastbeat) then
+                    done_flag  <= '1';
+                    frames     <= frames + 1;
+                    bytes_last <= bytes_tot;
+                    kdone_q    <= '0';
+                    drained_q  <= '0';
                 end if;
             end if;
         end if;

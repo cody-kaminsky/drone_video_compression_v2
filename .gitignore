@@ -59,3 +59,15 @@ hls_proj/
 /tmp/
 *.tmp
 *.log
+
+# Vivado / xsim run artifacts (written into cwd by batch runs)
+*.jou
+*.wdb
+*.pb
+*.dcp
+xsim.dir/
+.Xil/
+dfx_runtime.txt
+clockInfo.txt
+hs_err_pid*.dmp
+hs_err_pid*.log

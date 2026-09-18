@@ -18,7 +18,9 @@ entity encoder_axi_top_tb is
         MBS_W    : natural := 30;
         MBS_H    : natural := 17;
         QP       : natural := 26;
-        FRAMES   : natural := 2
+        FRAMES   : natural := 2;
+        BP_MODE  : natural := 1;    -- output backpressure: 0 tidy, 1 long stalls
+        IN_BP    : natural := 1     -- input stalls:        0 tidy, 1 long stalls
     );
 end entity;
 
@@ -90,21 +92,51 @@ begin
                   m_axis_tdata => m_tdata, m_axis_tkeep => m_tkeep, m_axis_tlast => m_tlast,
                   m_axis_tvalid => m_tvalid, m_axis_tready => m_tready, irq => irq);
 
+    -- Output backpressure. BP_MODE 0 is the original tidy 1-in-5 pattern.
+    -- BP_MODE 1 is adversarial: an LFSR drives long stalls, because a real
+    -- AXI DMA does not deassert tready politely every fifth cycle -- it goes
+    -- away for tens of cycles when its FIFO fills or DDR is busy, and that is
+    -- the case a regular pattern never exercises.
     cyc_p : process(aclk)
+        variable lfsr  : unsigned(15 downto 0) := x"ACE1";
+        variable stall : integer := 0;
     begin
         if rising_edge(aclk) then
             cycle <= cycle + 1;
-            if (cycle mod 5) = 2 then m_tready <= '0'; else m_tready <= '1'; end if;
+            if BP_MODE = 0 then
+                if (cycle mod 5) = 2 then m_tready <= '0'; else m_tready <= '1'; end if;
+            else
+                lfsr := lfsr(14 downto 0) & (lfsr(15) xor lfsr(13) xor lfsr(12) xor lfsr(10));
+                if stall > 0 then
+                    stall := stall - 1;
+                    m_tready <= '0';
+                elsif lfsr(3 downto 0) = "0000" then
+                    stall := 1 + to_integer(lfsr(6 downto 0));   -- up to 128 cycles
+                    m_tready <= '0';
+                else
+                    m_tready <= '1';
+                end if;
+            end if;
         end if;
     end process;
 
-    -- pixel feeder (DMA model) with random gaps
+    -- Pixel feeder, standing in for MM2S.
+    --
+    -- IN_BP 0 is the original: a one-cycle gap on a fixed pattern, which
+    -- exercises the handshake but never a sustained stall. IN_BP 1 withholds
+    -- data for up to 128 cycles at a time, which is what a real DMA does when
+    -- DDR is busy or the HP port is arbitrating against the PS. Every bug
+    -- found on this design so far has been a valid/ready field or length
+    -- moving while un-handshaken, and the input path has the same structure as
+    -- the output path that produced three of them.
     src_p : process
         file f : text;
         variable L : line;
         variable w32 : std_logic_vector(31 downto 0);
         variable open_status : file_open_status;
         variable gap : natural := 0;
+        variable ilfsr : unsigned(15 downto 0) := x"BEEF";
+        variable istall : integer := 0;
     begin
         for k in 0 to FRAMES - 1 loop
             wait until feed_go;
@@ -118,8 +150,19 @@ begin
                 s_tdata <= w32; s_tvalid <= '1';
                 loop wait until rising_edge(aclk); exit when s_tready = '1'; end loop;
                 s_tvalid <= '0';
-                gap := (gap * 5 + 1) mod 4;
-                if gap = 3 then wait until rising_edge(aclk); end if;
+                if IN_BP = 0 then
+                    gap := (gap * 5 + 1) mod 4;
+                    if gap = 3 then wait until rising_edge(aclk); end if;
+                else
+                    ilfsr := ilfsr(14 downto 0) &
+                             (ilfsr(15) xor ilfsr(13) xor ilfsr(12) xor ilfsr(10));
+                    if ilfsr(3 downto 0) = "0000" then
+                        istall := 1 + to_integer(ilfsr(6 downto 0));
+                        for z in 1 to istall loop
+                            wait until rising_edge(aclk);
+                        end loop;
+                    end if;
+                end if;
             end loop;
             file_close(f);
             feed_done <= true;
@@ -130,6 +173,8 @@ begin
 
     main_p : process
         file f : text;
+        file fdump : text;                 -- received bytes, for offline analysis
+        variable Ld : line;
         variable L : line;
         variable val, got, nb : integer;
         variable open_status : file_open_status;
@@ -158,6 +203,14 @@ begin
 
         for k in 0 to FRAMES - 1 loop
             file_open(open_status, f, OUT_FILE, read_mode);
+            -- Received bytes, one decimal per line, so a mismatch can be
+            -- analysed offline: a bit shift, a dropped byte and a
+            -- duplicated byte all look the same in a first-difference report.
+            if k = 0 then
+                file_open(open_status, fdump, "build/got_frame0.txt", write_mode);
+            else
+                file_open(open_status, fdump, "build/got_frame1.txt", write_mode);
+            end if;
             assert open_status = open_ok report "could not open " & OUT_FILE severity failure;
             n := 0; mc := 0; last_seen := false;
             t0 := cycle;
@@ -171,6 +224,7 @@ begin
                     if m_tkeep = "1111" then nb := 4; elsif m_tkeep = "0111" then nb := 3; elsif m_tkeep = "0011" then nb := 2; else nb := 1; end if;
                     for i in 0 to nb - 1 loop
                         got := to_integer(unsigned(m_tdata(8 * i + 7 downto 8 * i)));
+                        write(Ld, got); writeline(fdump, Ld);
                         if endfile(f) then
                             mc := mc + 1;
                             if mc <= 10 then report "MISMATCH: extra byte " & integer'image(got) severity error; end if;
@@ -192,6 +246,7 @@ begin
             end loop;
             if not endfile(f) then mc := mc + 1; report "MISMATCH: stream ended early" severity error; end if;
             file_close(f);
+            file_close(fdump);
             -- status readback
             axi_read(aclk, 16#08#, r, araddr, arvalid, rready, arready, rvalid, rdata);
             assert r(1) = '1' report "DONE not set" severity error;

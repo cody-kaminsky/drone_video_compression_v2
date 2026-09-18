@@ -43,7 +43,23 @@ entity bit_packer is
         -- Width of the producer data path. The field VALUE must fit in
         -- DATA_W bits; length_i may still be up to 32 (leading zeros are
         -- implied). CAVLC fields never exceed 16 significant bits.
-        DATA_W : positive := 32
+        DATA_W : positive := 32;
+        -- Hold one byte back in normal operation so that a flush always has
+        -- something left to mark with out_last.
+        --
+        -- Without this, a byte leaves as soon as the accumulator holds eight
+        -- bits, so a payload whose bit count is an exact multiple of 8 has
+        -- already emitted its final byte by the time flush_i arrives: the
+        -- flush finds an empty accumulator, emits nothing, and out_last is
+        -- never asserted. Downstream that means no tlast on the frame, and a
+        -- length-unbounded AXI DMA waits forever. One frame in eight.
+        --
+        -- Default false: the per-block packers inside cavlc_engine are flushed
+        -- after every block, and cavlc_dispatch's merger already compensates
+        -- for exactly this behaviour by holding a byte back itself. Turning it
+        -- on there would hold two. Set it only on the packer whose out_last
+        -- actually reaches m_axis_tlast.
+        HOLD_LAST : boolean := false
     );
     port (
         clk       : in  std_logic;
@@ -109,6 +125,7 @@ begin
         variable shift_amt : integer range 0 to 64;
         variable do_accept : boolean;
         variable blk_base  : unsigned(15 downto 0);
+        variable emit_min  : integer range 8 to 16;
     begin
         if rising_edge(clk) then
             if rst_n = '0' then
@@ -150,8 +167,17 @@ begin
                 did_emit := false;
                 last_byte := false;
 
+                -- How full the accumulator must be before a byte may leave.
+                -- See the HOLD_LAST generic. Once flushing, or on the cycle
+                -- flush_i is seen, drop back to 8 so the drain starts at once.
+                if HOLD_LAST and state = S_NORMAL and flush_i = '0' then
+                    emit_min := 16;
+                else
+                    emit_min := 8;
+                end if;
+
                 if can_emit then
-                    if n_v >= 8 then
+                    if n_v >= emit_min then
                         out_byte_q  <= accum_v(63 downto 56);
                         out_valid_q <= '1';
                         accum_v := shift_left(accum_v, 8);

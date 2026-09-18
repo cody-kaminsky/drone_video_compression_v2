@@ -128,6 +128,13 @@ architecture rtl of cavlc_dispatch is
     signal hold_byte  : unsigned(7 downto 0) := (others => '0');
     signal hold_valid : std_logic := '0';
     signal blk_done   : std_logic := '0';
+    -- Trim length of the block's last byte, captured when the engine's
+    -- flushed pulse arrives. It must be a register: block_bits_o is only
+    -- valid from flush_i until flushed_o, and the packer restarts the
+    -- count immediately after, so reading it combinationally on any later
+    -- cycle -- which is what happens the moment op_ready is low -- returns
+    -- 0 and the merger pushes 8 bits where it should push block_bits mod 8.
+    signal blk_r      : unsigned(2 downto 0) := (others => '0');
     signal consume    : std_logic;
 
     -- output packer
@@ -278,7 +285,14 @@ begin
             when S_BLOCK =>
                 -- a flushed pulse with nothing held cannot be this block's
                 fin := blk_done or (eng_flushed(cur_e) and hold_valid);
-                r := to_integer(eng_blk_bits(cur_e)(2 downto 0));
+                -- On the flushed pulse the live count is correct; from the next
+                -- cycle on it has already been restarted, so use what was
+                -- captured with blk_done.
+                if blk_done = '1' then
+                    r := to_integer(blk_r);
+                else
+                    r := to_integer(eng_blk_bits(cur_e)(2 downto 0));
+                end if;
                 if fin = '1' then
                     -- last byte of the block: only block_bits mod 8 bits are real
                     if r /= 0 then
@@ -331,7 +345,10 @@ begin
                         hold_byte  <= eng_out_data(cur_e);
                         hold_valid <= '1';
                     end if;
-                    if eng_flushed(cur_e) = '1' and hold_valid = '1' then blk_done <= '1'; end if;
+                    if eng_flushed(cur_e) = '1' and hold_valid = '1' then
+                        blk_done <= '1';
+                        blk_r    <= eng_blk_bits(cur_e)(2 downto 0);
+                    end if;
                     if (blk_done = '1' or (eng_flushed(cur_e) = '1' and hold_valid = '1')) and op_ready = '1' then
                         hold_valid <= '0';
                         blk_done   <= '0';
@@ -352,7 +369,10 @@ begin
     end process;
 
     packer : entity work.bit_packer
-        generic map (DATA_W => 8)
+        -- HOLD_LAST: this is the packer whose out_last becomes
+        -- m_axis_tlast, so it must always have a byte left to mark when
+        -- the frame flush arrives. The engine-side packers keep the default.
+        generic map (DATA_W => 8, HOLD_LAST => true)
         port map (
             clk       => clk,
             rst_n     => rst_n,
