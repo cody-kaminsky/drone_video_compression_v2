@@ -109,6 +109,15 @@ typedef struct {
                             frames will repay what an I frame draws ahead.
                             1 (or 0) means every frame is intra, and then an
                             intra frame gets only the plain per-frame budget. */
+    int rc_mb;           /* 1: correct each MB's QP from the bits spent so far,
+                            so mb_qp_delta is nonzero inside the frame.
+                            0: one QP per frame, mb_qp_delta always 0 -- what
+                            the RTL kernel does today, since it latches CONFIG
+                            once per START.
+                            2: per-MB correction against a straight-line
+                            expectation (no per-MB bit map from the previous
+                            frame), the cheapest form the RTL could carry.
+                            Only read when rc_bps > 0. */
 } encode_cfg_t;
 
 typedef struct {

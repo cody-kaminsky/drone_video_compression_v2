@@ -26,6 +26,10 @@
  *   --rc-buffer F     bucket size in frame budgets (default 4). This is the
  *                     receiver buffering the link must have; it also sets how
  *                     many bits the IDR may draw ahead.
+ *   --rc-frame-only   one QP per frame, no per-MB correction (mb_qp_delta
+ *                     stays 0, which is all the RTL kernel can do today)
+ *   --rc-mb-linear    per-MB correction against a straight-line expectation
+ *                     instead of the previous frame's per-MB bit map
  *
  * Stdout:
  *   STAT key: value lines per frame and totals, suitable for parsing.
@@ -62,6 +66,7 @@ int main(int argc, char **argv)
     int max_frames = -1, intra_only = 0, gop = 0, refresh_cols = 1, intra_budget = 64, me_range = 16;
     int strict = 1, deblock = 1;
     long bitrate = 0; int fps = 30, qp_min = 22, qp_max = 32, rc_buffer = 4;
+    int rc_mb = 1;
     int npos = 0;
     for (int i = 5; i < argc; i++) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc)            max_frames = atoi(argv[++i]);
@@ -77,6 +82,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--qp-min") && i + 1 < argc)       qp_min = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--qp-max") && i + 1 < argc)       qp_max = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rc-buffer") && i + 1 < argc)    rc_buffer = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rc-frame-only"))               rc_mb = 0;
+        else if (!strcmp(argv[i], "--rc-mb-linear"))                rc_mb = 2;
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); return 1; }
         else if (npos == 0) { recon_path = argv[i]; npos++; }
         else if (npos == 1) { bs_path = argv[i]; npos++; }
@@ -131,6 +138,7 @@ int main(int argc, char **argv)
         cfg.rc_bps = bitrate; cfg.rc_fps = fps; cfg.rc_qp_min = qp_min; cfg.rc_qp_max = qp_max;
         cfg.rc_bucket_frames = rc_buffer; cfg.rc_reset = (fi == 0);
         cfg.rc_gop = intra_only ? 1 : (gop > 0 ? gop : nframes);
+        cfg.rc_mb = rc_mb;
 
         encode_stats_t stats;
         encode_pstats_t ps = {0};

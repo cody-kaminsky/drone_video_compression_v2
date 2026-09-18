@@ -1988,7 +1988,7 @@ int encode_frame_h264(int width, int height, int qp,
                       u8 *bs_out, int bs_max_size, int frame_num,
                       encode_stats_t *stats)
 {
-    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1, 0, 30, 0, 51, 4, 1, 1 };
+    encode_cfg_t cfg = { 0, frame_num, 16, 0, 0, 0, 1, 1, 0, 30, 0, 51, 4, 1, 1, 1 };
     return encode_frame_h264_ext(width, height, qp, src_y, stride_y, src_uv, stride_uv,
                                  recon_y_out, recon_stride_y, recon_uv_out, recon_stride_uv,
                                  bs_out, bs_max_size, &cfg, stats, NULL);
@@ -2169,10 +2169,10 @@ int encode_frame_h264_ext(int width, int height, int qp,
             int i = r * mbs_w + c;
             long bits_before = bs.byte_pos * 8L + bs.n_in_cur;
             /* ---- MB QP from the spend so far vs the expected spend ---- */
-            if (rc_on && i > 0) {
+            if (rc_on && cfg->rc_mb && i > 0) {
                 long spent = bits_before - payload_start_bit;
                 double expect;
-                if (rc.prev_mbs == mb_count && rc_w_total > 0) expect = (double)frame_target * (w_cum / rc_w_total);
+                if (rc.prev_mbs == mb_count && rc_w_total > 0 && cfg->rc_mb == 1) expect = (double)frame_target * (w_cum / rc_w_total);
                 else expect = (double)frame_target * ((double)i / mb_count);
                 int adj = 0;
                 if (expect > frame_target * 0.01 && spent > 0) {
